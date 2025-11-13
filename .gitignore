@@ -1,0 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment / packaging
+.venv/
+.uv/
+poetry.lock
+
+# Editor & OS artifacts
+.DS_Store
+.idea/
+.vscode/
+
+# Environment & secrets
+.env
+.env.*
+
+# Logs & temp
+*.log
+*.tmp
+*.bak
+
+# ML artifacts
+mlruns/
+mlflow/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Storage assets (keep README only)
+storage/models/
+storage/models_v2/
+storage/datasets/
+storage/datasets_v2/
+storage/datasets_local_small/
+!storage/README.md
+
+# Generated data files
+*.jsonl
+*.jsonl.zst
+
+# Misc
+node_modules/
+
