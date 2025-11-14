@@ -1,0 +1,33 @@
+{
+  "timestamp": "2025-11-14T12:07:26.469699",
+  "steps": {
+    "step2_model_download": {
+      "name": "모델 원본 다운로드 (Meta 7B_1T_4, Sheared LLaMA 2.7B)",
+      "status": "❌"
+    },
+    "step3_meta_conversion": {
+      "name": "Meta LLaMA MTP 파생 자산 생성 (safetensors, config)",
+      "status": "✅"
+    },
+    "step4_ref_conversion": {
+      "name": "Sheared LLaMA 2.7B 파생 자산 생성",
+      "status": "❌"
+    },
+    "step5_micro_model": {
+      "name": "Micro 모델 생성 (Policy & Reference)",
+      "status": "✅"
+    },
+    "step6_dataset_download": {
+      "name": "데이터셋 원본 다운로드 (CodeContests, MBPP, HumanEval)",
+      "status": "❌"
+    },
+    "step8_dataset_small": {
+      "name": "Small 데이터셋 생성 및 검증",
+      "status": "❌"
+    },
+    "step9_verification": {
+      "name": "자산 무결성 검증 (모델 & 데이터셋)",
+      "status": "❌"
+    }
+  }
+}
