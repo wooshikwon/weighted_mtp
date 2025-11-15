@@ -7,7 +7,7 @@ WMTP 리팩토링 프로젝트는 `wmtp_research_proposal.md`에 정의된 목�
 ## 1. 프로젝트 목표 재정의
 
 - **간결한 실험 범위**: Baseline MTP, Verifiable Critic WMTP, Rho-1 Weighted 세 실험에 집중한다.
-- **Meta 네이티브 파이프라인**: Meta LLaMA MTP reference 구현을 직접 호출한다.
+- **Pure PyTorch 파이프라인**: Meta LLaMA MTP 아키텍처를 Pure PyTorch로 재구현하여 FSDP 완전 호환 및 safetensors 지원을 확보한다.
 - **VESSL A100 4-GPU 분산학습**: FSDP (Fully Sharded Data Parallel) 기반 효율적 멀티GPU 학습을 표준으로 한다.
   - storage → VESSL Storage (S3 미사용), MLflow 서버 구성은 기존 WMTP와 동일하게 재사용
   - 4-GPU 병렬 처리로 학습 시간 단축 및 대규모 배치 처리
@@ -279,8 +279,8 @@ weighted_mtp/
     # - Rank 2: samples[2::4]
     # - Rank 3: samples[3::4]
     ```
-- `vendor/meta_llama/`: Meta LLaMA reference 구현을 외부 의존성으로 명시. HuggingFace에서 직접 다운로드하여 배치. 업스트림 업데이트 시 이 디렉터리만 교체.
-- `src/models/meta_mtp/`: Meta reference를 래핑하는 adapter와 value head만 포함. `from vendor.meta_llama import Transformer`로 import.
+- `vendor/meta_llama/`: Meta LLaMA reference 구현 (참고용). 아키텍처 이해 및 검증에 활용하나, 실제 학습에는 사용하지 않음.
+- `src/models/meta_mtp/`: **Pure PyTorch Transformer 재구현** + Adapter + Value Head 포함. Meta 아키텍처를 순수 PyTorch로 재구현하여 fairscale 의존성 제거, FSDP 완전 호환, safetensors 저장 지원.
 - `src/data/datasets.py`: **메타데이터 기반 효율적 로딩** 및 **Stage별 샘플링 전략** 구현. 전체 데이터를 메모리에 로드하지 않고 메타데이터(`is_correct`, `difficulty`)만 읽어 필요한 샘플 인덱스를 계산한 후, JSONL에서 해당 라인만 선택적으로 읽어 99% 메모리 절감.
 - `src/data/prepare.py`: 데이터셋 전처리 및 스키마 검증 (instruction, input, output, is_correct, metadata). 메타데이터 추출 기능 포함.
 - `src/value_weighting/`: TD error 기반 가중치 계산 로직을 기능 단위로 분할하여 테스트 가능하도록 구성.
@@ -308,23 +308,66 @@ weighted_mtp/
 
 ## 6. 모델 아티팩트 규격
 
-### 6.1 Meta LLaMA MTP (Base, facebook/multi-token-prediction/7B_1T_4)
-- **Meta 배포 원본**
-  - `7B_1T_4/consolidated.pth` (PyTorch state_dict)
-  - `7B_1T_4/params.json` (모델 하이퍼파라미터: dim=4096, n_layers=32, n_heads=32, n_future_tokens=4, rope_theta=10000.0)
-  - `tokenizer.model` (LLaMA SentencePiece)
-  - `llama/{model.py,generation.py,tokenizer.py,__init__.py}` (레퍼런스 코드)
-- **프로젝트 표준 파생물(storage/models_v2/meta-llama-mtp)**
-  - `safetensors/model.safetensors` : `consolidated.pth`를 float16 그대로 변환한 파일
-  - `configs/params.json` : 원본 `params.json`을 복사(필요 시 추가 필드 포함)
-  - `configs/meta_adapter.yaml` : project adapter 설정 (`intermediate_size:11008`, `rope_theta:10000.0`, `dtype:float16`, `n_future_tokens:4` 등)
-  - `tokenizer/tokenizer.model` + `tokenizer/tokenizer_config.json`
-  - `metadata.json` : 버전, dtype(float16), SHA256, 변환 일자 기록
-  - `llama/*.py` : Meta 레퍼런스 코드를 `vendor/meta_llama/`로 이동 후 동기화
-- **검증 체크리스트**
-  - 변환 전후 dtype 유지(float16) 확인
-  - `meta_adapter.yaml`과 `params.json`의 dim/heads/rope 값 일치 검증
-  - SHA256 기록 및 MLflow에 업로드 경로 등록
+### 6.1 Meta LLaMA MTP (Base, Pure PyTorch 재구현)
+
+#### Meta 배포 원본 (참고용)
+- `7B_1T_4/consolidated.pth` (PyTorch state_dict)
+- `7B_1T_4/params.json` (모델 하이퍼파라미터: dim=4096, n_layers=32, n_heads=32, n_future_tokens=4, rope_theta=10000.0)
+- `tokenizer.model` (LLaMA SentencePiece)
+- `llama/{model.py,generation.py,tokenizer.py,__init__.py}` (레퍼런스 코드 - 아키텍처 참고용)
+
+#### Meta 레퍼런스 코드의 문제점
+Meta vendor 코드 (`vendor/meta_llama/model.py`)는 다음과 같은 치명적 문제가 있어 학습에 사용 불가:
+1. **fairscale 의존성**: `ParallelEmbedding`, `ColumnParallelLinear` 등 fairscale 라이브러리 사용 (pyproject.toml에 없음, model parallelism 불필요)
+2. **@torch.inference_mode()**: Gradient 계산 차단 → **학습 불가능**
+3. **.cuda() hardcoding**: MPS, CPU 지원 불가
+4. **FSDP 호환 불확실**: fairscale과 FSDP 충돌 가능성
+
+#### Pure PyTorch 재구현 (`src/weighted_mtp/models/meta_mtp/`)
+Meta 아키텍처를 정확히 유지하되, 순수 PyTorch로 재구현하여 학습 가능하도록 함:
+
+**핵심 구현**:
+- `transformer.py`: Pure PyTorch Transformer (358 lines)
+  - `nn.Embedding`, `nn.Linear` 사용 (fairscale 제거)
+  - `@torch.inference_mode()` 제거 → Gradient 계산 가능
+  - Device-agnostic (cuda/mps/cpu 자동 지원)
+  - RoPE, RMSNorm, SwiGLU, GQA 모두 순수 PyTorch 구현
+  - **Trunk + Extra heads 구조 유지**: n_layers=32, n_future_tokens=4 → layers 29개 + extra_heads 3개
+- `checkpoints.py`: Safetensors 로딩 (params.json + config.json 지원)
+- `value_head.py`: Unbounded linear value head
+- `adapter.py`: trunk_forward/full_forward wrapper
+
+**RoPE freqs_cis 처리 (safetensors 호환)**:
+- **문제**: RoPE freqs_cis는 complex64 타입 → safetensors 미지원 → 저장 불가
+- **해결**: freqs_cis를 `register_buffer` 대신 **일반 속성**으로 저장
+  ```python
+  # ✅ 개선 (현재)
+  self.freqs_cis = precompute_freqs_cis(...)  # state_dict 미포함
+
+  def forward(self, tokens):
+      # 명시적 device 이동
+      freqs_cis = self.freqs_cis[0:seqlen].to(tokens.device)
+  ```
+- **효과**:
+  - ✅ Safetensors 저장/로딩 가능
+  - ✅ FSDP checkpoint 저장 가능
+  - ✅ HuggingFace Hub 배포 가능
+  - ✅ State dict 크기 감소 (freqs_cis 제외)
+
+#### 프로젝트 표준 파생물 (storage/models_v2/meta-llama-mtp)
+- `safetensors/model.safetensors`: Pure PyTorch Transformer state_dict (freqs_cis 제외, runtime 자동 계산)
+- `configs/params.json`: 원본 params.json 복사
+- `tokenizer/tokenizer.model` + `tokenizer/tokenizer_config.json`
+- `metadata.json`: 버전, dtype(float16), SHA256, Pure PyTorch 구현 명시
+
+#### 검증 체크리스트
+- Pure PyTorch Transformer 생성 성공
+- Forward pass shape 정확: [batch, seq, n_future_tokens, vocab]
+- Gradient 계산 가능 확인
+- Safetensors 저장/로딩 정상 (freqs_cis 자동 생성)
+- Device 이동 정상 (cuda/mps/cpu)
+- FSDP wrapping 가능
+- Unit tests 11/11 통과
 
 ### 6.2 Reference (Rho-1) Model
 - **원본 자산**: Microsoft Rho-1(예: `microsoft/rho-math-7b-v0.1`)의 sharded PyTorch `.bin`과 `tokenizer.json`.

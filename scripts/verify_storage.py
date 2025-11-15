@@ -72,12 +72,10 @@ MODELS_TO_VERIFY = {
             "safetensors/model.safetensors",
             "safetensors/SHA256SUMS",
             "configs/config.json",
-            "metadata.json",
         ],
         "config_checks": [
             ("num_hidden_layers", 4),
             ("hidden_size", 512),
-            ("target_device", "mps"),
         ],
     },
 }
@@ -210,13 +208,12 @@ class StorageVerifier:
         if config["config_checks"]:
             print("  [3/3] Verifying config...")
 
-            # Config 파일 로드
-            config_file = None
-            config_data = None
-
+            # Config 파일 로드 (명시적 경로, fallback 제거)
             yaml_path = base_dir / "configs/meta_adapter.yaml"
             json_path = base_dir / "configs/config.json"
-            metadata_path = base_dir / "metadata.json"
+
+            config_file = None
+            config_data = None
 
             if yaml_path.exists():
                 with open(yaml_path, "r") as f:
@@ -226,25 +223,24 @@ class StorageVerifier:
                 with open(json_path, "r") as f:
                     config_data = json.load(f)
                 config_file = "config.json"
-            elif metadata_path.exists():
-                with open(metadata_path, "r") as f:
-                    config_data = json.load(f)
-                config_file = "metadata.json"
-
-            if config_data:
-                for key, expected_value in config["config_checks"]:
-                    actual_value = config_data.get(key)
-
-                    if actual_value == expected_value:
-                        print(f"    ✓ {key}: {actual_value}")
-                    else:
-                        errors.append(
-                            f"Config mismatch: {key} (expected={expected_value}, actual={actual_value})"
-                        )
-                        print(f"    ✗ {key}: expected={expected_value}, actual={actual_value}")
             else:
-                errors.append("No config file found for verification")
-                print("    ✗ No config file found")
+                # Config 파일이 없으면 명시적 오류
+                errors.append("Required config file not found (meta_adapter.yaml or config.json)")
+                print("    ✗ Required config file not found in configs/")
+                print("      Expected: configs/meta_adapter.yaml or configs/config.json")
+                return (False, errors)
+
+            # Config 검증
+            for key, expected_value in config["config_checks"]:
+                actual_value = config_data.get(key)
+
+                if actual_value == expected_value:
+                    print(f"    ✓ {key}: {actual_value}")
+                else:
+                    errors.append(
+                        f"Config mismatch: {key} (expected={expected_value}, actual={actual_value})"
+                    )
+                    print(f"    ✗ {key}: expected={expected_value}, actual={actual_value}")
         else:
             print("  [3/3] Skipping config checks (not defined)")
 

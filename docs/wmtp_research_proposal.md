@@ -43,6 +43,7 @@
   - Policy Gradient Theorem (Sutton et al. 1999, [NIPS](https://proceedings.neurips.cc/paper/1999/file/464d828b85b0bed98e80ade0a5c43b0f-Paper.pdf))
   - GAE (Schulman et al. 2015, [arXiv](https://arxiv.org/abs/1506.02438))
   - Off-policy Actor-Critic (Degris et al. 2012, [arXiv](https://arxiv.org/abs/1205.4839))
+  - **Implicit Q-Learning (IQL, Kostrikov et al. 2021, [arXiv](https://arxiv.org/abs/2110.06169))**: Advantage 기반 exponential weighting (`exp(advantage/β)`). 본 연구는 이 패턴을 차용하되 Q function 없이 TD error로 단순화.
 
 **본 연구의 위치**: WMTP는 MTP의 병렬 예측 이점을 토큰-수준 중요도 가중과 결합하며, 실용적으로 구현 가능한 3가지 핵심 방식을 체계적으로 비교한다. Verifiable Critic은 RM 의존성을 제거하여 메모리 효율성과 객관성을 강화하고, Rho-1은 참조 모델 비교로 간결한 가중화를 제공한다.
 
@@ -76,59 +77,81 @@ w_{t,k} = 1.0 (모든 k)
   - 모든 토큰 균등 학습
   - WMTP 방식들의 성능 이득 측정 기준
 
-#### **방식 2: Verifiable Critic WMTP**
+#### **방식 2: Verifiable Critic WMTP (표준 TD Learning 기반)**
 
-데이터셋의 검증 가능한 레이블(is_correct)을 reward signal로 사용하여 TD error 기반 토큰 가중치를 산출한다.
+데이터셋의 검증 가능한 레이블(is_correct)을 reward signal로 사용하여 표준 TD error 기반 토큰 가중치를 산출한다.
 
+**TD Error 계산 (표준 Temporal Difference)**:
+
+```python
+# MTP 시나리오: 시점 t에서 미래 토큰 x_{t+1}, ..., x_{t+H} 예측
+# 상태 표기: s_{k-1} = 토큰 x_k 생성 전 prefix, s_k = 토큰 x_k 생성 후
+
+# Intermediate tokens (k < T): Bootstrapping
+δ_k = r_k + γV(s_k) - V(s_{k-1})
+    = γV(s_k) - V(s_{k-1})  # r_k = 0 (중간 토큰은 보상 없음)
+
+# Terminal token (k = T): Direct reward
+δ_T = R - V(s_{T-1})  # V(terminal) = 0 가정
 ```
-토큰 x_k의 가중치: w_k = exp(δ_k / β)  (β=0.9)
 
-TD error (표준 Temporal Difference):
-  # Intermediate tokens (k < T): Bootstrapping
-  δ_k = r_k + γV(s_k) - V(s_{k-1})
-      = 0 + γV(s_k) - V(s_{k-1})        # r_k = 0 (중간 토큰은 보상 없음)
-      = γV(s_k) - V(s_{k-1})            ✅
+**Token-level Weighting (표준 Bootstrapping)**:
 
-  # Terminal token (k = T): Direct reward
-  δ_T = r_T + γV(terminal) - V(s_{T-1})
-      = R + 0 - V(s_{T-1})              # V(terminal) = 0
-      = R - V(s_{T-1})                  ✅
+```python
+# 가중치 계산 (IQL/AWR 방식 차용)
+weight_k = exp(td_error_k / β)  # β = 0.9 (temperature)
+
+# Weight clipping (보수적 안정 장치)
+weight_k = clamp(weight_k, min=0.1, max=5.0)
 ```
-
-**TD Error 공식 설명 (표준 RL)**:
-- **MTP 시나리오**: 시점 t에서 미래 토큰 x_{t+1}, ..., x_{t+H} 예측
-- **표준 TD Learning 적용**:
-  - 토큰 x_k의 상태: `s_{k-1} = (x_0, ..., x_{k-1})` (토큰 x_k 생성 **전**)
-  - 생성 후 상태: `s_k = (x_0, ..., x_k)` (토큰 x_k 생성 **후**)
-- **Intermediate tokens (k < T)**:
-  - `δ_k = γV(s_k) - V(s_{k-1})` (Bootstrapping)
-  - 다음 상태의 가치 함수로 현재 토큰의 기여도 추정
-  - 분산 감소 효과 (GAE의 기반)
-- **Terminal token (k = T)**:
-  - `δ_T = R - V(s_{T-1})` (Direct reward)
-  - 실제 보상 R을 직접 사용 (bootstrapping 불필요)
-- **R (reward)**: Terminal 누적 보상 (LLM에서 = 최종 보상, binary: 0 or 1)
-- **γ (gamma)**: 할인 계수 (일반적으로 0.99, LLM에서는 1.0 가능)
-- **직관**: δ_k는 "토큰 x_k를 선택한 것의 marginal value"
-- **이론적 근거**:
-  - Sutton & Barto "RL: An Introduction" - 표준 TD(0) 공식
-  - TDRM (2024): Intermediate bootstrapping + Terminal direct reward
-  - Policy Gradient Theorem (Sutton et al. 1999)
 
 **핵심 특징**:
+- **직관**: δ_k는 "토큰 x_k를 선택한 것의 marginal value"
+- **Bootstrapping 효과**:
+  - Intermediate: 다음 상태 V(s_k)로 현재 토큰 기여도 추정 → 분산 감소
+  - Terminal: 실제 보상 R 직접 사용 → 편향 없음
+- **V function only**: Q function 불필요, terminal state 가정
+- **정규화 불필요**: Binary reward [0,1] 환경에서 TD error 자연 bounded [-1,1]
+- **Sample-level filtering 효과**: Incorrect 샘플은 낮은 reward → 음수 TD error → weight < 1
+
+**Value Head 구현**:
+- **구조**: Unbounded linear (표현력 유지, RLHF 표준)
+- **입력**: Meta 모델 hidden state (norm 적용 후)
+- **출력**: Scalar value (unbounded)
+
+**Critic Continual Learning (PPO Best Practice)**:
+- **Stage2에서 Value Loss를 Auxiliary Loss로 추가**: Policy 학습 중 critic도 지속 학습
+- **Loss 구조**: `total_loss = weighted_ce_loss + value_coef * value_loss`
+- **Value Coefficient**: 0.5 (Stable Baselines3 표준) 또는 1.0 (HuggingFace TRL)
+- **Value Loss Clipping**: MSE 또는 Huber loss에 clipping 적용 (clip_range=0.2)
+- **Monitoring**: Value explained variance 추적 (1.0에 가까울수록 이상적)
+- **Gradient Clipping**: Global gradient norm clipping (max_grad_norm=0.5~1.0)
+
+**안정화 메커니즘**:
+- **Value drift 방지**: Value loss 클리핑 (value_clip=0.2), EMA/anchor 손실 병행
+- **Reward 스케일**: Binary reward [0,1] 고정 (정규화 불필요), TD error 자연 bounded
+- **2단계 학습**: Stage 1 (Value Head Pretrain 0.5 epoch) + Stage 2 (Weighted Training 2.5 epoch)
+
+**실무적 이점**:
 - **Reward 소스**: 데이터셋 레이블 (코드 실행 결과, 수학 정답)
 - **RM 불필요**: ~28GB VRAM 절약
 - **객관적 보상**: Ground truth 기반 신뢰성
 - **데이터**: 정답+오답 모두 학습 (negative signal 활용)
-- **학습 구조**: 2단계 (Pretrain 0.5 epoch + Main 2.5 epoch)
 
-**이론적 정당성**:
-- Policy Gradient Theorem: 이득(Advantage)으로 로그우도 가중 시 분산 감소와 수렴 보장 (Sutton et al. 1999)
-- GAE: Temporal Difference와 Monte Carlo의 균형으로 분산 저감 (Schulman et al. 2015)
+**이론적 근거**:
+- **Sutton & Barto "RL: An Introduction"**: 표준 TD(0) 공식
+- **TDRM (2024)**: Intermediate bootstrapping + Terminal direct reward
+- **Policy Gradient Theorem (Sutton et al. 1999)**: Advantage 기반 가중으로 분산 감소와 수렴 보장
+- **IQL/AWR**: Exponential weighting 방식 (`exp(advantage/β)`) 차용, Q function 없이 V function만 사용
 
 **적용 데이터셋**:
-- CodeContests (507K solutions, 57.3% correct)
-- MATH, MBPP with incorrect solutions
+- CodeContests (3.7M samples: correct 1.75M + incorrect 1.94M)
+- MATH, MBPP with incorrect solutions (향후 확장)
+
+**추가 모니터링**:
+- Critic drift 감시: KL divergence 또는 cosine distance 선택적 기록
+- Value explained variance: Critic 품질 지표
+- TD error 분포: Bounded 특성 검증
 
 **RM Critic과의 비교**:
 
@@ -166,13 +189,16 @@ w_{t,k} = softmax(excess_loss_{t,k} / T)
 
 | 특성 | Baseline MTP | Verifiable Critic | Rho-1 Weighted |
 |------|-------------|-------------------|----------------|
-| **가중치 산출** | 상수 (1.0) | TD error (동적 학습) | Reference CE 차이 (정적 비교) |
+| **가중치 산출** | 상수 (1.0) | TD error (표준 Bootstrapping) | Reference CE 차이 (정적 비교) |
 | **외부 모델** | 불필요 | 불필요 (RM 제거) | 필요 (Reference) |
-| **메모리 효율** | 표준 | 높음 | 표준 |
-| **데이터 요구** | 정답만 | 정답+오답 | 정답만 |
-| **학습 안정성** | 높음 | 중간 (Value drift 위험) | 높음 |
-| **구현 복잡도** | 낮음 | 높음 (2단계 학습) | 중간 (Reference 관리) |
-| **이론적 기반** | 표준 SFT | Policy Gradient | 정보 이론 |
+| **메모리 효율** | 표준 | 높음 (~28GB 절약) | 표준 |
+| **데이터 요구** | 정답만 | 정답+오답 (3.7M) | 정답만 |
+| **학습 안정성** | 높음 | 중간 (Continual Learning으로 완화) | 높음 |
+| **구현 복잡도** | 낮음 | 높음 (Value Head + 2단계) | 중간 (Reference 관리) |
+| **이론적 기반** | 표준 SFT | TD Learning (Sutton & Barto) | 정보 이론 |
+| **Weight 특성** | 균등 | Exponential (IQL/AWR), Clipping | Continuous (Softmax) |
+| **정규화** | 불필요 | 불필요 (Binary reward bounded) | Softmax 내장 |
+| **Negative signal** | 미사용 | 활용 (weight < 1) | 미사용 |
 
 ### 4.4 실무적 고려(원칙)
 
@@ -258,9 +284,12 @@ w_{t,k} = softmax(excess_loss_{t,k} / T)
 - **시점 정렬 유효성**: MTP 헤드 k ↔ t+k 예측이 항상 일치하도록 라벨 시프트·마스킹을 자동 검증.
 
 - **Verifiable Critic 안정화**:
-  - GAE(λ), 보상/이득 정규화, auxiliary loss (히든 상태 앵커, 가치-헤드 정규화)
-  - KL/Trust-region으로 Value drift 완화
-  - 2단계 학습 (Pretrain 0.5 epoch + Main 2.5 epoch)
+  - **Critic Continual Learning**: Stage2에서 Value Loss를 Auxiliary Loss로 추가 (`total_loss = weighted_ce_loss + value_coef * value_loss`)
+  - **Value Loss Clipping**: MSE/Huber loss + clipping (clip_range=0.2)
+  - **Value Coefficient**: 0.5 (Stable Baselines3) 또는 1.0 (HuggingFace TRL)
+  - **Monitoring**: Value explained variance, TD error 분포, Critic drift (KL/cosine)
+  - **Gradient Clipping**: Global norm clipping (max_grad_norm=0.5~1.0)
+  - **2단계 학습**: Stage 1 (Value Head Pretrain 0.5 epoch) + Stage 2 (Weighted Training 2.5 epoch)
 
 - **Rho-1 안정화**:
   - min_ce_diff로 노이즈 필터링
@@ -275,8 +304,8 @@ w_{t,k} = softmax(excess_loss_{t,k} / T)
 - **토큰화/정렬 불일치**: w 오산정·손실 왜곡 → 동일 토크나이저 강제, 정렬 자동 검증, 실패 시 배치 제외
 
 **Verifiable Critic 특유 리스크**:
-- **Value drift**: 가치 표류로 가중 왜곡 → GAE(λ), KL/Trust-region, auxiliary 표현 고정화, 2단계 학습
-- **Binary sparsity**: 0/1 보상의 sparsity → Z-score 정규화, 충분한 positive/negative 샘플 확보
+- **Value drift**: 가치 표류로 가중 왜곡 → Critic Continual Learning (Value Loss를 Auxiliary Loss로 추가), Value Loss Clipping, Gradient Clipping, 2단계 학습
+- **Binary reward bounded**: Binary reward [0,1] 환경에서 TD error 자연 bounded [-1,1] → 정규화 불필요, 충분한 positive/negative 샘플 확보 (correct 1.75M + incorrect 1.94M)
 
 **Rho-1 특유 리스크**:
 - **참조 비용**: Reference 과도 사용 시 비용 급증 → 샘플링/주기화, 캐시·오프라인 스코어링
@@ -347,3 +376,7 @@ w_{t,k} = softmax(excess_loss_{t,k} / T)
 - Mroueh (2025). GRPO's Effective Loss, Dynamics, and Data Efficiency. — [arXiv](https://arxiv.org/html/2503.06639v1)
 
 - Zhuang et al. (2025). Not All Thoughts Are Equal: Thought-Level Reinforcement Learning with Goal-Gradient Importance. — [arXiv](https://arxiv.org/abs/2505.08392)
+
+- Sutton & Barto (2018). Reinforcement Learning: An Introduction (2nd Edition). — [PDF](http://incompleteideas.net/book/RLbook2020.pdf)
+
+- Kostrikov et al. (2021). Offline Reinforcement Learning with Implicit Q-Learning (IQL). — [arXiv](https://arxiv.org/abs/2110.06169)

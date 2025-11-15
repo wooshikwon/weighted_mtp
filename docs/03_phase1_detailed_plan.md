@@ -57,32 +57,108 @@
 
 ---
 
-## Step 3. Meta LLaMA MTP 파생 자산 생성
-- **목표**: `consolidated.pth`를 프로젝트 표준 구조로 변환하고 검증한다.
+## Step 3. Meta LLaMA MTP 파생 자산 생성 (Pure PyTorch)
+- **목표**: Pure PyTorch Transformer를 생성하고 safetensors로 저장한다. Meta vendor 코드는 참고용으로만 사용하며, 실제 학습에는 Pure PyTorch 재구현을 사용한다.
 - **작업**
-  1. safetensors 변환 및 SHA256 기록
+  1. **Pure PyTorch Transformer 생성 및 safetensors 저장**
      ```bash
      python - <<'PY'
+     import json
      import torch
-     from safetensors.torch import save_file, safe_open
+     from safetensors.torch import save_file
      from pathlib import Path
+     from weighted_mtp.models.meta_mtp import ModelArgs, Transformer
 
-     raw = Path("storage/models_v2/meta-llama-mtp/raw/7B_1T_4/consolidated.pth")
-     out = Path("storage/models_v2/meta-llama-mtp/safetensors/model.safetensors")
-     state_dict = torch.load(raw, map_location="cpu")
-     save_file(state_dict, out, metadata={"dtype": "float16"})
+     # params.json 읽기
+     params_path = Path("storage/models_v2/meta-llama-mtp/raw/7B_1T_4/params.json")
+     with open(params_path) as f:
+         params = json.load(f)
+
+     # ModelArgs 생성
+     model_args = ModelArgs(
+         dim=params["dim"],
+         n_layers=params["n_layers"],
+         n_heads=params["n_heads"],
+         n_kv_heads=params.get("n_kv_heads"),
+         vocab_size=params["vocab_size"],
+         n_future_tokens=params.get("n_future_tokens", 4),
+         rope_theta=params.get("rope_theta", 10000.0),
+         max_seq_len=params.get("max_position_embeddings", 2048),
+         norm_eps=params.get("rms_norm_eps", 1e-5),
+     )
+
+     # Pure PyTorch Transformer 생성
+     transformer = Transformer(model_args)
+
+     # Meta 원본 weights 로드 (선택적)
+     raw_path = Path("storage/models_v2/meta-llama-mtp/raw/7B_1T_4/consolidated.pth")
+     if raw_path.exists():
+         state_dict = torch.load(raw_path, map_location="cpu")
+         transformer.load_state_dict(state_dict, strict=True)
+
+     # Safetensors 저장 (freqs_cis는 자동 제외됨)
+     out_path = Path("storage/models_v2/meta-llama-mtp/safetensors/model.safetensors")
+     save_file(
+         transformer.state_dict(),
+         str(out_path),
+         metadata={"dtype": "float16", "implementation": "pure_pytorch"}
+     )
+     print(f"✅ Safetensors 저장 완료: {out_path}")
+     print(f"  - freqs_cis는 자동 제외됨 (runtime 계산)")
      PY
+
+     # SHA256 기록
      sha256sum storage/models_v2/meta-llama-mtp/safetensors/model.safetensors \
        > storage/models_v2/meta-llama-mtp/safetensors/SHA256SUMS
      ```
-  2. `params.json` 복사 → `configs/params.json` (필요 시 추가 필드 포함).
-  3. `configs/meta_adapter.yaml` 작성 (dim=4096, num_layers=32, n_future_tokens=4, intermediate_size=11008, rope_theta=10000.0, dtype=float16).
-  4. `tokenizer_config.json` 생성 (`model_type: sentencepiece`, `vocab_size: 32000` 등).
-  5. `metadata.json` 작성 (dtype, SHA256, 원본 repo, 생성 일자 기록).
+
+     **핵심 구현 원칙**:
+     - **Pure PyTorch 구조**: `nn.Embedding`, `nn.Linear` 사용 (fairscale 제거)
+     - **Gradient 계산 가능**: `@torch.inference_mode()` 제거
+     - **Device-agnostic**: cuda/mps/cpu 자동 지원
+     - **RoPE freqs_cis 처리**: 일반 속성으로 저장 (state_dict 미포함), forward 시 runtime 계산
+     - **Safetensors 호환성**: complex64 타입 제외로 완전한 호환성 확보
+
+  2. **Config 파일 생성**
+     - `params.json` 복사 → `configs/params.json`
+     - `configs/meta_adapter.yaml` 작성 (dim=4096, num_layers=32, n_future_tokens=4, intermediate_size=11008, rope_theta=10000.0, dtype=float16)
+     - `tokenizer_config.json` 생성 (`model_type: sentencepiece`, `vocab_size: 32000`)
+
+  3. **metadata.json 작성**
+     ```json
+     {
+       "model_name": "meta-llama-mtp",
+       "version": "v2.0.0",
+       "implementation": "pure_pytorch",
+       "n_params": 6.7e9,
+       "format": "safetensors",
+       "dtype": "float16",
+       "source": {
+         "architecture": "Meta LLaMA MTP (Pure PyTorch reimplementation)",
+         "original_repo": "facebook/multi-token-prediction",
+         "original_revision": "7B_1T_4",
+         "note": "vendor/meta_llama/ 참고용, 실제 구현은 src/models/meta_mtp/"
+       },
+       "safetensors": {
+         "freqs_cis_handling": "runtime_computed",
+         "note": "freqs_cis는 complex64 타입(safetensors 미지원)으로 state_dict 미포함"
+       },
+       "distributed": {
+         "fsdp_compatible": true
+       }
+     }
+     ```
+
 - **검증**
-  - `scripts/verify_mtp_model.py` 실행 → 모든 체크 통과.  
-  - dtype=float16, rope_theta=10000.0 확인.  
-  - `meta_adapter.yaml` ↔ `params.json` ↔ `metadata.json` 파라미터가 모두 일치.
+  - Pure PyTorch Transformer 생성 성공 (fairscale 의존성 없음)
+  - Forward pass shape 정확: `[batch, seq, n_future_tokens, vocab]`
+  - Gradient 계산 가능 확인
+  - Safetensors 저장/로딩 정상 (freqs_cis 자동 제외)
+  - Device 이동 정상 (cuda/mps/cpu)
+  - FSDP wrapping 가능
+  - dtype=float16, rope_theta=10000.0 확인
+  - `meta_adapter.yaml` ↔ `params.json` ↔ `metadata.json` 파라미터 일치
+  - Unit tests 통과
 
 ---
 
@@ -109,38 +185,81 @@
 
 ---
 
-## Step 5. Micro 모델 생성 (Policy & Reference)
-- **목표**: 로컬 M3 환경에서 Baseline과 Rho-1 실험을 빠르게 검증할 수 있도록 정책/레퍼런스용 경량 safetensors를 준비한다.
+## Step 5. Micro 모델 생성 (Pure PyTorch, Policy & Reference)
+- **목표**: 로컬 M3 환경에서 Pure PyTorch 구조로 경량 모델을 생성하여 빠르게 검증한다.
 - **작업**
-  1. **Micro Policy (Meta MTP 축소판)**
+  1. **Micro Policy (Pure PyTorch 경량 모델)**
      ```bash
-     uv run python scripts/prepare_local_small_model.py \
-       --source storage/models_v2/meta-llama-mtp/safetensors/model.safetensors \
-       --target storage/models_v2/micro-mtp
+     # Pure PyTorch 구조로 Micro 모델 재생성
+     uv run python scripts/regenerate_micro_model.py
+
+     # 또는 수동 생성:
+     python - <<'PY'
+     import json
+     from pathlib import Path
+     import torch
+     from safetensors.torch import save_file
+     from weighted_mtp.models.meta_mtp import ModelArgs, Transformer
+
+     # Config 읽기
+     config_path = Path("storage/models_v2/micro-mtp/configs/config.json")
+     with open(config_path) as f:
+         config = json.load(f)
+
+     # ModelArgs 생성
+     model_args = ModelArgs(
+         dim=config["hidden_size"],
+         n_layers=config["num_hidden_layers"],
+         n_heads=config["num_attention_heads"],
+         n_kv_heads=config["num_key_value_heads"],
+         vocab_size=config["vocab_size"],
+         n_future_tokens=config["n_future_tokens"],
+         rope_theta=config["rope_theta"],
+         max_seq_len=config["max_position_embeddings"],
+         norm_eps=config["rms_norm_eps"],
+     )
+
+     # Pure PyTorch Transformer 생성 (랜덤 초기화)
+     transformer = Transformer(model_args)
+
+     # Safetensors 저장 (freqs_cis 자동 제외)
+     out_path = Path("storage/models_v2/micro-mtp/safetensors/model.safetensors")
+     save_file(transformer.state_dict(), str(out_path))
+     print(f"✅ Micro 모델 생성 완료: {out_path}")
+     PY
+
+     # SHA256 기록
      sha256sum storage/models_v2/micro-mtp/safetensors/model.safetensors \
        > storage/models_v2/micro-mtp/safetensors/SHA256SUMS
      ```
-     - 출력: 4-layer/512-dim, vocab 32000 모델 (Meta LLaMA tokenizer 공유).
-     - 구성 파일: `micro-mtp/configs/config.json`, `tokenizer/tokenizer.model`, `metadata.json(target_device: "mps", dtype: float16)`.
-  2. **Micro Reference**
-     - Sheared-LLaMA 2.7B 모델을 동일 방식으로 축소하여 로컬 테스트용 reference 모델 생성.  
-     - 스크립트 예시(향후 `prepare_micro_reference.py`로 분리 가능):
-       ```bash
-       uv run python scripts/prepare_micro_reference.py \
-         --source storage/models_v2/ref-sheared-llama-2.7b/safetensors/model.safetensors \
-         --target storage/models_v2/micro-ref
-       sha256sum storage/models_v2/micro-ref/safetensors/model.safetensors \
-         > storage/models_v2/micro-ref/safetensors/SHA256SUMS
-       ```
-       - 최소 4-layer, hidden_size 512 수준으로 축소하고, Base와 동일 토크나이저를 공유하도록 `metadata.json.tokenizer_shared_with="meta-llama-mtp"` 기록.
+
+     **Micro 모델 특징**:
+     - **Pure PyTorch 구조**: Trunk + Extra heads 분리 (n_layers=4, n_future_tokens=4 → layers 1개 + extra_heads 3개)
+     - **경량화**: 4-layer/512-dim, vocab 32000
+     - **Safetensors 호환**: freqs_cis 자동 제외, runtime 계산
+     - **Config**: `config.json`, `tokenizer/`, `metadata.json(target_device: "mps")`
+
+  2. **Micro Reference (선택적)**
+     - Sheared-LLaMA 2.7B 모델을 동일 방식으로 축소
+     - Base와 동일 토크나이저 공유 (`metadata.json.tokenizer_shared_with="meta-llama-mtp"`)
+
 - **산출물**
-  - `storage/models_v2/micro-mtp/` (필수)  
-  - `storage/models_v2/micro-ref/` (필요 시)  
-  - 각 디렉터리의 safetensors/config/tokenizer/metadata/SHA256SUMS.
+  - `storage/models_v2/micro-mtp/` (필수)
+    - `safetensors/model.safetensors` (freqs_cis 제외)
+    - `configs/config.json`
+    - `tokenizer/tokenizer.model`
+    - `metadata.json`
+    - `safetensors/SHA256SUMS`
+  - `storage/models_v2/micro-ref/` (선택적)
+
 - **검증**
-  - 파일 크기 < 50MB, dtype=float16 유지.  
-  - `uv run pytest tests/unit/test_adapter.py -k micro` 통과.  
-  - (Micro reference 사용 시) Rho-1 비교 스크립트와 토크나이저 호환성 확인.
+  - Pure PyTorch Transformer 생성 성공
+  - Trunk + Extra heads 구조 정확 (layers 1개 + extra_heads 3개)
+  - Forward pass shape: `[batch, seq, n_future_tokens, vocab]`
+  - Safetensors 저장/로딩 정상 (freqs_cis runtime 계산)
+  - 파일 크기 < 50MB, dtype=float16 유지
+  - **Unit tests 11/11 통과**: `uv run pytest tests/unit/test_adapter.py -k micro`
+  - Device 이동 정상 (mps/cpu)
 
 ---
 
