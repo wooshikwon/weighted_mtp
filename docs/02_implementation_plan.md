@@ -89,21 +89,17 @@
     - Output만 실제 token ID 유지 (loss 계산 대상)
     - attention_mask는 모든 토큰 포함 (전체 context 활용)
     - n_future_tokens 대응 (MTP 헤드용)
-  - `src/data/transforms.py`: 런타임 변환
-    - Padding, truncation (max_length=2048, 토큰 필터링 이미 적용됨)
-    - Batching utilities
-  - DataLoader 통합 및 테스트
 - **데이터셋 규모** (실제):
   - CodeContests: train 3.69M, valid 14.7K, test 14.8K (correct + incorrect 통합)
   - **Difficulty 분포**: diff=7 (86.7%), diff=2 (6.4%), diff=1 (4.4%), diff=11 (2.1%), diff=6 (0.4%)
   - MBPP: train 374, validation 90, test 500
   - HumanEval: test 164
-- **산출물**: src/data/ 모듈 (datasets.py, collators.py, transforms.py), unit tests
+- **산출물**: src/data/ 모듈 (datasets.py, collators.py), unit tests, integration tests
 - **검증 기준**
   - JSONL 로딩 및 DatasetDict 생성 성공
   - Collator가 instruction/input을 -100으로 마스킹 (unit test)
   - Output 토큰만 loss 계산 확인
-  - DataLoader 배치 생성 및 shape 검증 통과
+  - Stage별 샘플링 분포 검증 (integration test)
 
 ### P4. Meta Adapter 통합
 - **목표**  
@@ -220,7 +216,8 @@
 - **문서화**: 설계·준비·구현·운영 문서가 최신 상태로 유지되며, 제안서에 명시된 세 실험 비교 보고가 가능하다.
 # WMTP 리팩토링 Phase별 구현 계획
 
-본 문서는 `docs/00_ideal_structure.md`와 `docs/01_storage_preparation_plan.md`를 실제 코드/데이터 자산으로 구현하기 위한 상세 단계별 로드맵이다. 모든 Phase는 **철학 → 구현 단위 → 산출물 → 검증 기준**을 명확히 정의하며, 순차적으로 수행하되 병렬 가능한 작업은 명시된 조건을 만족할 때에 한해 병행한다.
+본 문서는 `docs/00_ideal_structure.md`와 `docs/01_storage_preparation_plan.md`를 실제 코드/데이터 자산으로 구현하기 위한 상세 단계별 로드맵이다. 
+모든 Phase는 **철학 → 구현 단위 → 산출물 → 검증 기준**을 명확히 정의하며, 순차적으로 수행하되 병렬 가능한 작업은 명시된 조건을 만족할 때에 한해 병행한다.
 
 ---
 
@@ -228,7 +225,7 @@
 
 1. **Meta 네이티브 우선**: 모델 로딩·forward는 Meta 레퍼런스 구현을 직접 호출하는 Adapter 기반 구조를 유지한다. HuggingFace 호환 계층은 제거한다.
 2. **단순·명료한 파이프라인**: 3개 핵심 실험(Baseline, Verifiable Critic, Rho-1 Weighted)에 집중하고, 각 실험은 동일한 파이프라인 위에서 recipe 차이만 남긴다.
-3. **TD error 기반 가중치 안정화**: GAE, Z-score, weight 정규화/클리핑 등 critic-weighted WMTP에 필요한 안정화 기법을 내장한다.
+3. **TD error 기반 가중치 안정화**: GAE, weight 정규화/클리핑 등 critic-weighted WMTP에 필요한 안정화 기법을 내장한다.
 4. **storage/의 단일화**: 변환된 dataset/model은 `01_storage_preparation_plan.md` 스키마에 맞추어 staging한다. 코드베이스에는 로직만, 자산은 storage에만 둔다.
 5. **검증 우선 개발**: 각 Phase는 최소 하나 이상의 자동 테스트 또는 체크리스트를 통과해야 다음 Phase로 진행할 수 있다.
 

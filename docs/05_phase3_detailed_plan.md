@@ -363,52 +363,6 @@ assert (labels[:10] == -100).all()
 assert (labels[-50:][labels[-50:] != -100]).numel() > 0
 ```
 
-### 4.3 Step 3: 통합 및 검증
-
-#### 통합 파이프라인
-
-```python
-# Stage 1 예시
-tokenizer = LlamaTokenizer.from_pretrained("storage/models_v2/meta-llama-mtp/tokenizer")
-dataset = load_dataset(
-    "codecontests",
-    split="train",
-    stage="stage1",
-    n_samples=50000,
-    balance_correct=True,
-    seed=42
-)
-collator = AlpacaDataCollator(tokenizer, max_length=2048)
-dataloader = DataLoader(dataset, batch_size=8, collate_fn=collator)
-
-# 배치 생성 테스트
-batch = next(iter(dataloader))
-assert batch["input_ids"].shape == (8, 2048)
-assert batch["labels"].shape == (8, 2048)
-```
-
-#### End-to-End 검증
-
-**시나리오 1: Stage 1 파이프라인**
-1. load_dataset() → 50K 샘플, is_correct 균형
-2. AlpacaDataCollator → masking 적용
-3. DataLoader → 배치 생성 (batch_size=8)
-4. 검증: correct 비율, masking 경계, shape
-
-**시나리오 2: Stage 2 파이프라인**
-1. load_dataset() → 200K 샘플, difficulty 가중치
-2. AlpacaDataCollator → masking 적용
-3. DataLoader → 배치 생성
-4. 검증: difficulty 분포, masking 경계
-
-**시나리오 3: Epoch 루프**
-```python
-for epoch in range(3):
-    for batch in dataloader:
-        assert batch["input_ids"].shape[0] <= 8
-        assert (batch["labels"] != -100).any()  # output 영역 존재
-```
-
 ---
 
 ## Part 5: 검증 및 위험 관리
@@ -568,8 +522,6 @@ pytest tests/integration/test_stage2_pipeline.py -v
   - get_dataset_config() 함수
 - [ ] `src/weighted_mtp/data/collators.py` 구현
   - AlpacaDataCollator 클래스
-- [ ] `src/weighted_mtp/data/transforms.py` 구현 (선택)
-  - Padding, truncation utilities
 
 #### 테스트 완성
 - [ ] `tests/unit/test_datasets.py`

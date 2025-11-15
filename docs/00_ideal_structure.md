@@ -133,8 +133,7 @@ weighted_mtp/
 │   ├── data/
 │   │   ├── __init__.py
 │   │   ├── datasets.py                    # JSONL 로딩, HF Dataset 캐시, Stage별 샘플링 전략
-│   │   ├── collators.py                   # MTP용 data collator (instruction/input masking)
-│   │   ├── transforms.py                  # 토큰 마스킹, truncation
+│   │   ├── collators.py                   # MTP용 data collator (instruction/input masking, padding, truncation)
 │   │   └── prepare.py                     # 데이터셋 전처리 (스키마 검증)
 │   ├── models/
 │   │   ├── __init__.py
