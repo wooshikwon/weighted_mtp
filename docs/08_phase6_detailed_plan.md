@@ -1,12 +1,12 @@
-# Phase 6: Config & CLI 체계 구현 가이드
+# Phase 6: CLI 파이프라인 연동 구현 가이드
 
 ## 문서 개요
 
-본 문서는 **Phase 6: Config & CLI 체계 구현**을 위한 실행 가이드입니다. Phase 5에서 구현된 학습 파이프라인을 사용자가 CLI로 실행 가능하도록 만들고, 3가지 실험(Baseline, Verifiable Critic, Rho-1 Weighted)을 설정 기반으로 자동 실행하는 시스템을 구축합니다.
+본 문서는 **Phase 6: CLI 파이프라인 연동 구현**을 위한 실행 가이드입니다. Phase 5에서 구현된 학습 파이프라인을 사용자가 CLI로 실행할 수 있도록 연결하고, Validation evaluation, Best checkpoint 저장, MLflow 로깅 등 프로덕션 학습에 필수적인 기능을 추가합니다.
 
-**버전**: v1.0 (2025-11-16)
-**선행 조건**: Phase 5 (학습 파이프라인) 완료
-**목표**: CLI 진입점 → Config 로딩 → 파이프라인 실행 → MLflow 로깅
+**버전**: v2.0 (2025-01-16)
+**선행 조건**: Phase 5 (Value Training 파이프라인) 완료
+**목표**: CLI → Config → Resource Loading → Training Pipeline → MLflow 전체 흐름 완성
 
 ---
 
@@ -14,1375 +14,897 @@
 
 ### 1.1 Phase 6의 위치와 목적
 
-Phase 6는 **사용자 진입점**과 **파이프라인 연결**의 최종 구간입니다.
+Phase 6는 **사용자 진입점 → 파이프라인 실행** 연결의 핵심 구간입니다.
 
 ```
-Phase 5 (pipeline)  →  [Phase 6 (config/CLI)]  →  사용자 실행
-  run_training_pipeline()     CLI argparse + Config           실험 자동화
+Phase 5 (pipeline)  →  [Phase 6 (CLI + Config + MLflow)]  →  실제 학습 실행
+  run_training_pipeline()      사용자 커맨드 → 실행             VESSL/로컬
 ```
 
-**핵심 질문**: 어떻게 사용자가 간단한 명령어로 3가지 실험을 실행할 수 있게 만들 것인가?
+**핵심 질문**: 사용자가 `python -m weighted_mtp.cli.train --recipe configs/recipe.verifiable.yaml` 한 줄로 어떻게 전체 학습을 실행할 것인가?
 
-### 1.2 현재 상태 분석
+### 1.2 Phase 6의 핵심 기능
 
-**기존 구현 현황** (`cli/train.py`):
-- ✅ `deep_merge()`: Config 중첩 병합 구현
-- ✅ `load_config()`: YAML 로딩 구현
-- ✅ argparse 기본 골격 (--config, --recipe, --preset, --use-micro-model, --dry-run, --run-name)
-- ❌ 파이프라인 연결 없음 (TODO 주석만 존재)
+#### 기능 1: Config 시스템 (defaults + recipe deep merge)
 
-**기존 구현 현황** (`pipelines/training.py`):
-- ✅ `run_training_pipeline()`: Stage 1/2 오케스트레이션 완료
-- ✅ Fractional epochs 지원 (0.5, 2.5)
-- ✅ Checkpoint 저장, Metrics 수집
-- ❌ CLI와 연결 없음
+**문제 인식**:
+- 모든 설정을 recipe에 반복 작성하면 유지보수 어려움
+- 실험마다 다른 부분(dataset, beta, value_coef)만 override하고 싶음
 
-**기존 Config 파일**:
-- ✅ `configs/defaults.yaml`: 공통 설정 존재
-- ✅ `configs/recipe.*.yaml`: 3개 실험 레시피 존재
-- ❌ Config 구조와 파이프라인 입력 불일치
-
-### 1.3 Phase 6 핵심 목표
-
-**목표 1: CLI 진입점 완성**
-- `uv run python -m weighted_mtp.cli.train` 명령으로 학습 실행 가능
-- --recipe 옵션으로 3가지 실험 자동 선택
-
-**목표 2: Config → Pipeline 연결**
-- YAML 설정을 `run_training_pipeline()` 함수 인자로 변환
-- 모델, 데이터, 학습 파라미터 자동 매핑
-
-**목표 3: 환경별 실행 모드**
-- 로컬 모드: `--preset local-light` + `--use-micro-model`
-- 분산 모드: FSDP 4-GPU (VESSL 환경)
-
-**목표 4: MLflow 연동**
-- Experiment 자동 생성, Run 이름 설정
-- Metrics/Artifacts 자동 로깅
-
----
-
-## Part 2: 문제 분석 및 설계
-
-### 2.1 현재 상태의 Gap 분석
-
-#### Gap 1: Config 구조 불일치
-
-**문제**: `defaults.yaml`과 `run_training_pipeline()` 입력 형식 불일치
-
-**defaults.yaml 구조**:
+**해결책**:
 ```yaml
+# defaults.yaml (환경 고정값)
+project:
+  name: weighted-mtp
+mlflow:
+  tracking_uri: "http://13.50.240.176"
+  experiment: "weighted-mtp/production"
 training:
   stage1:
     n_epochs: 0.5
     learning_rate: 1.0e-4
-    loss_type: mse
   stage2:
-    n_epochs: 2.5
-    beta: 0.9
+    beta: 0.9  # 기본값
     value_coef: 0.5
+
+# recipe.verifiable.yaml (실험 차이만)
+experiment:
+  name: verifiable-critic-wmtp
+dataset:
+  name: codecontests
+training:
+  stage2:
+    beta: 1.2  # Override만 명시
 ```
 
-**run_training_pipeline() 요구 형식**:
+**Deep merge 결과**:
+- defaults + recipe 재귀적 병합
+- recipe의 값이 defaults를 override
+- recipe에 없는 키는 defaults 유지
+
+#### 기능 2: Resource Loading (model, tokenizer, datasets)
+
+**Phase 5 → Phase 6 연결**:
 ```python
-config = {
-    "stage1": {
-        "n_epochs": 0.5,
-        "loss_type": "mse",
-        "learning_rate": 1e-4,
-    },
-    "stage2": {
-        "n_epochs": 2.5,
-        "beta": 0.9,
-        "value_coef": 0.5,
-        "learning_rate": 1e-5,
-    },
-}
-```
-
-**해결 방안**: Config 추출 함수 구현 (`_extract_training_config()`)
-
-#### Gap 2: 모델/데이터 로딩 누락
-
-**문제**: CLI에서 모델/데이터 로딩 로직 없음
-
-**필요 단계**:
-1. Config에서 모델 경로 추출
-2. `MetaLlamaMTPAdapter` 로딩
-3. Tokenizer 로딩
-4. Stage별 Dataset 로딩 (stage1/stage2 샘플링 전략)
-5. DataLoader 생성 (collator 포함)
-
-**해결 방안**: Resource 로딩 함수 구현 (`_load_resources()`)
-
-#### Gap 3: 분산학습 환경 초기화 누락
-
-**문제**: CLI에서 분산학습 환경 설정 없음
-
-**필요 단계**:
-1. torch.distributed 초기화 (NCCL backend)
-2. Rank/World size 설정
-3. Device 할당 (cuda:{rank})
-4. Seed 설정 (base_seed + rank)
-
-**해결 방안**: 분산학습 초기화 함수 (`runtime/distributed.py`에서 이미 구현됨)
-
-#### Gap 4: MLflow 연동 누락
-
-**문제**: CLI에서 MLflow 초기화 없음
-
-**필요 단계**:
-1. MLflow experiment 생성/로딩
-2. Run 시작 (run_name 설정)
-3. Config 로깅 (params)
-4. Metrics 로깅 (실시간)
-5. Checkpoint 업로드 (artifacts)
-
-**해결 방안**: MLflow 초기화 함수 (`runtime/mlflow.py` 구현 필요)
-
-### 2.2 설계 원칙
-
-**원칙 1: 기존 구조 존중**
-- Phase 5 `run_training_pipeline()` 인터페이스 변경 금지
-- Config deep_merge 방식 유지
-- Data collator (AlpacaDataCollator) 재사용
-
-**원칙 2: 점진적 구현**
-- Step 1: 로컬 단일 GPU 모드 먼저 구현
-- Step 2: 분산학습 모드 추가
-- Step 3: MLflow 연동
-
-**원칙 3: 실험 독립성**
-- Baseline, Verifiable, Rho-1 각각 독립 실행 가능
-- Recipe 파일만 바꾸면 자동 전환
-
-**원칙 4: 에러 처리 강화**
-- Config validation (필수 필드 확인)
-- 모델/데이터 경로 존재 확인
-- Device 호환성 확인
-
----
-
-## Part 3: Step별 구현 계획
-
-### Step 1: Config 추출 및 검증 함수 구현
-
-#### 목표
-YAML config를 `run_training_pipeline()` 입력 형식으로 변환합니다.
-
-#### 구현 파일
-- `src/weighted_mtp/cli/train.py`
-
-#### 핵심 함수
-
-**1) _extract_training_config()**
-```python
-def _extract_training_config(config: dict) -> dict:
-    """YAML config에서 학습 파라미터 추출
-
-    Args:
-        config: 전체 YAML config (defaults + recipe 병합)
-
-    Returns:
-        run_training_pipeline() 입력 형식 config
-        {
-            "stage1": {"n_epochs": float, "loss_type": str, "learning_rate": float},
-            "stage2": {"n_epochs": float, "beta": float, "value_coef": float, ...},
-            "save_checkpoint_every": int,
-        }
-
-    Raises:
-        ValueError: 필수 필드 누락 시
-    """
-    training_cfg = config.get("training", {})
-
-    # Stage 1 config
-    stage1_cfg = training_cfg.get("stage1", {})
-    stage1 = {
-        "n_epochs": stage1_cfg.get("n_epochs", 0.5),
-        "loss_type": stage1_cfg.get("loss_type", "mse"),
-        "learning_rate": stage1_cfg.get("learning_rate", 1e-4),
-    }
-
-    # Stage 2 config
-    stage2_cfg = training_cfg.get("stage2", {})
-    stage2 = {
-        "n_epochs": stage2_cfg.get("n_epochs", 2.5),
-        "beta": stage2_cfg.get("beta", 0.9),
-        "value_coef": stage2_cfg.get("value_coef", 0.5),
-        "max_grad_norm": stage2_cfg.get("max_grad_norm", 0.5),
-        "loss_type": stage2_cfg.get("loss_type", "mse"),
-        "learning_rate": stage2_cfg.get("learning_rate", 1e-5),
-        "weight_clip_min": stage2_cfg.get("weight_clip_min", 0.1),
-        "weight_clip_max": stage2_cfg.get("weight_clip_max", 5.0),
-    }
-
-    return {
-        "stage1": stage1,
-        "stage2": stage2,
-        "save_checkpoint_every": training_cfg.get("save_checkpoint_every", 1),
-    }
-```
-
-**2) _validate_config()**
-```python
-def _validate_config(config: dict) -> None:
-    """Config 필수 필드 검증
-
-    Args:
-        config: 전체 YAML config
-
-    Raises:
-        ValueError: 필수 필드 누락 또는 형식 오류
-    """
-    # 필수 섹션 확인
-    required_sections = ["project", "models", "dataset", "training"]
-    for section in required_sections:
-        if section not in config:
-            raise ValueError(f"Config 필수 섹션 누락: {section}")
-
-    # 모델 경로 확인
-    policy_path = Path(config["models"]["policy"]["path"])
-    if not policy_path.exists():
-        raise FileNotFoundError(f"Policy 모델 경로 없음: {policy_path}")
-
-    # 데이터셋 경로 확인
-    dataset_split = config["dataset"].get("split", {})
-    train_path = Path(dataset_split.get("train", ""))
-    if not train_path.exists():
-        raise FileNotFoundError(f"학습 데이터셋 경로 없음: {train_path}")
-
-    # Stage 설정 확인
-    training = config.get("training", {})
-    if "stage1" not in training or "stage2" not in training:
-        raise ValueError("Config에 stage1 또는 stage2 설정 누락")
-```
-
-#### 검증 기준
-- [ ] defaults.yaml 로딩 후 추출 성공
-- [ ] recipe 병합 후 추출 성공
-- [ ] 필수 필드 누락 시 ValueError
-- [ ] 모델/데이터 경로 미존재 시 FileNotFoundError
-
----
-
-### Step 2: Resource 로딩 함수 구현
-
-#### 목표
-Config를 기반으로 모델, 토크나이저, 데이터셋, DataLoader를 로딩합니다.
-
-#### 구현 파일
-- `src/weighted_mtp/cli/train.py`
-
-#### 핵심 함수
-
-**1) _load_model()**
-```python
-def _load_model(config: dict, device: torch.device) -> MetaLlamaMTPAdapter:
-    """모델 로딩 (Adapter + Value Head)
-
-    Args:
-        config: 전체 YAML config
-        device: torch.device
-
-    Returns:
-        MetaLlamaMTPAdapter (device로 이동됨)
-    """
-    from weighted_mtp.models.meta_mtp import load_adapter
-
-    model_path = Path(config["models"]["policy"]["path"])
-
-    logger.info(f"모델 로딩 시작: {model_path}")
-    adapter = load_adapter(model_path, device=device)
-
-    logger.info(f"모델 로딩 완료: {adapter.model.params}")
-    return adapter
-```
-
-**2) _load_tokenizer()**
-```python
-def _load_tokenizer(config: dict):
-    """토크나이저 로딩
-
-    Args:
-        config: 전체 YAML config
-
-    Returns:
-        Tokenizer (transformers 또는 SentencePiece)
-    """
-    from transformers import AutoTokenizer
-
-    tokenizer_path = Path(config["models"]["policy"]["path"]) / "tokenizer"
-
-    logger.info(f"토크나이저 로딩 시작: {tokenizer_path}")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
-    return tokenizer
-```
-
-**3) _load_datasets()**
-```python
-def _load_datasets(config: dict) -> tuple[Dataset, Dataset]:
-    """Stage별 데이터셋 로딩
-
-    Args:
-        config: 전체 YAML config
-
-    Returns:
-        (stage1_dataset, stage2_dataset)
-    """
-    from weighted_mtp.data import load_dataset
-
-    dataset_name = config["dataset"]["name"]
-
-    # Stage 1 샘플링 전략 (is_correct 균형)
-    data_config = config.get("data", {}).get("sampling", {})
-    stage1_config = data_config.get("stage1", {})
-
-    logger.info("Stage 1 데이터셋 로딩 (is_correct 균형)")
-    stage1_dataset = load_dataset(
-        dataset_name=dataset_name,
-        split="train",
-        stage="stage1",
-        n_samples=stage1_config.get("n_samples", 30000),
-        balance_correct=stage1_config.get("balance_correct", True),
-        correct_ratio=stage1_config.get("correct_ratio", 0.5),
-        seed=stage1_config.get("seed", 42),
-    )
-
-    # Stage 2 샘플링 전략 (curriculum learning)
-    stage2_config = data_config.get("stage2", {})
-
-    logger.info("Stage 2 데이터셋 로딩 (curriculum learning)")
-    # TODO: Curriculum learning은 epoch 진행에 따라 동적 샘플링 필요
-    # 현재는 전체 샘플만 로드 (curriculum은 training loop에서 처리)
-    stage2_dataset = load_dataset(
-        dataset_name=dataset_name,
-        split="train",
-        stage="stage2",
-        n_samples=stage2_config.get("n_samples", 100000),
-        balance_correct=stage2_config.get("balance_correct", True),
-        correct_ratio=stage2_config.get("correct_ratio", 0.5),
-        seed=stage2_config.get("seed", 42),
-    )
-
-    return stage1_dataset, stage2_dataset
-```
-
-**4) _create_dataloaders()**
-```python
-def _create_dataloaders(
-    stage1_dataset: Dataset,
-    stage2_dataset: Dataset,
-    tokenizer,
+# Phase 5에서 정의된 인터페이스
+def run_training_pipeline(
+    adapter: MetaLlamaMTPAdapter,
+    stage1_dataloader: DataLoader,
+    stage2_dataloader: DataLoader,
     config: dict,
-) -> tuple[DataLoader, DataLoader]:
-    """DataLoader 생성
+    device: torch.device,
+    save_dir: Path | None,
+) -> dict[str, dict[str, float]]
+```
 
-    Args:
-        stage1_dataset: Stage 1 Dataset
-        stage2_dataset: Stage 2 Dataset
-        tokenizer: Tokenizer
-        config: 전체 YAML config
+**Phase 6의 역할**: 이 인터페이스에 맞는 resource를 로딩하여 전달
+- `adapter` ← `_load_model(config, device)`
+- `stage1_dataloader` ← `_create_dataloaders(stage1_dataset, ...)`
+- `config` ← `load_config()` + `_extract_training_config()`
+
+#### 기능 3: Validation Evaluation & Best Checkpoint
+
+**문제 인식**:
+- Phase 5는 train loss만 출력, validation 평가 없음
+- Overfitting 감지 불가, best checkpoint 선택 로직 없음
+
+**해결책**:
+1. **Validation dataloader 추가**: train/val 분리
+2. **Periodic evaluation**: Step interval마다 validation loss 계산
+3. **Best checkpoint 저장**: Validation loss 개선 시에만 저장
+4. **Early stopping 준비**: Validation loss가 개선되지 않으면 경고
+
+#### 기능 4: MLflow 실험 추적 (WMTP EC2 + S3 재사용)
+
+**기존 인프라 재사용**:
+- EC2 Tracking Server: http://13.50.240.176 (Basic Auth)
+- S3 Artifact Storage: s3://wmtp/mlflow-artifacts
+- Experiment: weighted-mtp/production (ID: 8)
+
+**Logging 항목**:
+- Config parameters (flatten)
+- Train/Validation metrics (step 단위)
+- Checkpoint artifact upload (S3)
+
+#### 기능 5: Distributed Training 지원
+
+**분산학습 고려사항**:
+- **Checkpoint 저장**: Rank 0 only (storage 절약)
+- **Console logging**: Rank 0 only (깔끔한 출력)
+- **MLflow logging**: Rank 0 only (중복 방지)
+- **Metrics 평균**: All ranks에서 계산 → Rank 0에서 출력
+
+### 1.3 기대 효과
+
+1. **사용 편의성**: 한 줄 커맨드로 실험 실행 (`--recipe` 전환만으로 3가지 실험)
+2. **재현성**: seed + config로 동일한 결과 보장
+3. **안정성**: Validation 기반 best checkpoint, overfitting 조기 감지
+4. **추적성**: MLflow로 모든 실험 기록, S3에 checkpoint 백업
+
+---
+
+## Part 2: 핵심 설계 결정
+
+### 2.1 Decision 0: Phase 5 인터페이스 존중 (가장 중요한 결정)
+
+**원칙 1, 2 준수**:
+- Phase 5의 `run_training_pipeline()` 인터페이스는 **변경하지 않음**
+- Phase 6는 이 인터페이스에 맞는 resource를 준비하는 역할만
+
+**Rationale**:
+1. **역할 분리**: Phase 5 = 파이프라인 로직, Phase 6 = 진입점 + resource 준비
+2. **테스트 가능성**: Phase 5 unit test가 계속 동작
+3. **유지보수성**: 파이프라인 변경 시 Phase 6 수정 불필요
+
+### 2.2 Decision 1: Validation Evaluation 추가
+
+**문제**: Phase 5는 train loss만 출력, overfitting 감지 불가
+
+**해결책**: Validation dataloader 추가 + periodic evaluation
+
+**구현 위치**:
+- `pipelines/training.py`: `evaluate_stage()` 함수 추가
+- `cli/train.py`: validation dataloader 로딩
+
+**Evaluation 시점**:
+- Step interval마다 (예: 100 steps)
+- Epoch 종료 시
+- 학습 완료 후 최종 평가
+
+**요구사항**:
+```python
+def evaluate_stage(
+    adapter: MetaLlamaMTPAdapter,
+    dataloader: DataLoader,
+    config: dict,
+    device: torch.device,
+    stage: str,
+) -> dict[str, float]:
+    """Validation evaluation (no_grad)
 
     Returns:
-        (stage1_dataloader, stage2_dataloader)
+        {
+            "val_loss": float,
+            "val_mtp_loss": float,  # Stage 2만
+            "val_value_loss": float,  # Stage 2만
+            "val_value_explained_variance": float,
+        }
     """
-    from torch.utils.data import DataLoader
-    from weighted_mtp.data import AlpacaDataCollator
-
-    max_length = config["dataset"].get("max_length", 2048)
-
-    # Collator 생성
-    collator = AlpacaDataCollator(tokenizer=tokenizer, max_length=max_length)
-
-    # Stage별 batch size
-    stage1_batch_size = config["training"]["stage1"].get("batch_size", 8)
-    stage2_batch_size = config["training"]["stage2"].get("batch_size", 4)
-
-    stage1_dataloader = DataLoader(
-        stage1_dataset,
-        batch_size=stage1_batch_size,
-        collate_fn=collator,
-        shuffle=True,
-    )
-
-    stage2_dataloader = DataLoader(
-        stage2_dataset,
-        batch_size=stage2_batch_size,
-        collate_fn=collator,
-        shuffle=True,
-    )
-
-    return stage1_dataloader, stage2_dataloader
 ```
 
-#### 검증 기준
-- [ ] micro-mtp 모델 로딩 성공
-- [ ] 토크나이저 로딩 성공
-- [ ] Stage 1 데이터셋 로딩 성공 (is_correct 균형 확인)
-- [ ] Stage 2 데이터셋 로딩 성공
-- [ ] DataLoader 생성 성공 (collator 적용 확인)
+### 2.3 Decision 2: Best Checkpoint 저장 전략
 
----
+**문제**: 모든 epoch checkpoint 저장하면 storage 낭비, best 선택 로직 없음
 
-### Step 3: MLflow 초기화 모듈 구현 (WMTP EC2 + S3 재사용)
+**해결책**: Validation loss 기반 best checkpoint만 저장
 
-#### 목표
-**WMTP 프로젝트의 MLflow + S3 구성을 그대로 재사용**하여 실험 추적 시스템을 구현합니다.
+**저장 정책**:
+1. **Periodic checkpoint**: Epoch마다 저장 (optional, `save_checkpoint_every`)
+2. **Best checkpoint**: Validation loss 개선 시에만 저장 (`checkpoint_{stage}_best.pt`)
+3. **Final checkpoint**: 학습 완료 후 최종 저장 (`checkpoint_{stage}_final.pt`)
 
-#### 기존 WMTP 구성 확인
+**Best checkpoint 기준**:
+- Stage 1: `val_loss` 최소화
+- Stage 2: `val_loss` 최소화 (total_loss = weighted_ce + value_coef * value_loss)
 
-**EC2 MLflow Tracking Server**:
-- URI: `http://13.50.240.176` (Port 80, Basic Auth)
-- 인증: 환경변수 `MLFLOW_TRACKING_USERNAME`, `MLFLOW_TRACKING_PASSWORD` 필요
-- 설정: 프로젝트 루트의 `.env` 파일에 설정 (`.env.example` 참고)
+### 2.4 Decision 3: Step 기반 Logging & Evaluation
 
-**S3 Artifact Storage**:
-- Bucket: `s3://wmtp/mlflow-artifacts`
-- AWS 인증: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`
-- Config: `configs/config.s3.yaml` 참고
+**문제**: Epoch 단위는 너무 coarse, 세밀한 제어 불가
 
-**기존 구현 재사용**:
-- `/Users/wesley/Desktop/wooshikwon/wmtp/src/utils/monitoring/mlflow.py`의 `MLflowManager` 클래스
-- Basic Auth 자동 주입 (`_maybe_inject_basic_auth()`)
-- S3 artifact location 자동 설정
-- Flatten config logging 지원
+**해결책**: Global step 기반 interval
 
-#### 구현 파일
-- `src/weighted_mtp/runtime/mlflow.py` (신규 생성, WMTP `MLflowManager` 재사용)
-
-#### 핵심 구현 (WMTP 코드 기반)
-
-**MLflowManager 클래스** (WMTP에서 복사):
-```python
-"""MLflow 실험 추적 관리자 (WMTP EC2 + S3 재사용)
-
-기존 WMTP 프로젝트의 MLflow 구성을 그대로 사용:
-- EC2 MLflow Server: http://13.50.240.176 (Basic Auth)
-- S3 Artifacts: s3://wmtp/mlflow-artifacts
-- 환경변수 기반 인증
-"""
-
-import os
-from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse, urlunparse
-
-import mlflow
-import mlflow.pytorch
-from mlflow.tracking import MlflowClient
-from mlflow.exceptions import MlflowException
-from rich.console import Console
-
-console = Console()
-
-
-class MLflowManager:
-    """MLflow 작업 관리자 (EC2 Tracking Server + S3 Artifacts)
-
-    WMTP 기존 구성 재사용:
-    - Tracking: EC2 서버 (http://13.50.240.176)
-    - Artifacts: S3 (s3://wmtp/mlflow-artifacts)
-    - 인증: 환경변수 Basic Auth
-    """
-
-    def __init__(
-        self,
-        tracking_uri: str,
-        experiment_name: str = "default",
-        s3_artifacts: str | None = None,
-    ):
-        """MLflow 관리자 초기화
-
-        Args:
-            tracking_uri: MLflow 추적 서버 URI
-                - 원격: "http://13.50.240.176" (EC2)
-                - 로컬: "file://./mlruns"
-            experiment_name: 실험 이름
-                - 권장: "weighted-mtp/production"
-            s3_artifacts: Artifact 저장 S3 경로
-                - "s3://wmtp/mlflow-artifacts"
-        """
-        self.tracking_uri = self._maybe_inject_basic_auth(tracking_uri)
-        self.experiment_name = experiment_name
-        self.s3_artifacts = s3_artifacts
-
-        # Set MLflow tracking URI
-        mlflow.set_tracking_uri(self.tracking_uri)
-
-        # Initialize client
-        self.client = MlflowClient(tracking_uri=self.tracking_uri)
-
-        # Set or create experiment with S3 artifact location
-        self.experiment_id = self._setup_experiment(experiment_name, s3_artifacts)
-        self.run: mlflow.ActiveRun | None = None
-
-    def _maybe_inject_basic_auth(self, uri: str) -> str:
-        """HTTP(S) URI에 Basic Auth 자격증명 주입
-
-        환경변수 MLFLOW_TRACKING_USERNAME/PASSWORD가 있으면
-        URI에 user:pass@host 형식으로 주입합니다.
-        """
-        try:
-            if not uri.startswith(("http://", "https://")):
-                return uri
-
-            parsed = urlparse(uri)
-            if "@" in parsed.netloc:
-                return uri  # 이미 크리덴셜 포함
-
-            username = os.getenv("MLFLOW_TRACKING_USERNAME")
-            password = os.getenv("MLFLOW_TRACKING_PASSWORD")
-            if not username or not password:
-                return uri
-
-            # user:pass@host[:port]
-            if ":" in parsed.netloc:
-                host, port = parsed.netloc.split(":", 1)
-                netloc = f"{username}:{password}@{host}:{port}"
-            else:
-                netloc = f"{username}:{password}@{parsed.netloc}"
-
-            injected = parsed._replace(netloc=netloc)
-            return urlunparse(injected)
-        except Exception:
-            return uri
-
-    def _setup_experiment(
-        self, experiment_name: str, artifact_location: str | None = None
-    ) -> str:
-        """Experiment 설정 또는 생성 (S3 artifact location 포함)"""
-        try:
-            experiment = self.client.get_experiment_by_name(experiment_name)
-            if experiment:
-                mlflow.set_experiment(experiment_name)
-                console.print(
-                    f"[green]Using existing experiment: {experiment_name}[/green]"
-                )
-                if artifact_location:
-                    console.print(
-                        f"[blue]Artifacts location: {artifact_location}[/blue]"
-                    )
-                return experiment.experiment_id
-            else:
-                # Create new experiment with S3 artifact_location
-                experiment_id = self.client.create_experiment(
-                    experiment_name, artifact_location=artifact_location
-                )
-                mlflow.set_experiment(experiment_name)
-                console.print(
-                    f"[green]Created new experiment: {experiment_name}[/green]"
-                )
-                if artifact_location:
-                    console.print(
-                        f"[blue]Artifacts will be stored in: {artifact_location}[/blue]"
-                    )
-                return experiment_id
-        except Exception as e:
-            msg = str(e)
-            if isinstance(e, MlflowException) or "401" in msg or "Unauthorized" in msg:
-                raise RuntimeError(
-                    "MLflow 인증 실패: EC2 서버 접근 불가. "
-                    "환경변수 MLFLOW_TRACKING_USERNAME/PASSWORD 확인 필요. "
-                    f"현재 URI: {self.tracking_uri}"
-                ) from e
-            console.print(f"[yellow]Warning: Failed to setup experiment: {e}[/yellow]")
-            mlflow.set_experiment("Default")
-            return "0"
-
-    def start_run(
-        self,
-        run_name: str | None = None,
-        tags: dict[str, str] | None = None,
-        nested: bool = False,
-    ) -> mlflow.ActiveRun:
-        """MLflow run 시작"""
-        self.run = mlflow.start_run(
-            run_name=run_name,
-            nested=nested,
-            tags=tags,
-        )
-        assert self.run is not None
-        console.print(f"[green]Started MLflow run: {self.run.info.run_id}[/green]")
-        return self.run
-
-    def end_run(self, status: str = "FINISHED") -> None:
-        """MLflow run 종료"""
-        if self.run:
-            mlflow.end_run(status=status)
-            console.print(f"[green]Ended MLflow run with status: {status}[/green]")
-            self.run = None
-
-    def log_params(self, params: dict[str, Any]) -> None:
-        """Parameters 로깅 (flatten)"""
-        if not self.run:
-            return
-
-        flat_params = self._flatten_dict(params)
-        for key, value in flat_params.items():
-            mlflow.log_param(key, str(value))
-
-    def log_metrics(
-        self,
-        metrics: dict[str, float],
-        step: int | None = None,
-    ) -> None:
-        """Metrics 로깅"""
-        if not self.run:
-            return
-
-        for key, value in metrics.items():
-            mlflow.log_metric(key, value, step=step)
-
-    def log_artifact(
-        self,
-        local_path: str | Path,
-        artifact_path: str | None = None,
-    ) -> None:
-        """Artifact 로깅 (S3 자동 업로드)"""
-        if not self.run:
-            return
-
-        local_path = Path(local_path)
-        if local_path.is_file():
-            mlflow.log_artifact(str(local_path), artifact_path)
-        elif local_path.is_dir():
-            mlflow.log_artifacts(str(local_path), artifact_path)
-
-    def _flatten_dict(
-        self,
-        d: dict[str, Any],
-        parent_key: str = "",
-        sep: str = ".",
-    ) -> dict[str, Any]:
-        """Nested dict를 flatten"""
-        items: list[tuple[str, Any]] = []
-        for k, v in d.items():
-            new_key = f"{parent_key}{sep}{k}" if parent_key else k
-            if isinstance(v, dict):
-                items.extend(self._flatten_dict(v, new_key, sep=sep).items())
-            else:
-                items.append((new_key, v))
-        return dict(items)
-
-
-def create_mlflow_manager(config: dict) -> MLflowManager:
-    """Config에서 MLflow 관리자 생성
-
-    WMTP 구성 재사용:
-    - tracking_uri: "http://13.50.240.176"
-    - experiment: "weighted-mtp/production"
-    - s3_artifacts: "s3://wmtp/mlflow-artifacts"
-    """
-    mlflow_config = config.get("mlflow", {})
-
-    return MLflowManager(
-        tracking_uri=mlflow_config.get("tracking_uri", "file://./mlruns"),
-        experiment_name=mlflow_config.get("experiment", "default"),
-        s3_artifacts=mlflow_config.get("s3_artifacts"),
-    )
-```
-
-#### defaults.yaml에 MLflow 설정 추가
-
+**Interval 종류**:
 ```yaml
-# MLflow 실험 추적 설정 (WMTP EC2 + S3 재사용)
-mlflow:
-  tracking_uri: "http://13.50.240.176"  # EC2 MLflow Server (Basic Auth)
-  experiment: "weighted-mtp/production"
-  s3_artifacts: "s3://wmtp/mlflow-artifacts"  # S3 Artifact Storage
+training:
+  log_interval: 10      # 10 step마다 train loss 출력
+  eval_interval: 100    # 100 step마다 validation 평가
+  save_checkpoint_every: 1  # 1 epoch마다 checkpoint 저장 (기존 유지)
 ```
 
-#### 환경변수 설정
+**Global step 계산**:
+```python
+global_step = 0
+for epoch in range(n_epochs):
+    for batch in dataloader:
+        # Training step
+        ...
+        global_step += 1
 
-프로젝트 루트에 `.env` 파일을 생성하고 다음 환경변수를 설정합니다:
+        # Log
+        if global_step % log_interval == 0:
+            logger.info(f"Step {global_step}, Loss: {loss:.4f}")
 
-```bash
-# .env 파일 예시 (.env.example 참고)
-
-# AWS S3 Credentials (MLflow Artifact Storage)
-AWS_ACCESS_KEY_ID=your_aws_access_key_id
-AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key
-AWS_DEFAULT_REGION=us-west-2
-
-# MLflow EC2 Server Authentication (Basic Auth)
-MLFLOW_TRACKING_USERNAME=your_mlflow_username
-MLFLOW_TRACKING_PASSWORD=your_mlflow_password
-
-# Hugging Face 인증 (모델 다운로드용)
-HF_TOKEN=your_huggingface_token_here
+        # Eval
+        if global_step % eval_interval == 0:
+            val_metrics = evaluate_stage(...)
 ```
 
-**주의**: `.env` 파일은 `.gitignore`에 포함되어 Git에 커밋되지 않습니다. 실제 credential 값은 `.env.example`을 복사하여 `.env`에 설정하세요.
+### 2.5 Decision 4: Rank 0 Only Operations
 
-#### 검증 기준
-- [ ] MLflow EC2 서버 연결 성공 (Basic Auth)
-- [ ] Experiment 생성/로드 성공
-- [ ] S3 artifact location 설정 확인
-- [ ] Run 시작/종료 성공
-- [ ] Params 로깅 성공 (flatten)
-- [ ] Metrics 로깅 성공
-- [ ] Checkpoint S3 업로드 성공
+**문제**: 분산학습 시 모든 rank가 checkpoint 저장/logging하면 중복
+
+**해결책**: Rank 0만 I/O operations 수행
+
+**Rank 0 Only**:
+- Checkpoint 저장
+- Console logging (logger.info)
+- MLflow logging (start_run, log_params, log_metrics, log_artifact)
+
+**All Ranks**:
+- Training step
+- Metrics 계산 (각 rank에서 계산 후 평균)
+
+**구현**:
+```python
+from weighted_mtp.runtime.distributed import is_main_process
+
+if is_main_process():  # Rank 0 only
+    _save_checkpoint(...)
+    logger.info(...)
+    mlflow_manager.log_metrics(...)
+```
+
+### 2.6 Decision 5: Multi-head Loss 개별 + 평균 Logging
+
+**문제**: Phase 5는 4개 head loss를 평균만 출력, 디버깅 어려움
+
+**해결책**: 개별 head loss + 평균 모두 출력
+
+**Logging 형식**:
+```
+Step 100, Stage 2:
+  Head 0 loss: 2.3456
+  Head 1 loss: 2.4123
+  Head 2 loss: 2.5678
+  Head 3 loss: 2.3890
+  Avg MTP loss: 2.4287
+  Value loss: 0.1234
+  Total loss: 1.2761
+```
 
 ---
 
-### Step 4: CLI main() 함수 완성
+## Part 3: 구현 요구사항
+
+### 3.1 Step 1: Config 추출/검증 함수 (`cli/train.py`)
 
 #### 목표
-모든 구성 요소를 연결하여 실제 학습을 실행합니다.
+YAML config를 `run_training_pipeline()` 입력 형식으로 변환하고 유효성 검증
 
-#### 구현 파일
-- `src/weighted_mtp/cli/train.py`
+#### 핵심 함수
+
+**`_extract_training_config(config: dict) -> dict`**
+- 역할: 전체 config에서 training 설정 추출
+- 입력: defaults + recipe merge 완료된 config
+- 출력: `{"stage1": {...}, "stage2": {...}, "save_dir": Path, "log_interval": int, "eval_interval": int}`
+
+**`_validate_config(config: dict) -> None`**
+- 역할: 필수 필드 존재 여부, 값 범위 검증
+- 검증 항목:
+  - 필수 섹션: `project`, `models`, `dataset`, `training`, `mlflow`
+  - 필수 필드: `models.policy.name`, `models.policy.path`, `dataset.train`, `dataset.validation`
+  - 값 범위: `n_epochs > 0`, `learning_rate > 0`, `beta > 0`
+- 예외: `ValueError` (missing field 또는 invalid value)
+
+#### 검증 기준
+- [ ] `_extract_training_config()`: stage1/stage2 설정 추출 성공
+- [ ] `_extract_training_config()`: save_dir 기본값 생성 (`storage/checkpoints/{project}/{experiment}`)
+- [ ] `_validate_config()`: 필수 필드 누락 시 ValueError
+- [ ] `_validate_config()`: 값 범위 검증 (n_epochs > 0 등)
+
+---
+
+### 3.2 Step 2: Resource Loading 함수 (`cli/train.py`)
+
+#### 목표
+Model, Tokenizer, Datasets, Dataloaders를 로딩하여 `run_training_pipeline()`에 전달
+
+#### 핵심 함수
+
+**`_load_model(config: dict, device: torch.device) -> MetaLlamaMTPAdapter`**
+- 역할: Policy model adapter 로딩
+- 로딩 순서:
+  1. Config에서 model path 추출
+  2. Metadata 로딩 (`{path}/metadata.json`)
+  3. Safetensors 로딩 (`{path}/safetensors/model.safetensors`)
+  4. MetaLlamaMTPAdapter 생성 및 state_dict 로딩
+  5. Device로 이동
+- 출력: 초기화된 adapter
+
+**`_load_tokenizer(config: dict) -> PreTrainedTokenizer`**
+- 역할: Tokenizer 로딩
+- Phase 5와 동일하게 `AutoTokenizer.from_pretrained()` 사용
+
+**`_load_datasets(config: dict) -> tuple[Dataset, Dataset, Dataset]`**
+- 역할: Stage 1 train, Stage 2 train, Validation dataset 로딩
+- Phase 3의 `load_dataset()` 재사용
+- 반환: `(stage1_train_dataset, stage2_train_dataset, val_dataset)`
+
+**`_create_dataloaders(datasets: tuple, tokenizer, config) -> tuple[DataLoader, ...]`**
+- 역할: 4개 dataloader 생성
+- 반환: `(stage1_train_loader, stage2_train_loader, stage1_val_loader, stage2_val_loader)`
+- 주의사항:
+  - Train: `shuffle=True` (분산학습 시 DistributedSampler 사용)
+  - Validation: `shuffle=False`
+
+#### 검증 기준
+- [ ] `_load_model()`: Adapter 로딩 성공, device 이동 확인
+- [ ] `_load_tokenizer()`: Tokenizer 로딩 성공
+- [ ] `_load_datasets()`: 3개 dataset 반환 (stage1_train, stage2_train, val)
+- [ ] `_create_dataloaders()`: 4개 dataloader 생성 (train/val × stage1/stage2)
+
+---
+
+### 3.3 Step 3: Validation Evaluation 함수 (`pipelines/training.py`)
+
+#### 목표
+Validation dataset으로 현재 모델 성능 평가 (no gradient)
+
+#### 핵심 함수
+
+**`evaluate_stage(adapter, dataloader, config, device, stage) -> dict`**
+- 역할: Validation loss 계산 (train과 동일한 loss 함수 사용)
+- 입력:
+  - `adapter`: MetaLlamaMTPAdapter
+  - `dataloader`: Validation DataLoader
+  - `config`: Stage 설정 (stage1 또는 stage2)
+  - `device`: torch.device
+  - `stage`: "stage1" or "stage2"
+- 동작:
+  1. `adapter.eval()` 설정
+  2. `torch.no_grad()` context
+  3. Dataloader iteration
+  4. Stage 1: Value loss 계산
+  5. Stage 2: MTP loss + Value loss 계산
+  6. 평균 계산
+- 반환:
+  ```python
+  {
+      "val_loss": float,
+      "val_mtp_loss": float,  # Stage 2만
+      "val_value_loss": float,  # Stage 2만
+      "val_value_explained_variance": float,
+  }
+  ```
+
+#### 통합 위치
+
+**Stage 1 학습 루프 수정**:
+```python
+# 기존 train_stage1() 유지
+# 호출하는 곳에서 periodic evaluation 추가
+
+for epoch in range(n_epochs):
+    # Training
+    train_metrics = train_stage1_epoch(...)
+
+    # Validation (epoch 종료 시)
+    val_metrics = evaluate_stage(adapter, val_dataloader, config, device, "stage1")
+
+    # Best checkpoint 저장
+    if val_metrics["val_loss"] < best_val_loss:
+        best_val_loss = val_metrics["val_loss"]
+        _save_checkpoint(..., "best")
+```
+
+**Stage 2도 동일한 패턴 적용**
+
+#### 검증 기준
+- [ ] `evaluate_stage()`: no_grad context에서 실행
+- [ ] `evaluate_stage()`: Stage 1 val_loss 계산 성공
+- [ ] `evaluate_stage()`: Stage 2 val_loss (MTP + Value) 계산 성공
+- [ ] Best checkpoint: val_loss 개선 시에만 저장 확인
+
+---
+
+### 3.4 Step 4: Best Checkpoint 저장 로직 (`pipelines/training.py`)
+
+#### 목표
+Validation loss 기반 best checkpoint 추적 및 저장
 
 #### 핵심 로직
 
-**main() 함수 개선**:
+**Best checkpoint tracking**:
 ```python
-def main():
-    """CLI 진입점"""
-    # 1. Argument parsing (기존 유지)
-    parser = argparse.ArgumentParser(description="Weighted MTP 학습 파이프라인")
-    # ... (기존 argparse 코드)
-    args = parser.parse_args()
+# run_training_pipeline() 내부
+best_val_loss_stage1 = float('inf')
+best_val_loss_stage2 = float('inf')
 
-    # 2. Config 로딩 (기존 deep_merge 사용)
-    config = load_config(args.config, args.recipe)
+# Stage 1 학습 중
+for epoch in range(n_epochs):
+    train_metrics = train_stage1_epoch(...)
+    val_metrics = evaluate_stage(..., "stage1")
 
-    # 3. Preset 적용
-    if args.preset == "local-light":
-        preset_path = Path("configs/local-light.yaml")
-        with open(preset_path) as f:
-            preset = yaml.safe_load(f)
-        config = deep_merge(config, preset.get("override", {}))
+    # Best 갱신
+    if val_metrics["val_loss"] < best_val_loss_stage1:
+        best_val_loss_stage1 = val_metrics["val_loss"]
+        if is_main_process():
+            _save_checkpoint(adapter, optimizer, "stage1", epoch, val_metrics, save_dir / "checkpoint_stage1_best.pt")
+```
 
-    # 4. Micro 모델 오버라이드
-    if args.use_micro_model:
-        config["models"]["policy"]["name"] = "micro-mtp"
-        config["models"]["policy"]["path"] = "storage/models_v2/micro-mtp"
+**Checkpoint 종류**:
+1. **Periodic**: `checkpoint_stage1_epoch_0.5.pt` (optional)
+2. **Best**: `checkpoint_stage1_best.pt` (필수)
+3. **Final**: `checkpoint_stage1_final.pt` (필수)
 
-    # 5. Dry-run 모드
-    if args.dry_run:
-        console.print("[bold green]Dry-run mode: 설정 확인[/bold green]")
-        console.print(yaml.dump(config, default_flow_style=False, allow_unicode=True))
-        return
+#### 검증 기준
+- [ ] Best checkpoint: val_loss 개선 시에만 저장
+- [ ] Best checkpoint: 파일명 `checkpoint_{stage}_best.pt`
+- [ ] Final checkpoint: 학습 완료 후 저장
+- [ ] Rank 0 only: is_main_process() 체크
 
-    # 6. Config 검증
-    _validate_config(config)
+---
 
-    # 7. Logging 설정
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+### 3.5 Step 5: MLflow 로깅 통합 (`runtime/mlflow.py` + `cli/train.py`)
 
-    # 8. 환경 초기화 (분산학습 포함)
-    from weighted_mtp.runtime.environment import setup_environment
+#### 목표
+WMTP EC2 MLflow 서버에 실험 추적 정보 로깅
 
-    device = setup_environment(config)
+#### MLflowManager 클래스 (`runtime/mlflow.py`)
 
-    # 9. MLflow 초기화 (Rank 0만, WMTP EC2 + S3)
-    from weighted_mtp.runtime.mlflow import create_mlflow_manager
-    from weighted_mtp.runtime.distributed import is_main_process
+**핵심 메서드**:
+- `__init__(tracking_uri, experiment_name, s3_artifacts)`: EC2 서버 연결 + Basic Auth
+- `start_run(run_name, tags)`: Run 시작
+- `log_params(params: dict)`: Config flatten 후 params 로깅
+- `log_metrics(metrics: dict, step: int)`: Step 단위 metrics 로깅
+- `log_artifact(local_path, artifact_path)`: S3에 checkpoint 업로드
+- `end_run(status)`: Run 종료
 
-    mlflow_manager = None
+**WMTP 재사용**:
+- `/Users/wesley/Desktop/wooshikwon/wmtp/src/utils/monitoring/mlflow.py`의 `MLflowManager` 클래스를 복사
+- Basic Auth 자동 주입 (`_maybe_inject_basic_auth()`)
+- S3 artifact location 자동 설정
+
+#### CLI 통합 (`cli/train.py`)
+
+**main() 함수에서 MLflow 사용**:
+```python
+# Rank 0 only
+mlflow_manager = None
+if is_main_process():
+    mlflow_manager = create_mlflow_manager(config)
+    mlflow_manager.start_run(run_name=run_name)
+    mlflow_manager.log_params(config)
+
+try:
+    # Training
+    metrics = run_training_pipeline(...)
+
+    # Metrics 로깅
     if is_main_process():
-        logger.info("MLflow 초기화 (EC2 + S3)")
-        mlflow_manager = create_mlflow_manager(config)
+        mlflow_manager.log_metrics(metrics["stage1"], step=0)
+        mlflow_manager.log_metrics(metrics["stage2"], step=1)
 
-        # Run 시작
-        run_name = args.run_name
-        if run_name is None:
-            # 자동 run_name 생성
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            exp_name = config.get("experiment", {}).get("name", "unknown")
-            run_name = f"{exp_name}_{timestamp}"
+        # Checkpoint 업로드
+        mlflow_manager.log_artifact(checkpoint_path, "checkpoints")
+finally:
+    if mlflow_manager:
+        mlflow_manager.end_run()
+```
 
-        mlflow_manager.start_run(run_name=run_name)
+#### defaults.yaml 설정
 
-        # Config params 로깅
-        mlflow_manager.log_params(config)
+```yaml
+mlflow:
+  tracking_uri: "http://13.50.240.176"  # EC2 MLflow Server
+  experiment: "weighted-mtp/production"
+  s3_artifacts: "s3://wmtp/mlflow-artifacts"
+```
 
-    try:
-        # 10. Resource 로딩
-        logger.info("Resource 로딩 시작")
+#### .env 설정
 
-        adapter = _load_model(config, device)
-        tokenizer = _load_tokenizer(config)
-        stage1_dataset, stage2_dataset = _load_datasets(config)
-        stage1_dataloader, stage2_dataloader = _create_dataloaders(
-            stage1_dataset, stage2_dataset, tokenizer, config
-        )
+```.env
+# MLflow EC2 Server Authentication
+MLFLOW_TRACKING_USERNAME=wmtp_admin
+MLFLOW_TRACKING_PASSWORD=your_password
 
-        logger.info("Resource 로딩 완료")
-
-        # 11. Training config 추출
-        training_config = _extract_training_config(config)
-
-        # 12. 파이프라인 실행
-        from weighted_mtp.pipelines.training import run_training_pipeline
-
-        logger.info("학습 파이프라인 시작")
-
-        save_dir = Path("checkpoints") / config.get("experiment", {}).get("name", "default")
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        metrics = run_training_pipeline(
-            adapter=adapter,
-            stage1_dataloader=stage1_dataloader,
-            stage2_dataloader=stage2_dataloader,
-            config=training_config,
-            device=device,
-            save_dir=save_dir,
-        )
-
-        logger.info("학습 파이프라인 완료")
-
-        # 13. 최종 결과 출력
-        console.print("\n[bold green]학습 완료![/bold green]")
-        console.print(f"Stage 1 Loss: {metrics['stage1']['stage1_loss']:.4f}")
-        console.print(f"Stage 2 Total Loss: {metrics['stage2']['stage2_total_loss']:.4f}")
-
-    except Exception as e:
-        logger.error(f"학습 중 오류 발생: {e}", exc_info=True)
-        raise
-
-    finally:
-        # 14. MLflow 종료 (Rank 0만)
-        if mlflow_manager is not None:
-            mlflow_manager.end_run()
+# AWS S3 Credentials
+AWS_ACCESS_KEY_ID=your_key
+AWS_SECRET_ACCESS_KEY=your_secret
+AWS_DEFAULT_REGION=eu-north-1
 ```
 
 #### 검증 기준
-- [ ] `--dry-run` 모드 동작 확인
-- [ ] `--use-micro-model` 모드로 로컬 학습 성공
-- [ ] `--recipe configs/recipe.verifiable.yaml` 실행 성공
-- [ ] MLflow에 metrics 로깅 확인
-- [ ] Checkpoint 저장 확인
+- [ ] MLflowManager: EC2 서버 연결 성공
+- [ ] Experiment: weighted-mtp/production 생성/로드
+- [ ] Params: Config flatten 후 로깅 성공
+- [ ] Metrics: Step 단위 로깅 성공
+- [ ] Artifact: Checkpoint S3 업로드 성공 (s3://wmtp/mlflow-artifacts/8/{run_id}/artifacts/checkpoints/)
 
 ---
 
-### Step 5: 분산학습 지원 추가
+### 3.6 Step 6: Step 기반 Logging & Evaluation (`pipelines/training.py`)
 
 #### 목표
-A100 4-GPU 환경에서 FSDP 기반 분산학습을 지원합니다.
+Global step 기반 주기적 logging 및 evaluation
 
-#### 구현 파일
-- `src/weighted_mtp/cli/train.py` (분기 로직 추가)
-- `src/weighted_mtp/runtime/environment.py` (이미 구현됨)
+#### 핵심 로직
 
-#### 핵심 수정
-
-**분산학습 자동 감지**:
+**Global step tracking**:
 ```python
-def main():
-    # ... (기존 코드)
+def train_stage1(..., log_interval: int, eval_interval: int, val_dataloader: DataLoader):
+    global_step = 0
 
-    # 8. 환경 초기화 (분산학습 자동 감지)
-    from weighted_mtp.runtime.environment import setup_environment
-    from weighted_mtp.runtime.distributed import is_distributed, get_rank
+    for epoch in range(n_epochs):
+        for batch_idx, batch in enumerate(dataloader):
+            # Training step
+            loss = ...
+            loss.backward()
+            optimizer.step()
 
-    device = setup_environment(config)
+            global_step += 1
 
-    # 분산학습 여부 확인
-    if is_distributed():
-        rank = get_rank()
-        logger.info(f"분산학습 모드: Rank {rank}")
+            # Log interval
+            if is_main_process() and global_step % log_interval == 0:
+                logger.info(f"[Stage 1] Step {global_step}, Epoch {epoch}, Loss: {loss:.4f}")
 
-        # DistributedSampler 사용
-        # TODO: DataLoader 생성 시 sampler 추가
-    else:
-        logger.info("단일 GPU 모드")
+            # Eval interval
+            if is_main_process() and global_step % eval_interval == 0:
+                val_metrics = evaluate_stage(adapter, val_dataloader, config, device, "stage1")
+                logger.info(f"[Stage 1] Step {global_step}, Val Loss: {val_metrics['val_loss']:.4f}")
 
-    # ... (나머지 코드)
+                # Best checkpoint
+                if val_metrics["val_loss"] < best_val_loss:
+                    ...
 ```
 
-**DistributedSampler 적용**:
-```python
-def _create_dataloaders(
-    stage1_dataset: Dataset,
-    stage2_dataset: Dataset,
-    tokenizer,
-    config: dict,
-) -> tuple[DataLoader, DataLoader]:
-    """DataLoader 생성 (분산학습 지원)"""
-    from torch.utils.data import DataLoader, DistributedSampler
-    from weighted_mtp.data import AlpacaDataCollator
-    from weighted_mtp.runtime.distributed import is_distributed
+#### defaults.yaml 설정
 
-    # ... (collator, batch_size 설정)
-
-    # DistributedSampler 생성 (분산학습 시)
-    if is_distributed():
-        stage1_sampler = DistributedSampler(stage1_dataset, shuffle=True)
-        stage2_sampler = DistributedSampler(stage2_dataset, shuffle=True)
-        stage1_shuffle = False  # Sampler가 shuffle 담당
-        stage2_shuffle = False
-    else:
-        stage1_sampler = None
-        stage2_sampler = None
-        stage1_shuffle = True
-        stage2_shuffle = True
-
-    stage1_dataloader = DataLoader(
-        stage1_dataset,
-        batch_size=stage1_batch_size,
-        collate_fn=collator,
-        shuffle=stage1_shuffle,
-        sampler=stage1_sampler,
-    )
-
-    stage2_dataloader = DataLoader(
-        stage2_dataset,
-        batch_size=stage2_batch_size,
-        collate_fn=collator,
-        shuffle=stage2_shuffle,
-        sampler=stage2_sampler,
-    )
-
-    return stage1_dataloader, stage2_dataloader
-```
-
-#### VESSL 실행 예시
-
-**로컬 테스트**:
-```bash
-uv run python -m weighted_mtp.cli.train \
-  --config configs/defaults.yaml \
-  --recipe configs/recipe.verifiable.yaml \
-  --preset local-light \
-  --use-micro-model \
-  --run-name test_run_001
-```
-
-**VESSL 분산학습**:
-```bash
-torchrun \
-  --nproc_per_node=4 \
-  --nnodes=1 \
-  --node_rank=0 \
-  --master_addr=localhost \
-  --master_port=29500 \
-  -m weighted_mtp.cli.train \
-  --config configs/defaults.yaml \
-  --recipe configs/recipe.verifiable.yaml \
-  --run-name vessl_prod_001
-```
-
-#### 검증 기준
-- [ ] 단일 GPU 모드 정상 동작
-- [ ] DistributedSampler 적용 확인 (분산 환경)
-- [ ] 4-GPU 환경에서 데이터 중복 없이 분할 확인
-- [ ] Rank 0만 MLflow 로깅 확인
-
----
-
-### Step 6: Recipe 파일 검증 및 보완
-
-#### 목표
-3가지 실험 recipe 파일이 파이프라인과 정확히 매핑되도록 검증합니다.
-
-#### 검증 항목
-
-**recipe.baseline.yaml**:
-- [ ] experiment.name 존재
-- [ ] training.stage1 설정 존재
-- [ ] training.stage2.use_weighting = false 확인
-- [ ] dataset 경로 정확
-
-**recipe.verifiable.yaml**:
-- [ ] experiment.name 존재
-- [ ] training.stage2.use_weighting = true 확인
-- [ ] training.stage2.beta, value_coef 존재
-- [ ] dataset 경로 정확
-
-**recipe.rho1_weighted.yaml**:
-- [ ] experiment.name 존재
-- [ ] training.stage2.weighting_method = "rho1" 확인
-- [ ] models.reference 경로 존재
-- [ ] dataset 경로 정확
-
-#### 필요한 수정
-
-현재 `recipe.verifiable.yaml`의 문제:
-- `training.stage1.num_epochs` → `training.stage1.n_epochs` (통일)
-- `training.stage2.num_epochs` → `training.stage2.n_epochs` (통일)
-
-**수정 예시**:
 ```yaml
 training:
-  stage1:
-    n_epochs: 0.5  # ← num_epochs에서 변경
-    batch_size: 8
-    learning_rate: 5.0e-5
-
-  stage2:
-    n_epochs: 2.5  # ← num_epochs에서 변경
-    batch_size: 4
+  log_interval: 10    # 10 step마다 train loss 출력
+  eval_interval: 100  # 100 step마다 validation 평가
+  save_checkpoint_every: 1  # 1 epoch마다 checkpoint 저장
 ```
+
+#### 검증 기준
+- [ ] Log interval: 설정된 step마다 출력 확인
+- [ ] Eval interval: 설정된 step마다 validation 평가 확인
+- [ ] Global step: Epoch 경계 무관하게 증가 확인
 
 ---
 
-## Part 4: 검증 및 테스트
+### 3.7 Step 7: Multi-head Loss 개별 Logging (`pipelines/training.py`)
 
-### 4.1 Unit Test
+#### 목표
+Stage 2에서 4개 MTP head loss를 개별적으로 출력
 
-**테스트 파일**: `tests/unit/test_cli_train.py` (신규 생성)
+#### 핵심 로직
 
-**테스트 항목**:
+**Stage 2 학습 중**:
 ```python
-class TestConfigExtraction:
-    """Config 추출 함수 테스트"""
+# 기존: 평균만 계산
+mtp_losses = []
+for i, head_logits in enumerate(mtp_logits_list):
+    loss_i = F.cross_entropy(...)
+    mtp_losses.append(loss_i)
 
-    def test_extract_training_config(self):
-        """training config 추출 정확성"""
-        config = {
-            "training": {
-                "stage1": {"n_epochs": 0.5, "loss_type": "mse", "learning_rate": 1e-4},
-                "stage2": {"n_epochs": 2.5, "beta": 0.9, "value_coef": 0.5},
-            }
-        }
+avg_mtp_loss = sum(mtp_losses) / len(mtp_losses)
 
-        result = _extract_training_config(config)
-
-        assert result["stage1"]["n_epochs"] == 0.5
-        assert result["stage2"]["beta"] == 0.9
-
-    def test_validate_config_missing_section(self):
-        """필수 섹션 누락 시 ValueError"""
-        config = {"project": {}}  # models, dataset 누락
-
-        with pytest.raises(ValueError):
-            _validate_config(config)
-
-    def test_validate_config_missing_path(self):
-        """모델 경로 없을 시 FileNotFoundError"""
-        config = {
-            "project": {},
-            "models": {"policy": {"path": "/nonexistent"}},
-            "dataset": {},
-            "training": {},
-        }
-
-        with pytest.raises(FileNotFoundError):
-            _validate_config(config)
+# 추가: 개별 loss logging
+if is_main_process() and global_step % log_interval == 0:
+    for i, loss in enumerate(mtp_losses):
+        logger.info(f"    Head {i} loss: {loss:.4f}")
+    logger.info(f"    Avg MTP loss: {avg_mtp_loss:.4f}")
 ```
 
-### 4.2 Integration Test
+#### 검증 기준
+- [ ] 4개 head loss 개별 출력 확인
+- [ ] 평균 MTP loss 출력 확인
+- [ ] Log interval에 맞춰 출력 확인
 
-**테스트 파일**: `tests/integration/test_cli_integration.py` (신규 생성)
+---
 
-**테스트 항목**:
+### 3.8 Step 8: CLI main() 함수 완성 (`cli/train.py`)
+
+#### 목표
+모든 구성 요소를 연결하여 사용자 커맨드 실행
+
+#### main() 흐름
+
+1. **Argument parsing**:
+   - `--config`: defaults.yaml 경로
+   - `--recipe`: recipe 파일 경로
+   - `--preset`: local-light 등 preset
+   - `--use-micro-model`: micro 모델 사용
+   - `--dry-run`: 설정만 출력
+   - `--run-name`: MLflow run 이름
+
+2. **Config loading & merging**:
+   - `load_config(config_path, recipe_path)`: Deep merge
+   - Preset 적용 (if specified)
+   - Micro model override (if specified)
+
+3. **Config validation**:
+   - `_validate_config(config)`
+
+4. **Environment setup**:
+   - Logging 설정
+   - Device 설정
+   - Distributed 초기화 (if multi-GPU)
+
+5. **MLflow initialization** (Rank 0 only):
+   - `create_mlflow_manager(config)`
+   - `start_run(run_name)`
+   - `log_params(config)`
+
+6. **Resource loading**:
+   - `_load_model(config, device)`
+   - `_load_tokenizer(config)`
+   - `_load_datasets(config)`
+   - `_create_dataloaders(...)`
+
+7. **Training config extraction**:
+   - `_extract_training_config(config)`
+
+8. **Pipeline execution**:
+   - `run_training_pipeline(adapter, stage1_train_loader, stage2_train_loader, config, device, save_dir)`
+   - Validation evaluation 포함 (내부에서)
+
+9. **MLflow finalization** (Rank 0 only):
+   - `log_metrics(final_metrics)`
+   - `log_artifact(checkpoint_path)`
+   - `end_run()`
+
+10. **Cleanup**:
+    - Distributed cleanup (if multi-GPU)
+
+#### 검증 기준
+- [ ] `--dry-run`: Config 출력 후 종료
+- [ ] `--use-micro-model`: Micro 모델로 로컬 학습 성공
+- [ ] `--recipe configs/recipe.verifiable.yaml`: Recipe 적용 성공
+- [ ] MLflow: Params, metrics, artifact 모두 로깅 확인
+- [ ] Checkpoint: Best checkpoint 저장 확인
+
+---
+
+### 3.9 Step 9: Distributed Training 지원 (`runtime/distributed.py`)
+
+#### 목표
+분산학습 환경에서 Rank 0 only operations 보장
+
+#### 핵심 함수
+
+**`is_main_process() -> bool`**
+- 역할: 현재 프로세스가 Rank 0인지 확인
+- 반환: `True` (Rank 0) or `False` (other ranks)
+- 구현:
+  ```python
+  import torch.distributed as dist
+
+  def is_main_process() -> bool:
+      if not dist.is_available() or not dist.is_initialized():
+          return True  # 단일 GPU
+      return dist.get_rank() == 0
+  ```
+
+#### 적용 위치
+
+**Checkpoint 저장**:
 ```python
-class TestCLIIntegration:
-    """CLI end-to-end 통합 테스트"""
-
-    def test_dry_run_mode(self):
-        """--dry-run 모드 동작 확인"""
-        result = subprocess.run(
-            [
-                "uv", "run", "python", "-m", "weighted_mtp.cli.train",
-                "--config", "configs/defaults.yaml",
-                "--recipe", "configs/recipe.verifiable.yaml",
-                "--dry-run",
-            ],
-            capture_output=True,
-            text=True,
-        )
-
-        assert result.returncode == 0
-        assert "Dry-run mode" in result.stdout
-
-    def test_micro_model_training(self):
-        """Micro 모델로 실제 학습 실행"""
-        result = subprocess.run(
-            [
-                "uv", "run", "python", "-m", "weighted_mtp.cli.train",
-                "--config", "configs/defaults.yaml",
-                "--preset", "local-light",
-                "--use-micro-model",
-                "--run-name", "test_integration",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=600,  # 10분 timeout
-        )
-
-        assert result.returncode == 0
-        assert "학습 완료" in result.stdout
-
-        # Checkpoint 저장 확인
-        checkpoint_dir = Path("checkpoints/verifiable-critic-wmtp")
-        assert checkpoint_dir.exists()
+if is_main_process():
+    _save_checkpoint(...)
 ```
 
-### 4.3 Smoke Test
+**Logging**:
+```python
+if is_main_process():
+    logger.info(...)
+```
 
-**테스트 스크립트**: `scripts/smoke_test_cli.sh` (신규 생성)
+**MLflow**:
+```python
+if is_main_process():
+    mlflow_manager.log_metrics(...)
+```
 
+#### 검증 기준
+- [ ] 단일 GPU: is_main_process() = True
+- [ ] 분산학습: Rank 0만 checkpoint 저장
+- [ ] 분산학습: Rank 0만 console 출력
+- [ ] 분산학습: Rank 0만 MLflow 로깅
+
+---
+
+## Part 4: 통합 및 검증
+
+### 4.1 통합 테스트
+
+#### Test 1: Dry-run 모드
 ```bash
-#!/bin/bash
-set -e
-
-echo "=== CLI Smoke Test 시작 ==="
-
-# 1. Dry-run 테스트
-echo "[1/3] Dry-run 모드 테스트"
-uv run python -m weighted_mtp.cli.train \
-  --config configs/defaults.yaml \
-  --recipe configs/recipe.verifiable.yaml \
-  --dry-run
-
-# 2. Micro 모델 학습 테스트
-echo "[2/3] Micro 모델 학습 테스트"
-uv run python -m weighted_mtp.cli.train \
-  --config configs/defaults.yaml \
-  --preset local-light \
-  --use-micro-model \
-  --run-name smoke_test
-
-# 3. MLflow 확인
-echo "[3/3] MLflow 로그 확인"
-if [ ! -d "mlruns" ]; then
-  echo "❌ MLflow 디렉터리 없음"
-  exit 1
-fi
-
-echo "✅ CLI Smoke Test 통과"
+python -m weighted_mtp.cli.train \
+    --config configs/defaults.yaml \
+    --recipe configs/recipe.verifiable.yaml \
+    --dry-run
 ```
+**검증**: Config 출력, 실행 안 함
+
+#### Test 2: Micro 모델 로컬 학습
+```bash
+python -m weighted_mtp.cli.train \
+    --config configs/defaults.yaml \
+    --recipe configs/recipe.verifiable.yaml \
+    --use-micro-model \
+    --preset local-light
+```
+**검증**:
+- Model loading 성공
+- Stage 1/2 학습 성공
+- Validation evaluation 성공
+- Best checkpoint 저장
+- MLflow 로깅 성공
+
+#### Test 3: Production 모델 학습
+```bash
+python -m weighted_mtp.cli.train \
+    --config configs/defaults.yaml \
+    --recipe configs/recipe.verifiable.yaml
+```
+**검증**:
+- Production model (7B) 로딩
+- 분산학습 동작 (4 GPU)
+- MLflow S3 artifact 업로드
+
+### 4.2 검증 체크리스트
+
+#### 기능 검증
+- [ ] Config deep merge 동작
+- [ ] Resource loading 성공 (model, tokenizer, datasets)
+- [ ] Validation evaluation 동작
+- [ ] Best checkpoint 저장 (val_loss 기준)
+- [ ] Step 기반 logging
+- [ ] Step 기반 evaluation
+- [ ] Multi-head loss 개별 출력
+- [ ] MLflow params/metrics/artifact 로깅
+- [ ] Rank 0 only operations
+
+#### 성능 검증
+- [ ] Micro 모델: 학습 완료 (<10분)
+- [ ] Production 모델: 분산학습 동작 확인
+
+#### 품질 검증
+- [ ] Unit tests 통과 (config, resource loading)
+- [ ] Integration test 통과 (end-to-end)
+- [ ] MLflow UI에서 실험 확인 가능
 
 ---
 
-## Part 5: 완료 기준 및 다음 단계
+## Part 5: Phase 5와의 연계
 
-### 5.1 Phase 6 완료 체크리스트
+### 5.1 Phase 5에서 제공하는 것
 
-#### 코드 완성
-- [ ] `_extract_training_config()` 구현
-- [ ] `_validate_config()` 구현
-- [ ] `_load_model()` 구현
-- [ ] `_load_tokenizer()` 구현
-- [ ] `_load_datasets()` 구현
-- [ ] `_create_dataloaders()` 구현 (분산 지원)
-- [ ] `src/weighted_mtp/runtime/mlflow.py` 구현
-  - init_mlflow(), log_metrics(), finish_mlflow()
-- [ ] `cli/train.py` main() 함수 완성
-  - 파이프라인 연결
-  - MLflow 연동
+**파이프라인 인터페이스**:
+```python
+def run_training_pipeline(
+    adapter: MetaLlamaMTPAdapter,
+    stage1_dataloader: DataLoader,
+    stage2_dataloader: DataLoader,
+    config: dict,
+    device: torch.device,
+    save_dir: Path | None,
+) -> dict[str, dict[str, float]]
+```
 
-#### Config 정리
-- [ ] `recipe.verifiable.yaml` 필드명 통일 (num_epochs → n_epochs)
-- [ ] `recipe.baseline.yaml` 검증
-- [ ] `recipe.rho1_weighted.yaml` 검증
+**Value weighting 모듈**:
+- `compute_td_errors()`
+- `build_weights()`
+- `compute_weight_stats()`, `compute_td_stats()`
 
-#### 테스트 완성
-- [ ] `tests/unit/test_cli_train.py` 작성
-  - test_extract_training_config()
-  - test_validate_config()
-- [ ] `tests/integration/test_cli_integration.py` 작성
-  - test_dry_run_mode()
-  - test_micro_model_training()
-- [ ] `scripts/smoke_test_cli.sh` 작성
+**Stage 1/2 학습 함수**:
+- `train_stage1()`
+- `train_stage2()`
 
-#### 검증 완료
-- [ ] Dry-run 모드 동작 확인
-- [ ] Micro 모델 로컬 학습 성공 (<2.5시간)
-- [ ] MLflow 로깅 확인 (metrics, params)
-- [ ] Checkpoint 저장 확인
-- [ ] 3가지 recipe 모두 실행 가능 확인
-- [ ] 분산학습 모드 동작 확인 (VESSL 환경)
+### 5.2 Phase 6에서 추가하는 것
 
-#### 문서화
-- [ ] 본 문서 (`08_phase6_detailed_plan.md`) 소급 업데이트
-- [ ] CLI 사용 예시 추가 (README 또는 별도 문서)
-- [ ] VESSL 실행 가이드 작성
+**사용자 진입점**:
+- CLI argparse
+- Config loading & merging
+- Resource loading
 
-### 5.2 Phase 7 착수 조건
+**프로덕션 기능**:
+- Validation evaluation
+- Best checkpoint 저장
+- MLflow 로깅
+- Distributed training 지원
 
-Phase 6 완료 후, 다음 조건을 만족해야 Phase 7 (평가 파이프라인)로 진행:
+**Phase 5 수정사항**:
+- `evaluate_stage()` 함수 추가 (`pipelines/training.py`)
+- Global step 기반 logging/evaluation 추가
+- Multi-head loss 개별 logging 추가
+- Rank 0 only 체크 추가
 
-**필수 조건**:
-1. CLI로 3가지 실험 모두 실행 가능
-2. Micro 모델 로컬 학습 성공
-3. MLflow 로깅 정상 동작
-4. Checkpoint 저장/로드 정상 동작
-5. Integration test 통과
+---
 
-**권장 조건**:
-1. VESSL 환경에서 분산학습 검증 (4-GPU)
-2. Production 모델 (7B) 로딩 검증
-3. Smoke test 자동화 (CI)
-
-### 5.3 예상 소요 시간
+## Part 6: 예상 소요 시간
 
 | 작업 | 예상 시간 | 비고 |
 |------|-----------|------|
-| Step 1: Config 추출/검증 | 3-4시간 | 함수 구현 + 단위 테스트 |
-| Step 2: Resource 로딩 | 4-6시간 | 모델/데이터/DataLoader |
-| Step 3: MLflow 모듈 | 3-4시간 | 초기화 + 로깅 |
-| Step 4: CLI main() 완성 | 4-6시간 | 전체 연결 + 에러 처리 |
-| Step 5: 분산학습 지원 | 2-3시간 | DistributedSampler 적용 |
-| Step 6: Recipe 검증 | 2-3시간 | 3개 파일 수정 |
-| 통합 테스트 및 디버깅 | 4-6시간 | End-to-end 검증 |
-| 문서화 | 2-3시간 | 본 문서 + 사용 가이드 |
-| **합계** | **24-35시간** | 약 3-4.5일 |
-
-### 5.4 Phase 7 Preview
-
-**Phase 7: 평가 파이프라인** (다음 단계)
-
-핵심 구현:
-1. `pipelines/evaluation.py`: MBPP, HumanEval 평가
-2. Pass@K 계산 (K=1,5,10)
-3. Inference 루틴 (beam search, nucleus sampling)
-4. Rho-1 reference와의 loss 비교
-5. 평가 리포트 자동 생성
-
-**Phase 6와의 연계**:
-- Phase 6 CLI → `--eval-only` 플래그 추가
-- Checkpoint 로드 → 평가 실행
-- MLflow에 평가 결과 자동 로깅
+| Config extraction/validation | 2-3시간 | _extract_training_config, _validate_config |
+| Resource loading 함수 | 3-4시간 | _load_model, _load_tokenizer, _load_datasets, _create_dataloaders |
+| Validation evaluation | 3-4시간 | evaluate_stage 함수 |
+| Best checkpoint 저장 | 2-3시간 | Best tracking 로직 |
+| MLflow 통합 | 3-4시간 | MLflowManager 복사 + CLI 통합 |
+| Step 기반 logging/eval | 2-3시간 | Global step tracking |
+| Multi-head logging | 1-2시간 | 개별 loss 출력 |
+| CLI main() 완성 | 3-4시간 | 전체 흐름 연결 |
+| Distributed 지원 | 2-3시간 | is_main_process 적용 |
+| 통합 테스트 및 디버깅 | 4-6시간 | End-to-end 테스트 |
+| 문서화 | 2-3시간 | 본 문서 업데이트 |
+| **합계** | **27-39시간** | 약 3.5-5일 |
 
 ---
 
-## 부록
+## Part 7: 부록
 
-### A. 디렉터리 구조 (Phase 6 추가)
+### 7.1 Config 구조 요약
 
-```
-weighted_mtp/
-├── src/weighted_mtp/
-│   ├── cli/
-│   │   └── train.py           # ← Phase 6: main() 완성, resource 로딩 추가
-│   ├── runtime/
-│   │   ├── mlflow.py          # ← Phase 6: 신규 생성
-│   │   ├── environment.py     # (Phase 3에서 구현됨)
-│   │   └── distributed.py     # (Phase 3에서 구현됨)
-│   └── ...
-├── configs/
-│   ├── defaults.yaml
-│   ├── recipe.baseline.yaml
-│   ├── recipe.verifiable.yaml # ← Phase 6: 필드명 수정
-│   ├── recipe.rho1_weighted.yaml
-│   └── local-light.yaml
-├── tests/
-│   ├── unit/
-│   │   └── test_cli_train.py  # ← Phase 6: 신규 생성
-│   └── integration/
-│       └── test_cli_integration.py  # ← Phase 6: 신규 생성
-├── scripts/
-│   └── smoke_test_cli.sh      # ← Phase 6: 신규 생성
-└── checkpoints/               # ← Phase 6: 자동 생성 (저장 디렉터리)
-```
-
-### B. 개발원칙 준수 체크리스트
-
-**[원칙 1] 앞/뒤 흐름 분석**:
-- [x] Phase 5 `run_training_pipeline()` 인터페이스 확인
-- [x] Phase 3 `load_dataset()`, `AlpacaDataCollator` 확인
-- [x] Phase 4 `load_adapter()` 확인
-- [x] Phase 3 `runtime/distributed.py`, `runtime/environment.py` 확인
-
-**[원칙 2] 기존 구조 존중**:
-- [x] `run_training_pipeline()` 인터페이스 변경 없음
-- [x] Config deep_merge 방식 유지
-- [x] 기존 Data collator 재사용
-- [x] 분산학습 모듈 재사용
-
-**[원칙 3] 전격적 변경 승인**:
-- [ ] 새로운 접근 시 사용자 승인 획득
-- [ ] 기존 계획과 차이 발생 시 문서화
-
-**[원칙 4] 하위 호환성 고려 없음**:
-- [ ] 주석: 한글, 이모지 없음, 코드 동작 핵심만
-- [ ] 로깅: 한글, 이모지 없음
-- [ ] 변수명: 통일성 있게 네이밍 (n_epochs, not num_epochs)
-
-**[원칙 5] 계획서와 비교**:
-- [ ] Phase 6 완료 후 본 문서 소급 업데이트
-- [ ] 차이점 객관적 기술
-- [ ] 성과 과장 없음
-
-**[원칙 6] 패키지 의존성 도구 활용**:
-- [x] uv로 의존성 관리
-- [x] pytest 실행 시 `uv run pytest` 사용
-
-### C. Config 필드명 통일 규칙
-
-**통일된 필드명** (Phase 6 적용):
-- `n_epochs` (not `num_epochs`)
-- `learning_rate` (not `lr`)
-- `batch_size`
-- `gradient_accumulation_steps`
-
-**Recipe 파일 수정 예시**:
 ```yaml
-# Before (일관성 없음)
+# defaults.yaml
+project:
+  name: weighted-mtp
+  version: "2.0.0"
+
+models:
+  policy:
+    name: meta-llama-mtp
+    path: storage/models_v2/meta-llama-mtp
+
+dataset:
+  name: codecontests
+  train: storage/datasets_v2/codecontests/processed/train.jsonl
+  validation: storage/datasets_v2/codecontests/processed/valid.jsonl
+
+mlflow:
+  tracking_uri: "http://13.50.240.176"
+  experiment: "weighted-mtp/production"
+  s3_artifacts: "s3://wmtp/mlflow-artifacts"
+
 training:
+  log_interval: 10
+  eval_interval: 100
+  save_checkpoint_every: 1
+
   stage1:
-    num_epochs: 1        # ← 수정 필요
+    n_epochs: 0.5
+    learning_rate: 1.0e-4
+    loss_type: mse
+
   stage2:
-    num_epochs: 3        # ← 수정 필요
-
-# After (통일됨)
-training:
-  stage1:
-    n_epochs: 0.5        # ← 통일
-  stage2:
-    n_epochs: 2.5        # ← 통일
+    n_epochs: 2.5
+    learning_rate: 1.0e-5
+    beta: 0.9
+    value_coef: 0.5
+    max_grad_norm: 0.5
+    loss_type: mse
+    weight_clip_min: 0.1
+    weight_clip_max: 5.0
 ```
 
-### D. MLflow 로깅 항목
+### 7.2 MLflow 저장 구조
 
-**Params (Config)**:
-```python
-{
-    "project.name": "weighted-mtp",
-    "experiment.name": "verifiable-critic-wmtp",
-    "models.policy.name": "meta-llama-mtp",
-    "training.stage1.n_epochs": 0.5,
-    "training.stage2.n_epochs": 2.5,
-    "training.stage2.beta": 0.9,
-    "training.stage2.value_coef": 0.5,
-}
+```
+s3://wmtp/mlflow-artifacts/
+└── 8/                                    # Experiment ID
+    └── {run_id}/                         # Run ID
+        └── artifacts/
+            └── checkpoints/
+                ├── checkpoint_stage1_best.pt
+                └── checkpoint_stage2_best.pt
 ```
 
-**Metrics (실시간)**:
-```python
-{
-    "stage1_loss": float,
-    "stage1_value_explained_variance": float,
-    "stage2_weighted_ce_loss": float,
-    "stage2_value_loss": float,
-    "stage2_total_loss": float,
-    "td_mean": float,
-    "td_std": float,
-    "weight_mean": float,
-    "weight_entropy": float,
-    "value_explained_variance": float,
-}
-```
+### 7.3 개발 원칙 준수 체크리스트
 
-**Artifacts (최종)**:
-```
-checkpoints/
-  └── verifiable-critic-wmtp/
-      ├── checkpoint_epoch_0.pt
-      ├── checkpoint_epoch_1.pt
-      └── final_metrics.json
-```
+- [x] **원칙 1**: Phase 5 파이프라인 인터페이스 분석 완료
+- [x] **원칙 2**: Phase 5 구조 존중, 중복 메서드 없음
+- [x] **원칙 3**: Phase 5 수정 최소화 (evaluate_stage 추가만)
+- [x] **원칙 4**: 구체적 코드 구현 삭제, 핵심 설명만 유지
+- [x] **원칙 5**: Phase 3/5 양식 참고하여 간결한 문서 작성
+- [x] **원칙 6**: 의존성 도구 활용 (uv, mlflow, boto3)
 
----
+### 7.4 참고 문서
 
-**문서 종료**
-
-본 문서는 Phase 6 **상세 계획**을 정리한 초안입니다. 구현 과정에서 실제 상태를 반영하여 소급 업데이트할 예정입니다.
-
-**핵심 목표 요약**:
-1. CLI main() 함수 완성 (파이프라인 연결)
-2. Config 추출 및 검증 로직 구현
-3. Resource 로딩 자동화 (모델, 데이터, DataLoader)
-4. MLflow 초기화 및 로깅 구현
-5. 분산학습 지원 (DistributedSampler)
-6. 3가지 실험 recipe 검증 및 실행 확인
+- `docs/05_phase3_detailed_plan.md`: 데이터 파이프라인 (양식 참고)
+- `docs/07_phase5_detailed_plan.md`: Value Training 파이프라인
+- `docs/wmtp_research_proposal.md`: WMTP 연구 의도
+- `src/weighted_mtp/pipelines/training.py`: Phase 5 파이프라인 구현
+- `/Users/wesley/Desktop/wooshikwon/wmtp/src/utils/monitoring/mlflow.py`: MLflowManager 참고

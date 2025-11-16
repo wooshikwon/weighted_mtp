@@ -42,8 +42,9 @@ runtime:
   mixed_precision: true
 
 mlflow:
-  tracking_uri: file://./mlruns
-  experiment_name: wmtp-experiments
+  tracking_uri: "http://13.50.240.176"  # EC2 MLflow Server (Basic Auth)
+  experiment: "weighted-mtp/production"  # Experiment 이름
+  s3_artifacts: "s3://wmtp/mlflow-artifacts"  # S3 Artifact Storage
 
 logging:
   level: INFO
@@ -98,6 +99,14 @@ data:
 
 # 학습 파이프라인 설정 (Phase 5)
 training:
+  # Logging & Evaluation Intervals (Step 단위)
+  log_interval: 10    # 10 step마다 train loss 출력
+  eval_interval: 100  # 100 step마다 validation 평가
+
+  # Checkpoint 저장
+  save_checkpoint_every: 1  # 1 epoch마다 checkpoint 저장
+  save_best_checkpoint: true  # Best validation loss checkpoint 저장
+
   # Stage 1: Value Head Pretrain
   stage1:
     n_epochs: 0.5
@@ -118,6 +127,3 @@ training:
     # Weight clipping (보수적 안정화)
     weight_clip_min: 0.1
     weight_clip_max: 5.0
-
-  # Checkpoint 저장
-  save_checkpoint_every: 1  # epoch마다 저장
