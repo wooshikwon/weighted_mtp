@@ -9,15 +9,59 @@ from rich.console import Console
 console = Console()
 
 
+def deep_merge(base: dict, override: dict) -> dict:
+    """재귀적으로 dict를 병합 (Deep merge)
+
+    Args:
+        base: 기본 설정 (defaults.yaml)
+        override: Override할 설정 (recipe, preset)
+
+    Returns:
+        병합된 설정 (중첩 구조 유지)
+
+    Examples:
+        >>> base = {"a": {"b": 1, "c": 2}, "d": 3}
+        >>> override = {"a": {"b": 10}, "e": 4}
+        >>> deep_merge(base, override)
+        {"a": {"b": 10, "c": 2}, "d": 3, "e": 4}
+    """
+    result = base.copy()
+
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            # 둘 다 dict인 경우 재귀적으로 병합
+            result[key] = deep_merge(result[key], value)
+        else:
+            # 일반 값이거나 base에 없는 키는 덮어쓰기
+            result[key] = value
+
+    return result
+
+
 def load_config(config_path: Path, recipe_path: Path | None = None) -> dict:
-    """설정 파일 로딩"""
+    """설정 파일 로딩 (Deep merge 지원)
+
+    Args:
+        config_path: 기본 설정 파일 (defaults.yaml)
+        recipe_path: 실험 recipe 파일 (선택적)
+
+    Returns:
+        병합된 설정
+
+    Examples:
+        >>> config = load_config(Path("configs/defaults.yaml"))
+        >>> config = load_config(
+        ...     Path("configs/defaults.yaml"),
+        ...     Path("configs/recipe.verifiable.yaml")
+        ... )
+    """
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
     if recipe_path:
         with open(recipe_path) as f:
             recipe = yaml.safe_load(f)
-        config.update(recipe)
+        config = deep_merge(config, recipe)
 
     return config
 
@@ -64,7 +108,8 @@ def main():
         preset_path = Path("configs/local-light.yaml")
         with open(preset_path) as f:
             preset = yaml.safe_load(f)
-        config.update(preset.get("override", {}))
+        # Deep merge preset override
+        config = deep_merge(config, preset.get("override", {}))
 
     if args.use_micro_model:
         config["models"]["policy"]["name"] = "micro-mtp"
