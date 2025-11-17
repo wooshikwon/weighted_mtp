@@ -1,6 +1,13 @@
 # Verifiable WMTP (Stage 2)
 # WMTP with TD error-based token weighting
+# 프로덕션 설정 (VESSL A100 4-GPU)
 
+# 프로젝트 정보
+project:
+  name: weighted-mtp
+  version: "2.0.0"
+
+# 실험 메타정보
 experiment:
   name: verifiable-wmtp
   description: "WMTP with TD error-based token weighting"
@@ -8,21 +15,37 @@ experiment:
   tags:
     - verifiable
     - wmtp
-    - stage2
+    - production
   critic_checkpoint: storage/checkpoints/critic/critic-pretrain/checkpoint_best.pt
 
-# models 섹션은 defaults.yaml 사용 (meta-llama-mtp + tokenizer)
+# 모델 설정
+models:
+  policy:
+    name: meta-llama-mtp
+    path: storage/models_v2/meta-llama-mtp
+    tokenizer_path: storage/models_v2/meta-llama-mtp/tokenizer
+    params:
+      dim: 4096
+      n_layers: 32
+      n_heads: 32
+      n_future_tokens: 4
+      intermediate_size: 11008
+      rope_theta: 10000.0
+      vocab_size: 32000
+    dtype: float16
 
+# 데이터셋 설정
 dataset:
   name: codecontests
   train: storage/datasets_v2/codecontests/processed/train.jsonl
   validation: storage/datasets_v2/codecontests/processed/valid.jsonl
   max_length: 2048
 
+# 데이터 샘플링
 data_sampling:
   n_samples: 100000
   balance_correct: true
-  correct_ratio: 0.5
+  correct_ratio: 0.5  # Correct/Incorrect 균형
   curriculum_learning: true
   difficulty_bins:
     low: [1, 3]
@@ -46,22 +69,51 @@ data_sampling:
         high: 0.4
   seed: 42
 
+# 학습 설정 (A100 4-GPU 최적화)
 training:
   n_epochs: 2.5
-  batch_size: 4
-  gradient_accumulation_steps: 4
+  batch_size: 4  # Per GPU (effective = 16 with 4 GPUs)
+  gradient_accumulation_steps: 4  # Effective batch size = 64
   learning_rate: 1.0e-5
-  beta: 0.9
-  value_coef: 0.5
   max_grad_norm: 0.5
+
+  # TD error weighting
+  beta: 0.9  # TD error temperature
+  value_coef: 0.5  # Value loss coefficient
+  weight_clip_min: 0.1  # 최소 가중치
+  weight_clip_max: 5.0  # 최대 가중치
   loss_type: mse
-  weight_clip_min: 0.1
-  weight_clip_max: 5.0
+
   log_interval: 10
 
+# 체크포인트
 checkpoint:
   save_dir: storage/checkpoints/verifiable/${experiment.name}
   save_checkpoint_every: 1.0
   save_best: true
   save_final: true
   save_total_limit: 3
+
+# 런타임 설정
+runtime:
+  device: cuda
+  seed: 42
+  mixed_precision: true
+
+# 스토리지
+storage:
+  root: storage
+  models_dir: storage/models_v2
+  datasets_dir: storage/datasets_v2
+  checkpoints_dir: storage/checkpoints
+
+# MLflow 추적
+mlflow:
+  tracking_uri: "http://13.50.240.176"
+  experiment: "weighted-mtp/production"
+  s3_artifacts: "s3://wmtp/mlflow-artifacts"
+
+# 로깅
+logging:
+  level: INFO
+  format: "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"

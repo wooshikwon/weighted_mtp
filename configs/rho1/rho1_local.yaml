@@ -1,6 +1,10 @@
 # Rho-1 WMTP Local Test (Micro model)
 # M3 Mac 경량 테스트용
 
+project:
+  name: weighted-mtp
+  version: "0.2.0"
+
 experiment:
   name: rho1-wmtp-local
   description: "Local test with micro model"
@@ -15,12 +19,12 @@ models:
     name: micro-mtp
     path: storage/models_v2/micro-mtp
     tokenizer_path: storage/models_v2/meta-llama-mtp/tokenizer
+    dtype: float16
 
   reference:
     name: micro-mtp
     path: storage/models_v2/micro-mtp
     dtype: float16
-    # Tokenizer는 policy 모델과 공유 (동일 모델)
 
 dataset:
   name: codecontests
@@ -39,8 +43,9 @@ training:
   batch_size: 2
   gradient_accumulation_steps: 1
   learning_rate: 1.0e-5
-  k_percent: 0.6
   max_grad_norm: 0.5
+  temperature: 1.0
+  k_percent: 0.6
   log_interval: 5
 
 checkpoint:
@@ -52,4 +57,17 @@ checkpoint:
 
 runtime:
   device: mps
+  seed: 42
   mixed_precision: false
+
+storage:
+  s3_bucket: "s3://wmtp"
+  s3_checkpoints_prefix: "checkpoints/rho1"
+
+mlflow:
+  tracking_uri: ""
+  experiment: ""
+  s3_artifacts: ""
+
+logging:
+  level: INFO

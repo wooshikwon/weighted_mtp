@@ -1,6 +1,13 @@
 # Critic Pre-training (Stage 1)
 # Value head pretraining for TD error calculation
+# 프로덕션 설정 (VESSL A100 4-GPU)
 
+# 프로젝트 정보
+project:
+  name: weighted-mtp
+  version: "2.0.0"
+
+# 실험 메타정보
 experiment:
   name: critic-pretrain
   description: "Value head pretraining for TD error calculation"
@@ -8,33 +15,77 @@ experiment:
   tags:
     - critic
     - value-head
-    - stage1
+    - production
 
-# models 섹션은 defaults.yaml 사용 (meta-llama-mtp + tokenizer)
+# 모델 설정
+models:
+  policy:
+    name: meta-llama-mtp
+    path: storage/models_v2/meta-llama-mtp
+    tokenizer_path: storage/models_v2/meta-llama-mtp/tokenizer
+    params:
+      dim: 4096
+      n_layers: 32
+      n_heads: 32
+      n_future_tokens: 4
+      intermediate_size: 11008
+      rope_theta: 10000.0
+      vocab_size: 32000
+    dtype: float16
 
+# 데이터셋 설정
 dataset:
   name: codecontests
   train: storage/datasets_v2/codecontests/processed/train.jsonl
   validation: storage/datasets_v2/codecontests/processed/valid.jsonl
   max_length: 2048
 
+# 데이터 샘플링
 data_sampling:
   n_samples: 30000
   balance_correct: true
-  correct_ratio: 0.5
+  correct_ratio: 0.5  # Correct/Incorrect 균형
   difficulty_range: [1, 11]
   seed: 42
 
+# 학습 설정 (A100 4-GPU 최적화)
 training:
-  n_epochs: 0.5
-  batch_size: 8
-  learning_rate: 1.0e-4
+  n_epochs: 0.5  # 빠른 pretraining
+  batch_size: 8  # Per GPU (effective = 32 with 4 GPUs)
+  gradient_accumulation_steps: 2  # Effective batch size = 64
+  learning_rate: 1.0e-4  # Critic은 높은 LR
+  max_grad_norm: 0.5
   loss_type: mse
   log_interval: 10
 
+# 체크포인트
 checkpoint:
   save_dir: storage/checkpoints/critic/${experiment.name}
   save_checkpoint_every: 0.5
   save_best: true
   save_final: true
   save_total_limit: 3
+
+# 런타임 설정
+runtime:
+  device: cuda
+  seed: 42
+  mixed_precision: true
+
+# 스토리지
+storage:
+  root: storage
+  models_dir: storage/models_v2
+  datasets_dir: storage/datasets_v2
+  checkpoints_dir: storage/checkpoints
+
+# MLflow 추적
+mlflow:
+  tracking_uri: "http://13.50.240.176"
+  experiment: "weighted-mtp/production"
+  s3_artifacts: "s3://wmtp/mlflow-artifacts"
+
+# 로깅
+logging:
+  level: INFO
+  format: "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"

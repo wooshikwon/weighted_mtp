@@ -27,17 +27,14 @@ def main():
         help="실험 config 경로 (예: configs/baseline/baseline.yaml)",
     )
     parser.add_argument(
-        "--run-name",
-        help="MLflow run 이름 override",
-    )
-    parser.add_argument(
-        "--device",
-        help="Device override (cuda/cpu/mps)",
-    )
-    parser.add_argument(
-        "--use-micro-model",
-        action="store_true",
-        help="Micro 모델 사용 (로컬 테스트)",
+        "--override",
+        action="append",
+        dest="overrides",
+        help=(
+            "Config 필드 override (계층 구조 지원). "
+            "형식: key=value (예: --override experiment.name=test "
+            "--override training.batch_size=8). 여러 번 사용 가능."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -52,29 +49,38 @@ def main():
         logger.error(f"Config 파일을 찾을 수 없습니다: {args.config}")
         sys.exit(1)
 
-    # Stage 식별 (config에서 experiment.stage 읽기)
+    # Config 로드
     try:
-        config_preview = OmegaConf.load(args.config)
-        stage = config_preview.experiment.stage
+        config = OmegaConf.load(args.config)
     except Exception as e:
         logger.error(f"Config 로딩 실패: {e}")
-        logger.error("Config 파일에 'experiment.stage' 필드가 있는지 확인하세요.")
         sys.exit(1)
 
-    # Override params 생성
-    overrides = {}
-    if args.run_name:
-        overrides["experiment.name"] = args.run_name
-    if args.device:
-        overrides["runtime.device"] = args.device
-    if args.use_micro_model:
-        overrides["models.policy.path"] = "storage/models_v2/micro-mtp"
+    # Override 적용
+    if args.overrides:
+        from weighted_mtp.utils.config_utils import apply_overrides
+
+        try:
+            config = apply_overrides(config, args.overrides)
+            logger.info(f"Override 적용 완료: {args.overrides}")
+        except ValueError as e:
+            logger.error(f"Override 적용 실패: {e}")
+            sys.exit(1)
+
+    # Stage 확인
+    if not hasattr(config, "experiment") or not hasattr(
+        config.experiment, "stage"
+    ):
+        logger.error("Config에 'experiment.stage' 필드가 없습니다.")
+        sys.exit(1)
+
+    stage = config.experiment.stage
 
     # Dry-run
     if args.dry_run:
         logger.info(f"Pipeline: {stage}")
-        logger.info(f"Config: {args.config}")
-        logger.info(f"Overrides: {overrides}")
+        logger.info(f"Config file: {args.config}")
+        logger.info(f"Final config:\n{OmegaConf.to_yaml(config)}")
         return
 
     # Pipeline 라우팅
@@ -84,22 +90,22 @@ def main():
     if stage == "baseline":
         from weighted_mtp.pipelines.run_baseline import run_baseline_training
 
-        run_baseline_training(config_path=str(args.config), **overrides)
+        run_baseline_training(config=config)
 
     elif stage == "critic":
         from weighted_mtp.pipelines.run_critic import run_critic_training
 
-        run_critic_training(config_path=str(args.config), **overrides)
+        run_critic_training(config=config)
 
     elif stage == "verifiable":
         from weighted_mtp.pipelines.run_verifiable import run_verifiable_training
 
-        run_verifiable_training(config_path=str(args.config), **overrides)
+        run_verifiable_training(config=config)
 
     elif stage == "rho1":
         from weighted_mtp.pipelines.run_rho1 import run_rho1_training
 
-        run_rho1_training(config_path=str(args.config), **overrides)
+        run_rho1_training(config=config)
 
     else:
         logger.error(f"Unknown stage: {stage}")

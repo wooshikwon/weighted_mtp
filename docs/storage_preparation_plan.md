@@ -147,7 +147,7 @@ storage/
      },
      "value_head": {
        "path": null,
-       "stage1_checkpoint_id": null
+       "critic_checkpoint_path": null
      },
      "tokenizer_shared_with": null,
      "source": {
@@ -288,13 +288,14 @@ MetaLlamaMTPAdapter.from_pretrained(
    - **메타데이터 기반 샘플링** (핵심 혁신):
      1. 전체 데이터셋(3.7M, ~15GB)을 메모리에 로드하지 **않음**
      2. 메타데이터 파일(`*_metadata.json`, ~217MB)만 로드
-     3. Config 기반으로 필요한 샘플 인덱스 계산 (Stage별 전략 적용)
+     3. Config 기반으로 필요한 샘플 인덱스 계산 (파이프라인별 전략 적용)
      4. JSONL 파일에서 계산된 인덱스의 라인만 선택적으로 읽기
      5. HuggingFace Dataset으로 변환
    - **메모리 절감 효과**:
-     - Rho-1 Stage (500 샘플, local): 메타데이터(~217MB) + 샘플(~2MB) = **~219MB** (기존 15GB 대비 98.5% 절감)
-     - Stage 1 (50K 샘플): 메타데이터(~217MB) + 샘플(~200MB) = **~417MB** (기존 15GB 대비 97% 절감)
-     - Stage 2 (200K 샘플): 메타데이터(~217MB) + 샘플(~800MB) = **~1GB** (기존 15GB 대비 93% 절감)
+     - Rho-1 파이프라인 (로컬 테스트 500 샘플): 메타데이터(~217MB) + 샘플(~2MB) = **~219MB** (기존 15GB 대비 98.5% 절감)
+     - Critic 파이프라인 (30K 샘플): 메타데이터(~217MB) + 샘플(~120MB) = **~337MB** (기존 15GB 대비 97.8% 절감)
+     - Verifiable 파이프라인 (100K 샘플): 메타데이터(~217MB) + 샘플(~400MB) = **~617MB** (기존 15GB 대비 96% 절감)
+     - Baseline 파이프라인 (500K 샘플): 메타데이터(~217MB) + 샘플(~2GB) = **~2.2GB** (기존 15GB 대비 85% 절감)
    - **분산학습 호환성**:
      - 메타데이터 기반으로 선택된 샘플들을 `DistributedSampler`가 4개 GPU로 자동 분할
      - Rank 0: `samples[0::4]`, Rank 1: `samples[1::4]`, Rank 2: `samples[2::4]`, Rank 3: `samples[3::4]`

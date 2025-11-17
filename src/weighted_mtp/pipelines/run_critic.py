@@ -12,7 +12,7 @@ from typing import Any
 
 import mlflow
 import torch
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 
@@ -345,23 +345,17 @@ def train_epoch_critic(
     return metrics, global_step
 
 
-def run_critic_training(config_path: str, **override_params: Any) -> tuple[dict[str, float], str]:
+def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
     """Critic pre-training 실행
 
     Args:
-        config_path: configs/critic/critic.yaml
-        override_params: CLI overrides
+        config: 완전한 config 객체 (OmegaConf DictConfig)
 
     Returns:
         (final_metrics, best_checkpoint_path)
     """
     # 0. 환경변수 로드 (MLflow credentials 등)
     ensure_env_loaded()
-
-    # 1. Config 로딩 (defaults + critic config merge)
-    defaults = OmegaConf.load("configs/defaults.yaml")
-    config = OmegaConf.load(config_path)
-    config = OmegaConf.merge(defaults, config, override_params)
 
     # 2. Distributed 초기화 (torchrun 환경인 경우)
     if "RANK" in os.environ:
@@ -782,14 +776,20 @@ if __name__ == "__main__":
         required=True,
         help="Config path (e.g., configs/critic/critic.yaml)",
     )
-    parser.add_argument("--run-name", help="MLflow run name override")
-    parser.add_argument("--device", help="Device override (cuda/cpu/mps)")
+    parser.add_argument(
+        "--override",
+        action="append",
+        dest="overrides",
+        help="Config override (e.g., --override experiment.name=test)",
+    )
     args = parser.parse_args()
 
-    overrides = {}
-    if args.run_name:
-        overrides["experiment.name"] = args.run_name
-    if args.device:
-        overrides["runtime.device"] = args.device
+    # Config 로드
+    config = OmegaConf.load(args.config)
 
-    run_critic_training(args.config, **overrides)
+    # Override 적용
+    if args.overrides:
+        from weighted_mtp.utils.config_utils import apply_overrides
+        config = apply_overrides(config, args.overrides)
+
+    run_critic_training(config)

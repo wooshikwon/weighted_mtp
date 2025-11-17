@@ -238,9 +238,7 @@ tests/
 │   ├── test_s3_utils.py       # S3 유틸 테스트
 │   ├── test_td_error.py       # TD error 계산 검증
 │   ├── test_weight_builder.py
-│   ├── test_training_pipeline.py
-│   ├── test_training_stage1.py
-│   └── test_training_stage2.py
+│   └── test_training_pipeline.py
 └── integration/
     ├── __init__.py
     ├── test_data_pipeline.py
@@ -391,13 +389,17 @@ MetaLlamaMTPAdapter.from_pretrained(
 # 1. 메타데이터만 로드 (~217MB)
 metadata = json.load(open(f"{dataset_path}_metadata.json"))
 
-# 2. Config 기반 샘플링 인덱스 계산
-if stage == "stage1":
+# 2. Config 기반 샘플링 인덱스 계산 (파이프라인별 전략)
+if balance_correct:  # Critic, Verifiable 파이프라인
     # Correct/Incorrect 균형 샘플링 (50:50)
-    indices = balanced_sample(metadata, n_samples=50000)
-elif stage == "stage2":
+    indices = balanced_sample(metadata, n_samples=n_samples, correct_ratio=0.5)
+elif correct_ratio == 1.0:  # Baseline, Rho-1 파이프라인
+    # 정답만 학습
+    indices = filter_correct_samples(metadata, n_samples=n_samples)
+
+if curriculum_learning:  # Verifiable 파이프라인 전용
     # Curriculum learning (difficulty 기반)
-    indices = curriculum_sample(metadata, schedule=...)
+    indices = curriculum_sample(indices, metadata, schedule=curriculum_schedule)
 
 # 3. JSONL에서 해당 라인만 선택적으로 읽기
 samples = [jsonl_lines[idx] for idx in indices]
@@ -410,12 +412,14 @@ dataset = Dataset.from_list(samples)
 - 기존: 전체 데이터 로드 (3.7M samples, ~15GB)
 - 개선: 메타데이터(~217MB) + 필요 샘플만(~200MB) = **~417MB** (97% 절감)
 
-**Stage별 샘플링 전략**:
+**파이프라인별 샘플링 전략**:
 
-| Stage | 샘플 크기 | `is_correct` 분포 | Difficulty 전략 | 목적 |
-|-------|----------|------------------|----------------|------|
-| **Stage 1 (Critic)** | 10K~50K | 50% correct, 50% incorrect | 균등 샘플링 | Value head가 correct/incorrect 구분 학습 |
-| **Stage 2 (Verifiable)** | 100K~500K | 혼합 (TD error가 자동 조절) | Curriculum Learning | 쉬운 문제 → 어려운 문제 점진적 학습 |
+| 파이프라인 | 샘플 크기 | `is_correct` 분포 | Difficulty 전략 | 목적 |
+|----------|----------|------------------|----------------|------|
+| **Baseline** | 500K | 100% correct (정답만) | 균등 샘플링 | 표준 MTP 학습 (비교 기준선) |
+| **Critic** | 30K | 50% correct, 50% incorrect | 균등 샘플링 | Value head가 correct/incorrect 구분 학습 |
+| **Verifiable** | 100K | 50% correct, 50% incorrect | Curriculum Learning | TD error 기반 가중치 학습 |
+| **Rho-1** | 100K | 100% correct (정답만) | 균등 샘플링 | Reference loss 기반 top-k 선택 |
 
 ### 3.6 Value Weighting
 
@@ -1039,7 +1043,7 @@ torchrun \
 - 인증: Basic Auth (.env에서 자동 로드)
 
 **자동 로깅 항목**:
-- Config: 모든 설정 flatten (stage1.learning_rate 형태)
+- Config: 모든 설정 flatten (training.learning_rate, experiment.name 등)
 - Metrics: train/loss, val/loss, td_error_mean, weight_mean 등
 - Artifacts: checkpoint → S3 자동 업로드
 
