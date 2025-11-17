@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Phase1 데이터셋 설정 스크립트
+Phase1 데이터셋 설정 통합 스크립트
 
 HuggingFace datasets 라이브러리를 사용하여:
 1. 데이터셋 다운로드 (Parquet 형식)
 2. Alpaca 형식으로 변환하여 processed/ JSONL 생성
-3. Small 버전 생성 (datasets_local_small/)
-4. Stats 생성 (stats/)
-5. 검증
+3. 메타데이터 추출 (is_correct, difficulty 정보만 별도 저장, 99% 메모리 절감)
+4. Small 버전 생성 (datasets_local_small/)
+5. Stats 생성 (stats/)
 """
 
 import argparse
@@ -350,6 +350,84 @@ class DatasetSetup:
         print("✅ Small version created!")
         print()
 
+    def extract_metadata(self) -> None:
+        """메타데이터 추출 (is_correct, difficulty 정보만 별도 저장)"""
+        print("=" * 70)
+        print(f"Extracting metadata for {self.dataset_name}")
+        print("=" * 70)
+        print()
+
+        processed_dir = self.base_dir / "processed"
+
+        for split in self.config["splits"]:
+            file = processed_dir / f"{split}.jsonl"
+
+            if not file.exists():
+                print(f"⚠️  {file} not found, skipping {split}")
+                continue
+
+            print(f"Processing {split}...")
+
+            metadata_list = []
+            stats = {
+                "total": 0,
+                "correct": 0,
+                "incorrect": 0,
+                "difficulty_dist": {},
+                "has_is_correct": False,
+                "has_difficulty": False,
+            }
+
+            with open(file, "r") as f:
+                for idx, line in enumerate(f):
+                    if idx % 100000 == 0 and idx > 0:
+                        print(f"  진행: {idx:,} 샘플")
+
+                    item = json.loads(line.strip())
+
+                    # 메타데이터 추출
+                    meta = {}
+
+                    # is_correct 필드
+                    if "is_correct" in item:
+                        meta["is_correct"] = item["is_correct"]
+                        stats["has_is_correct"] = True
+                        if item["is_correct"]:
+                            stats["correct"] += 1
+                        else:
+                            stats["incorrect"] += 1
+
+                    # difficulty 필드
+                    if "metadata" in item and "difficulty" in item["metadata"]:
+                        difficulty = item["metadata"]["difficulty"]
+                        meta["difficulty"] = difficulty
+                        stats["has_difficulty"] = True
+
+                        diff_str = str(difficulty)
+                        stats["difficulty_dist"][diff_str] = stats["difficulty_dist"].get(diff_str, 0) + 1
+
+                    metadata_list.append(meta)
+                    stats["total"] += 1
+
+            # 메타데이터 저장
+            output_data = {
+                "metadata": metadata_list,
+                "stats": stats,
+                "source_file": str(file),
+            }
+
+            output_file = processed_dir / f"{split}_metadata.json"
+            with open(output_file, "w") as f:
+                json.dump(output_data, f, indent=2)
+
+            print(f"✓ {split}_metadata.json ({stats['total']:,} samples)")
+            if stats["has_is_correct"]:
+                print(f"  correct={stats['correct']:,}, incorrect={stats['incorrect']:,}")
+
+        print()
+        print("✅ Metadata extraction completed!")
+        print()
+
     def generate_stats(self) -> None:
         """통계 생성 (토큰 길이 포함)"""
         print("=" * 70)
@@ -455,7 +533,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # 전체 데이터셋 설정
+  # 전체 데이터셋 설정 (다운로드 + 변환 + 메타데이터 + small + stats)
   uv run python scripts/setup_datasets.py --datasets all --steps all
 
   # MBPP만 처리
@@ -463,6 +541,12 @@ Examples:
 
   # 다운로드+전처리만
   uv run python scripts/setup_datasets.py --datasets all --steps process
+
+  # 메타데이터만 추출
+  uv run python scripts/setup_datasets.py --datasets codecontests --steps metadata
+
+  # 단계별 실행
+  uv run python scripts/setup_datasets.py --datasets codecontests --steps process,metadata,small,stats
         """,
     )
 
@@ -475,7 +559,7 @@ Examples:
     parser.add_argument(
         "--steps",
         default="all",
-        help="Steps to run (comma-separated): process,small,stats,all",
+        help="Steps to run (comma-separated): process,metadata,small,stats,all",
     )
 
     args = parser.parse_args()
@@ -488,7 +572,7 @@ Examples:
 
     # Steps 파싱
     if args.steps == "all":
-        steps = ["process", "small", "stats"]
+        steps = ["process", "metadata", "small", "stats"]
     else:
         steps = [s.strip() for s in args.steps.split(",")]
 
@@ -502,6 +586,9 @@ Examples:
 
             if "process" in steps:
                 setup.download_and_process()
+
+            if "metadata" in steps:
+                setup.extract_metadata()
 
             if "small" in steps:
                 setup.create_small()

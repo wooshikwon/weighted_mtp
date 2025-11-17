@@ -127,3 +127,34 @@ def load_critic_checkpoint(
         logger.info(f"  Val loss: {val_loss}")
 
     return checkpoint
+
+
+def cleanup_old_checkpoints(
+    checkpoint_dir: Path,
+    save_total_limit: int,
+) -> None:
+    """오래된 중간 checkpoint 삭제
+
+    checkpoint_best.pt와 checkpoint_final.pt는 절대 삭제하지 않음
+    checkpoint_epoch_*.pt만 save_total_limit 개수만큼 유지
+
+    Args:
+        checkpoint_dir: Checkpoint 디렉터리
+        save_total_limit: 유지할 최대 개수
+    """
+    if not checkpoint_dir.exists():
+        return
+
+    # 중간 checkpoint 파일만 수집 (checkpoint_epoch_*.pt)
+    epoch_checkpoints = sorted(
+        [f for f in checkpoint_dir.glob("checkpoint_epoch_*.pt")],
+        key=lambda x: x.stat().st_mtime,
+    )
+
+    # 삭제할 파일 개수 계산
+    n_to_delete = len(epoch_checkpoints) - save_total_limit
+
+    if n_to_delete > 0:
+        for checkpoint_path in epoch_checkpoints[:n_to_delete]:
+            logger.info(f"오래된 checkpoint 삭제: {checkpoint_path.name}")
+            checkpoint_path.unlink()

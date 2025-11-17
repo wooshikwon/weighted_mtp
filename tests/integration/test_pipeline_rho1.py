@@ -115,7 +115,7 @@ def test_rho1_config_validation():
     assert config.runtime.device == "mps", "Should use MPS for local test"
 
     # Training 파라미터 검증 (rho1 특화)
-    assert hasattr(config.training, "temperature"), "Should have temperature for excess loss"
+    assert hasattr(config.training, "k_percent"), "Should have k_percent for top-k selection"
 
     # 모델 경로 검증
     model_path = Path(config.models.policy.path)

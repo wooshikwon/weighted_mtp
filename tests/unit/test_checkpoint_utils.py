@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from weighted_mtp.pipelines.checkpoint_utils import (
+from weighted_mtp.utils import (
     load_critic_checkpoint,
     save_checkpoint,
 )

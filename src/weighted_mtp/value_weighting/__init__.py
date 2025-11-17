@@ -12,8 +12,7 @@ from .td_weighting import (
     compute_weight_stats,
 )
 from .rho1_weighting import (
-    build_weights as build_rho1_weights,
-    compute_excess_loss,
+    compute_mtp_selective_weights,
     compute_rho1_stats,
 )
 
@@ -24,7 +23,6 @@ __all__ = [
     "compute_td_stats",
     "compute_weight_stats",
     # Rho-1 기반
-    "compute_excess_loss",
-    "build_rho1_weights",
+    "compute_mtp_selective_weights",
     "compute_rho1_stats",
 ]

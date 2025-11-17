@@ -47,12 +47,13 @@ runtime:
 training:
   log_interval: 10
   max_grad_norm: 0.5
+  k_percent: 0.6
 
 checkpoint:
   save_checkpoint_every: 1.0
   save_best: true
   save_final: true
-  save_total_limit: 3
+  save_total_limit: 2
 
 mlflow:
   tracking_uri: "http://13.50.240.176"

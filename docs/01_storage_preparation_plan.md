@@ -244,7 +244,7 @@ MetaLlamaMTPAdapter.from_pretrained(
    - HuggingFace datasets 라이브러리를 사용해 Parquet 형식으로 직접 로드한다.
    - CodeContests는 `name`, `description`, `public_tests`, `solutions`, `incorrect_solutions` 등의 필드를 포함한다.
    - raw/ 디렉터리는 선택 사항 (HF에서 직접 로드하므로 중간 JSONL 저장 불필요).
-2. **전처리 & 변환** (`scripts/setup_datasets.py`)
+2. **전처리 & 변환** (`scripts/setup_datasets.py --steps process`)
    - HuggingFace dataset → Alpaca 형식 JSONL 변환
    - 작업 내용:
      - `description` → `instruction`, `public_tests` → `input` (최대 2개 예시)
@@ -254,8 +254,10 @@ MetaLlamaMTPAdapter.from_pretrained(
      - 길이 필터: instruction + input + output 합산이 2048 토큰 초과 시 제외
      - Python/Python3 솔루션만 포함 (언어 코드 1 또는 3)
    - train/valid/test split은 HuggingFace 기본 split 사용
-3. **메타데이터 추출** (`scripts/extract_metadata.py`)
+3. **메타데이터 추출** (`scripts/setup_datasets.py --steps metadata`)
    - **목적**: 메모리 효율적 학습을 위해 `is_correct`, `difficulty` 정보만 별도 파일로 추출
+   - **통합**: `setup_datasets.py`의 `extract_metadata()` 메서드로 통합됨
+   - **독립 실행 (선택)**: `scripts/extract_metadata.py` 유틸리티도 제공
    - **입력**: `processed/*.jsonl` (전체 데이터셋)
    - **출력**: `processed/*_metadata.json`
    - **구조**:
@@ -275,11 +277,14 @@ MetaLlamaMTPAdapter.from_pretrained(
      }
      ```
    - **크기**: 전체 데이터(~15GB) 대비 ~217MB (99% 메모리 절감)
-   - **실행**: `python scripts/extract_metadata.py --dataset codecontests --split train`
-4. **통계/무결성 기록**
+4. **Small 버전 생성** (`scripts/setup_datasets.py --steps small`)
+   - 로컬 테스트용 경량 데이터셋 생성
+   - 출력: `storage/datasets_local_small/{dataset_name}_small/` (상대 경로)
+   - 샘플 수: train=100, validation=32, test=32
+5. **통계/무결성 기록** (`scripts/setup_datasets.py --steps stats`)
    - `stats/YYYY-MM-DD_summary.json`에 샘플 수, 평균 토큰 길이(`instruction`, `input`, `output`), `is_correct` 분포, 최대 길이 등을 기록.
-   - `scripts/validate_datasets.py`로 schema 검증, 2048 토큰 초과 여부 검사, SHA256 로그를 수행한다.
-5. **메모리 효율 학습 워크플로우**
+   - 무결성 검증: `scripts/verify_storage.py --check datasets`로 schema 검증, 파일 존재 확인, 샘플 구조 체크
+6. **메모리 효율 학습 워크플로우**
    - **메타데이터 기반 샘플링** (핵심 혁신):
      1. 전체 데이터셋(3.7M, ~15GB)을 메모리에 로드하지 **않음**
      2. 메타데이터 파일(`*_metadata.json`, ~217MB)만 로드
@@ -287,6 +292,7 @@ MetaLlamaMTPAdapter.from_pretrained(
      4. JSONL 파일에서 계산된 인덱스의 라인만 선택적으로 읽기
      5. HuggingFace Dataset으로 변환
    - **메모리 절감 효과**:
+     - Rho-1 Stage (500 샘플, local): 메타데이터(~217MB) + 샘플(~2MB) = **~219MB** (기존 15GB 대비 98.5% 절감)
      - Stage 1 (50K 샘플): 메타데이터(~217MB) + 샘플(~200MB) = **~417MB** (기존 15GB 대비 97% 절감)
      - Stage 2 (200K 샘플): 메타데이터(~217MB) + 샘플(~800MB) = **~1GB** (기존 15GB 대비 93% 절감)
    - **분산학습 호환성**:
@@ -321,7 +327,7 @@ MetaLlamaMTPAdapter.from_pretrained(
 
 ### 4.3 전처리 실행 예시
 ```bash
-# 전체 데이터셋 일괄 처리 (다운로드 + 변환 + 메타데이터 추출 + small + stats)
+# 전체 데이터셋 일괄 처리 (다운로드 + 변환 + 메타데이터 + small + stats)
 uv run python scripts/setup_datasets.py --datasets all --steps all
 
 # 개별 데이터셋 처리
@@ -331,15 +337,22 @@ uv run python scripts/setup_datasets.py --datasets humaneval --steps all
 
 # 단계별 실행
 uv run python scripts/setup_datasets.py --datasets codecontests --steps process
-uv run python scripts/setup_datasets.py --datasets codecontests --steps metadata  # 메타데이터 추출
-uv run python scripts/setup_datasets.py --datasets codecontests --steps small,stats
+uv run python scripts/setup_datasets.py --datasets codecontests --steps metadata
+uv run python scripts/setup_datasets.py --datasets codecontests --steps small
+uv run python scripts/setup_datasets.py --datasets codecontests --steps stats
 
-# 메타데이터만 별도 추출
+# 복수 단계 실행
+uv run python scripts/setup_datasets.py --datasets codecontests --steps process,metadata,small,stats
+
+# 메타데이터만 별도 추출 (독립 유틸리티, 선택적)
 uv run python scripts/extract_metadata.py --dataset codecontests --split train
-uv run python scripts/extract_metadata.py --dataset codecontests --split valid
-uv run python scripts/extract_metadata.py --dataset codecontests --split test
+uv run python scripts/extract_metadata.py --dataset codecontests
+
+# 무결성 검증
+uv run python scripts/verify_storage.py --check datasets
+uv run python scripts/verify_storage.py --check all --generate-report
 ```
-> `scripts/setup_datasets.py`가 HuggingFace에서 직접 로드하여 processed, metadata, small, stats를 모두 생성한다.
+> **핵심**: `scripts/setup_datasets.py`가 HuggingFace에서 직접 로드하여 processed, metadata, small, stats를 통합 생성한다. `extract_metadata.py`는 독립 유틸리티로도 사용 가능하다.
 
 ---
 
@@ -368,12 +381,17 @@ uv run python scripts/extract_metadata.py --dataset codecontests --split test
    - Unit tests 11/11 통과
 
 ### 5.2 데이터셋
-1. **raw 정리**: CodeContests 등 원본 JSONL을 `datasets_v2/<name>/raw/`로 이동하고 SHA256 기록.
-2. **전처리 실행**: `src/data/prepare.py`를 돌려 processed train/validation/test, stats, schema를 생성한다.
-3. **검증 & 메타데이터 추출**
-   - `scripts/validate_datasets.py`로 스키마, 길이, 중복을 검사.
-   - `scripts/extract_metadata.py`로 메타데이터 파일 생성 (is_correct, difficulty만 추출, 99% 메모리 절감)
-   - README에 생성 일자와 SHA256을 갱신한다.
+1. **전처리 실행**: `scripts/setup_datasets.py --steps all`로 전체 파이프라인 실행
+   - HuggingFace에서 직접 다운로드
+   - processed train/validation/test 생성 (Alpaca 형식 JSONL)
+   - metadata 파일 생성 (is_correct, difficulty 정보, 99% 메모리 절감)
+   - small 버전 생성 (로컬 테스트용)
+   - stats 파일 생성 (토큰 길이 통계 포함)
+   - schema.json 자동 생성
+2. **검증**
+   - `scripts/verify_storage.py --check datasets`로 무결성 검증
+   - 파일 존재, schema, 샘플 구조 확인
+   - 검증 리포트 생성: `--generate-report` 옵션
 
 ### 5.3 README 갱신
 `storage/README.md`에 다음 항목을 명시한다.
@@ -385,16 +403,38 @@ uv run python scripts/extract_metadata.py --dataset codecontests --split test
 
 ---
 
-## 6. VESSL 업로드 전략
+## 6. Scripts 디렉토리 구성
 
-- `scripts/sync_to_vessl_storage.py`에서 다음 규약을 따른다.
-  - 기본 업로드 루트: `vessl://weighted-mtp/{models,datasets}/{version}/...`
-  - 업로드 전 SHA256 비교로 중복 전송 방지.
-  - Micro 모델과 small 데이터셋은 `--include-local-small` 플래그로 선택 업로드.
-- 업로드 후 VESSL CLI에서 디렉터리 구조를 검증:
-  ```bash
-  vessl storage ls weighted-mtp/models_v2/meta-llama-mtp
-  ```
+현재 프로젝트의 scripts 디렉토리에는 다음 파일들이 있습니다:
+
+### 6.1 핵심 스크립트
+- **`setup_models.py`** (862줄)
+  - 모델 다운로드, 변환, Config 동기화, Micro 모델 생성, 검증 통합
+  - 단일 모델 또는 전체 모델 처리 가능
+  - 실행: `python scripts/setup_models.py --model meta-llama-mtp --steps all`
+
+- **`setup_datasets.py`** (598줄)
+  - 데이터셋 다운로드, 전처리, 메타데이터 추출, small 생성, stats 통합
+  - 단일 데이터셋 또는 전체 데이터셋 처리 가능
+  - 실행: `python scripts/setup_datasets.py --datasets all --steps all`
+
+- **`verify_storage.py`** (551줄)
+  - 모델 및 데이터셋 무결성 검증
+  - SHA256 확인, Config 검증, Schema 검증
+  - Phase1 체크리스트 자동 생성
+  - 실행: `python scripts/verify_storage.py --check all --phase1-checklist`
+
+### 6.2 유틸리티 스크립트
+- **`extract_metadata.py`** (226줄)
+  - 독립 메타데이터 추출 유틸리티 (setup_datasets.py와 기능 중복, 선택적 사용)
+  - 실행: `python scripts/extract_metadata.py --dataset codecontests`
+
+- **`regenerate_micro_model.py`** (143줄)
+  - Micro 모델 Pure PyTorch 구조로 재생성
+  - 실행: `python scripts/regenerate_micro_model.py`
+
+### 6.3 VESSL 업로드 (향후 구현)
+- `sync_to_vessl_storage.py` - VESSL Storage 업로드 스크립트 (문서에서 언급, 향후 필요 시 구현)
 
 ---
 
@@ -423,8 +463,9 @@ uv run python scripts/extract_metadata.py --dataset codecontests --split test
 - [ ] 전체 데이터셋 샘플 수가 4의 배수가 아니어도 DistributedSampler가 자동 처리하므로 문제없음을 확인.
 
 ### 스크립트
-- [ ] `scripts/prepare_local_small_model.py` 실행 후 Micro 모델 테스트 (`tests/unit/test_adapter.py`) 통과.
-- [ ] `scripts/sync_to_vessl_storage.py --dry-run`으로 업로드 시뮬레이션 성공.
+- [ ] `scripts/setup_models.py --model micro-mtp --steps all` 실행 후 Micro 모델 테스트 (`tests/unit/test_adapter.py`) 통과.
+- [ ] `scripts/setup_datasets.py --datasets all --steps all` 실행 후 모든 데이터셋 processed, metadata, small, stats 생성 확인.
+- [ ] `scripts/verify_storage.py --check all --phase1-checklist` 실행 후 모든 체크리스트 항목 통과.
 
 ### 분산학습
 - [ ] FSDP wrapper가 단일 safetensors 파일을 올바르게 로드하고 4-GPU로 분산하는지 로컬 테스트 수행.
@@ -434,12 +475,62 @@ uv run python scripts/extract_metadata.py --dataset codecontests --split test
 
 ---
 
-## 8. 후속 작업
+## 8. 최신화 완료 사항 (2025-11-17)
 
-1. `00_ideal_structure.md`에 명시된 테스트/체크리스트와 본 계획을 비교하여 누락 항목을 `docs/migration_notes.md`에 기록.
-2. 변환 스크립트 작성 후 Git에 추가 (`src/data/prepare.py`, `scripts/*`).
-3. 실제 변환을 수행하고, 변경된 자산을 VESSL Storage에 업로드.
-4. 파이프라인에서 새 경로(`models_v2`, `datasets_v2`)를 사용하도록 Config 업데이트.
+### 구현된 변경사항
+1. **Scripts 통합**:
+   - `setup_datasets.py`에 metadata 추출 기능 통합 (`extract_metadata()` 메서드)
+   - `--steps metadata` 옵션으로 메타데이터 추출 가능
+   - `extract_metadata.py`는 독립 유틸리티로 선택적 사용 가능
 
-이 문서는 변환 실행 전 리뷰 및 승인용으로 사용하며, 실행 중 발견되는 이슈는 문서 하단에 주석으로 추가 업데이트한다.
+2. **파이프라인 연동 확인**:
+   - `run_rho1.py`에서 `MetaLlamaMTPAdapter.from_pretrained()` 사용
+   - `configs/defaults.yaml`에서 `storage/models_v2`, `storage/datasets_v2` 경로 참조
+   - `configs/rho1/rho1_local.yaml`에서 Micro 모델 경로 설정
+
+3. **검증 스크립트 구성**:
+   - `verify_storage.py`가 모델 및 데이터셋 무결성 검증 담당
+   - Phase1 체크리스트 자동 생성 기능 포함
+   - 검증 리포트 생성 기능
+
+### 현재 Storage 구조
+```
+storage/
+├── checkpoints/         # 학습 체크포인트 (baseline, critic, rho1, verifiable)
+├── datasets_v2/
+│   ├── codecontests/
+│   │   ├── processed/  # train.jsonl, valid.jsonl, test.jsonl, *_metadata.json, schema.json
+│   │   └── stats/      # YYYY-MM-DD_summary.json
+│   ├── mbpp/
+│   └── humaneval/
+└── models_v2/
+    ├── meta-llama-mtp/  # Policy model
+    ├── ref-sheared-llama-2.7b/  # Reference model
+    ├── micro-mtp/       # Local test model
+    ├── micro-ref/       # Local test reference
+    └── starling-rm-7b/  # Reward model (optional)
+```
+
+### 향후 작업
+1. `datasets_local_small/` 생성 확인 (setup_datasets.py --steps small 실행)
+2. VESSL 업로드 스크립트 구현 (필요 시)
+3. 전체 검증 실행: `scripts/verify_storage.py --check all --phase1-checklist`
+
+---
+
+## 9. 이전 구현 완료 사항 참조
+
+본 문서는 Storage 준비 단계에 집중하며, 이후 단계에서 완료된 구현 사항은 다음을 참조:
+
+### Rho-1 Refactoring 완료
+- Rho-1 weighting 논문 방식 정확 구현 (signed difference + top-k selection)
+- MTP 확장 전략: Head 0 always, Head 1~3 selective
+- Integration test 전체 통과 (Baseline, Critic, Rho1, Verifiable)
+
+### S3 Checkpoint 최적화 완료
+- 비동기 S3 업로드 (`utils/s3_utils.py` 생성)
+- 학습 중 실시간 Best checkpoint 백업
+- S3 자동 정리 로직 추가
+
+상세 내용은 `docs/00_ideal_structure.md` 끝부분의 "구현 완료 사항" 섹션 참조.
 

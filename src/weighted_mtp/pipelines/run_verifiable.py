@@ -14,7 +14,7 @@ import mlflow
 import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 
 from weighted_mtp.core.env import ensure_env_loaded
@@ -22,13 +22,21 @@ from weighted_mtp.core.logging import setup_logging
 from weighted_mtp.data import AlpacaDataCollator, load_dataset
 from weighted_mtp.models.meta_mtp.adapter import MetaLlamaMTPAdapter
 from weighted_mtp.models.tokenizer_utils import load_tokenizer_from_config
-from weighted_mtp.pipelines.checkpoint_utils import load_critic_checkpoint, save_checkpoint
-from weighted_mtp.pipelines.metrics_utils import (
+from weighted_mtp.utils import (
     GPUMonitor,
     ThroughputTracker,
-    compute_gradient_norm,
+    cleanup_old_checkpoints,
+    cleanup_s3_checkpoints,
+    compute_gradient_clip_stats,
+    compute_value_function_stats,
+    compute_weight_statistics,
     get_model_size,
     get_system_info,
+    load_critic_checkpoint,
+    s3_upload_executor,
+    save_checkpoint,
+    shutdown_s3_executor,
+    upload_to_s3_async,
 )
 from weighted_mtp.runtime import (
     init_distributed,
@@ -37,6 +45,8 @@ from weighted_mtp.runtime import (
     wrap_model_ddp,
     unwrap_model,
     all_reduce_scalar,
+    create_distributed_sampler,
+    barrier,
 )
 from weighted_mtp.value_weighting.td_weighting import (
     build_weights,
@@ -77,8 +87,8 @@ def create_dataloader(
     difficulty_bins: dict | None,
     seed: int,
     shuffle: bool = True,
-) -> DataLoader:
-    """DataLoader 생성 (Config-driven 샘플링)
+) -> tuple[DataLoader, DistributedSampler | None]:
+    """DataLoader 생성 (분산 학습 지원)
 
     Args:
         dataset_path: 데이터셋 경로
@@ -94,10 +104,10 @@ def create_dataloader(
         shuffle: 셔플 여부
 
     Returns:
-        DataLoader
+        (DataLoader, DistributedSampler or None)
+        분산 환경에서는 DistributedSampler 반환, 로컬 환경에서는 None 반환
     """
     # 데이터셋 이름 및 스플릿 추출
-    # storage/datasets_v2/codecontests/processed/train.jsonl -> codecontests
     dataset_path_obj = Path(dataset_path)
     dataset_name = dataset_path_obj.parent.parent.name
     split_file = dataset_path_obj.name
@@ -127,16 +137,25 @@ def create_dataloader(
         max_length=max_length,
     )
 
+    # DistributedSampler 생성 (분산 환경에서만)
+    sampler = create_distributed_sampler(
+        dataset,
+        shuffle=shuffle,
+        seed=seed,
+        drop_last=False,
+    )
+
     # DataLoader 생성
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        sampler=sampler,
+        shuffle=(sampler is None),  # sampler 있으면 shuffle 비활성화
         collate_fn=collator,
         num_workers=0,
     )
 
-    return dataloader
+    return dataloader, sampler
 
 
 def get_curriculum_weights(
@@ -289,37 +308,6 @@ def validate_verifiable(
     return metrics
 
 
-def cleanup_old_checkpoints(
-    checkpoint_dir: Path,
-    save_total_limit: int,
-) -> None:
-    """오래된 중간 checkpoint 삭제
-
-    checkpoint_best.pt와 checkpoint_final.pt는 절대 삭제하지 않음
-    checkpoint_epoch_*.pt만 save_total_limit 개수만큼 유지
-
-    Args:
-        checkpoint_dir: Checkpoint 디렉터리
-        save_total_limit: 유지할 최대 개수
-    """
-    if not checkpoint_dir.exists():
-        return
-
-    # 중간 checkpoint 파일만 수집 (checkpoint_epoch_*.pt)
-    epoch_checkpoints = sorted(
-        [f for f in checkpoint_dir.glob("checkpoint_epoch_*.pt")],
-        key=lambda x: x.stat().st_mtime,  # 수정 시간 기준 정렬
-    )
-
-    # 삭제할 파일 개수 계산
-    n_to_delete = len(epoch_checkpoints) - save_total_limit
-
-    if n_to_delete > 0:
-        for checkpoint_path in epoch_checkpoints[:n_to_delete]:
-            logger.info(f"오래된 checkpoint 삭제: {checkpoint_path.name}")
-            checkpoint_path.unlink()
-
-
 def run_verifiable_training(
     config_path: str, **override_params: Any
 ) -> tuple[dict[str, float], str]:
@@ -371,8 +359,9 @@ def run_verifiable_training(
     actual_seed, device = setup_environment(config.runtime.seed)
     logger.info(f"Device: {device}, Seed: {actual_seed}")
 
-    # 6. MLflow 초기화 (Rank 0만)
-    if is_main_process():
+    # 6. MLflow 초기화 (Rank 0만, experiment 이름이 있는 경우만)
+    use_mlflow = bool(config.mlflow.experiment)
+    if is_main_process() and use_mlflow:
         mlflow.set_tracking_uri(config.mlflow.tracking_uri)
         mlflow.set_experiment(config.mlflow.experiment)
         mlflow.start_run(
@@ -393,7 +382,7 @@ def run_verifiable_training(
         f"Model size: {model_size['trainable_params']:,} trainable / "
         f"{model_size['total_params']:,} total params"
     )
-    if is_main_process():
+    if is_main_process() and use_mlflow:
         mlflow.log_params(
             {
                 "model_total_params": model_size["total_params"],
@@ -402,7 +391,7 @@ def run_verifiable_training(
         )
 
     system_info = get_system_info()
-    if is_main_process():
+    if is_main_process() and use_mlflow:
         mlflow.log_params(
             {
                 "system_cpu_count": system_info["cpu_count"],
@@ -465,7 +454,7 @@ def run_verifiable_training(
     logger.info(f"Train: {config.dataset.train}")
     logger.info(f"Validation: {config.dataset.validation}")
 
-    train_loader = create_dataloader(
+    train_loader, train_sampler = create_dataloader(
         dataset_path=config.dataset.train,
         tokenizer=tokenizer,
         batch_size=config.training.batch_size,
@@ -482,7 +471,7 @@ def run_verifiable_training(
     # Validation 샘플 수: train의 10% 또는 최소 100개
     val_n_samples = max(100, config.data_sampling.n_samples // 10)
 
-    val_loader = create_dataloader(
+    val_loader, val_sampler = create_dataloader(
         dataset_path=config.dataset.validation,
         tokenizer=tokenizer,
         batch_size=config.training.batch_size,
@@ -518,6 +507,10 @@ def run_verifiable_training(
         batches_this_period = target_batches - batch_count
 
         logger.info(f"--- Training to epoch {target_epoch:.2f} ---")
+
+        # DistributedSampler epoch 설정 (재현성 유지하면서 shuffle)
+        if train_sampler is not None:
+            train_sampler.set_epoch(int(target_epoch))
 
         # Curriculum learning: 현재 epoch에 맞는 difficulty_weights 계산
         if use_curriculum and curriculum_schedule:
@@ -637,15 +630,21 @@ def run_verifiable_training(
             optimizer.zero_grad()
             total_loss.backward()
 
-            # Gradient norm (clipping 전)
-            grad_norm_dict = compute_gradient_norm(adapter)
-
-            # Gradient clipping
+            # Gradient clipping with statistics
             if config.training.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
+                grad_clip_stats = compute_gradient_clip_stats(
                     adapter.parameters(),
                     config.training.max_grad_norm,
                 )
+            else:
+                from weighted_mtp.utils.metrics_utils import compute_gradient_norm
+
+                grad_norm_dict = compute_gradient_norm(adapter)
+                grad_clip_stats = {
+                    "grad_norm_pre_clip": grad_norm_dict["grad_norm"],
+                    "grad_norm_post_clip": grad_norm_dict["grad_norm"],
+                    "grad_clip_ratio": 1.0,
+                }
 
             optimizer.step()
 
@@ -670,23 +669,48 @@ def run_verifiable_training(
                 weight_stats = compute_weight_stats(weights)
                 gpu_metrics = gpu_monitor.get_metrics()
 
+                # Value function statistics
+                value_func_stats = compute_value_function_stats(
+                    values=value_logits.squeeze(-1),
+                    returns=value_targets.squeeze(-1),
+                )
+
+                # Weight distribution statistics
+                weight_dist_stats = compute_weight_statistics(weights)
+
                 # Metric aggregation (DDP)
                 avg_weighted_ce = all_reduce_scalar(weighted_ce_loss.item())
                 avg_value_loss = all_reduce_scalar(value_loss.item())
                 avg_total_loss = all_reduce_scalar(total_loss.item())
-                avg_grad_norm = all_reduce_scalar(grad_norm_dict["grad_norm"])
+                avg_grad_norm_post = all_reduce_scalar(grad_clip_stats["grad_norm_post_clip"])
+                avg_grad_norm_pre = all_reduce_scalar(grad_clip_stats["grad_norm_pre_clip"])
+                avg_grad_clip_ratio = all_reduce_scalar(grad_clip_stats["grad_clip_ratio"])
                 avg_td_mean = all_reduce_scalar(td_stats["td_mean"])
                 avg_weight_mean = all_reduce_scalar(weight_stats["weight_mean"])
+                avg_value_mse = all_reduce_scalar(value_func_stats["value_mse"])
+                avg_value_mean = all_reduce_scalar(value_func_stats["value_mean"])
+                avg_value_std = all_reduce_scalar(value_func_stats["value_std"])
 
-                if is_main_process():
+                if is_main_process() and use_mlflow:
                     mlflow.log_metrics(
                         {
                             "train/weighted_ce_loss": avg_weighted_ce,
                             "train/value_loss": avg_value_loss,
                             "train/total_loss": avg_total_loss,
-                            "train/grad_norm": avg_grad_norm,
+                            "train/grad_norm": avg_grad_norm_post,
+                            "train/grad_norm_pre_clip": avg_grad_norm_pre,
+                            "train/grad_clip_ratio": avg_grad_clip_ratio,
+                            "train/learning_rate": optimizer.param_groups[0]["lr"],
                             "train/td_mean": avg_td_mean,
                             "train/weight_mean": avg_weight_mean,
+                            "value/mse": avg_value_mse,
+                            "value/mean_prediction": avg_value_mean,
+                            "value/std_prediction": avg_value_std,
+                            "weight/mean": weight_dist_stats["weight_mean"],
+                            "weight/std": weight_dist_stats["weight_std"],
+                            "weight/min": weight_dist_stats["weight_min"],
+                            "weight/max": weight_dist_stats["weight_max"],
+                            "weight/entropy": weight_dist_stats["weight_entropy"],
                             "system/gpu_memory_allocated_gb": gpu_metrics["gpu_memory_allocated_gb"],
                             "system/gpu_utilization_pct": gpu_metrics["gpu_utilization_pct"],
                         },
@@ -718,6 +742,11 @@ def run_verifiable_training(
 
         # Validation 실행 (epoch 경계에서)
         logger.info(f"--- Validation at epoch {current_epoch:.2f} ---")
+
+        # Validation sampler epoch 설정
+        if val_sampler is not None:
+            val_sampler.set_epoch(int(current_epoch))
+
         val_metrics = validate_verifiable(
             adapter=adapter,
             dataloader=val_loader,
@@ -735,7 +764,7 @@ def run_verifiable_training(
         avg_val_value = all_reduce_scalar(val_metrics["val_value_loss"])
 
         # Epoch-level 로깅
-        if is_main_process():
+        if is_main_process() and use_mlflow:
             mlflow.log_metrics(
                 {
                     "train/epoch_total_loss": train_total_avg,
@@ -772,7 +801,15 @@ def run_verifiable_training(
                 checkpoint_path=checkpoint_path,
             )
 
-            logger.info(f"✓ Improved checkpoint saved: {checkpoint_path.name} (val_loss: {best_val_loss:.4f})")
+            # 모든 GPU가 checkpoint 저장 완료까지 대기
+            barrier()
+
+            if is_main_process():
+                logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_loss: {best_val_loss:.4f})")
+
+            # S3 업로드 (비동기)
+            if is_main_process() and use_mlflow:
+                s3_upload_executor.submit(upload_to_s3_async, checkpoint_path, use_mlflow)
 
             # 오래된 checkpoint 정리 (최대 3개 유지)
             if config.checkpoint.get("save_total_limit"):
@@ -780,6 +817,15 @@ def run_verifiable_training(
                     checkpoint_dir=checkpoint_dir,
                     save_total_limit=config.checkpoint.save_total_limit,
                 )
+
+                # S3 정리 (비동기)
+                if is_main_process() and use_mlflow:
+                    s3_upload_executor.submit(
+                        cleanup_s3_checkpoints,
+                        experiment_id=mlflow.active_run().info.experiment_id,
+                        run_id=mlflow.active_run().info.run_id,
+                        save_total_limit=config.checkpoint.save_total_limit,
+                    )
         else:
             logger.info(f"Validation loss did not improve ({avg_val_total:.4f} >= {best_val_loss:.4f}), skipping checkpoint save")
 
@@ -816,16 +862,15 @@ def run_verifiable_training(
             checkpoint_path=final_path,
         )
 
-        logger.info(f"Final checkpoint saved: {final_path.name}")
+        # 모든 GPU가 final checkpoint 저장 완료까지 대기
+        barrier()
 
-    # 11. MLflow artifact 업로드 (Rank 0만)
-    if is_main_process():
-        # 최신 epoch checkpoint 업로드 (모두 validation loss 개선 시에만 저장되므로 best)
-        epoch_checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"))
-        if epoch_checkpoints:
-            latest_checkpoint = epoch_checkpoints[-1]
-            mlflow.log_artifact(str(latest_checkpoint), "checkpoints")
-            logger.info(f"Latest checkpoint uploaded to MLflow: {latest_checkpoint.name}")
+        if is_main_process():
+            logger.info(f"Final checkpoint saved: {final_path.name}")
+
+    # 11. 모든 S3 업로드 완료 대기 및 MLflow 종료
+    shutdown_s3_executor()
+    if is_main_process() and use_mlflow:
         mlflow.end_run()
 
     # 최신 checkpoint 경로 반환
