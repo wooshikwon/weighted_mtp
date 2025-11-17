@@ -114,34 +114,80 @@ weighted-mtp-checkpoints  2025-11-17 14:21:48+00:00  ['checkpoints', 'weighted-m
 
 ### 3.2 데이터 업로드
 
-#### 단일 파일 업로드
+#### 업로드 스크립트
 ```bash
-vessl storage copy-file \
-  <local-file-path> \
-  volume://vessl-storage/weighted-mtp-models/<destination-path>
-```
+# 전체 업로드 (models, datasets, checkpoints)
+./scripts/03_upload_to_vessl.sh
 
-#### 디렉토리 업로드 (스크립트 사용)
-```bash
-./scripts/02_setup_vessl_storage.sh
+# Datasets만 업로드
+./scripts/04_upload_datasets.sh
 ```
 
 스크립트는 다음을 자동으로 수행합니다:
-1. Volume 생성 (이미 존재하면 스킵)
-2. storage/models/ 디렉토리의 모든 파일 업로드
-3. storage/datasets/ 디렉토리의 모든 파일 업로드
+1. storage/models/ 디렉토리의 모든 파일 업로드
+2. storage/datasets/ 디렉토리의 모든 파일 업로드
+3. storage/checkpoints/ 디렉토리의 모든 파일 업로드
 
 **업로드 형식:**
 ```
 로컬: storage/models/meta-llama-mtp/model.safetensors
-→ VESSL: volume://vessl-storage/weighted-mtp-models/meta-llama-mtp/model.safetensors
+→ VESSL: volume://vessl-storage/models/meta-llama-mtp/model.safetensors
+```
+
+#### 단일 파일 업로드 (주의사항)
+
+**중요: VESSL CLI 경로 오류 주의**
+
+VESSL storage copy-file 명령어는 destination 경로를 특별하게 해석합니다:
+
+**잘못된 방법 (파일명이 디렉토리가 됨):**
+```bash
+# ✗ 잘못된 예시 - 파일명까지 포함하면 안 됨
+vessl storage copy-file \
+  "storage/models/model.safetensors" \
+  "volume://vessl-storage/models/model.safetensors"
+
+# 결과: models/model.safetensors/ 디렉토리 생성되고 그 안에 파일이 들어감
+# → models/model.safetensors/model.safetensors (잘못된 구조)
+```
+
+**올바른 방법 (디렉토리 경로만, trailing slash 필수):**
+```bash
+# ✓ 올바른 예시 - 디렉토리 경로만, trailing slash 포함
+vessl storage copy-file \
+  "storage/models/meta-llama-mtp/safetensors/model.safetensors" \
+  "volume://vessl-storage/models/meta-llama-mtp/safetensors/"
+
+# 결과: models/meta-llama-mtp/safetensors/model.safetensors (올바른 구조)
+```
+
+**경로 구성 규칙:**
+1. Source: 로컬 파일의 전체 경로
+2. Destination:
+   - 디렉토리 경로만 포함 (파일명 제외)
+   - 반드시 trailing slash (/) 포함
+   - 파일명은 자동으로 source에서 가져옴
+
+**스크립트 예시:**
+```bash
+# 올바른 업로드 로직
+file="storage/models/meta-llama-mtp/safetensors/model.safetensors"
+dir_path=$(dirname "$file")  # storage/models/meta-llama-mtp/safetensors
+dest_dir="volume://vessl-storage/models/$dir_path/"  # trailing slash 필수
+
+vessl storage copy-file "$file" "$dest_dir"
 ```
 
 #### Volume 파일 목록 확인
 ```bash
-vessl storage list-files \
-  --storage-name vessl-storage \
-  --volume-name weighted-mtp-models
+# 특정 volume의 파일 목록
+vessl storage list-files volume://vessl-storage/models
+
+# 특정 경로의 파일 목록
+vessl storage list-files volume://vessl-storage/models/meta-llama-mtp/
+
+# 파일 개수 제한
+vessl storage list-files volume://vessl-storage/datasets | head -30
 ```
 
 ---
@@ -408,10 +454,32 @@ vessl storage list-volumes --storage-name vessl-storage
 
 ### 9.2 Volume 업로드 실패
 
+**오류**: 파일이 잘못된 경로에 업로드됨 (파일명이 디렉토리가 됨)
+```bash
+# 원인: Destination에 파일명까지 포함
+vessl storage copy-file "file.txt" "volume://vessl-storage/models/file.txt"
+
+# 해결: Destination은 디렉토리만, trailing slash 포함
+vessl storage copy-file "file.txt" "volume://vessl-storage/models/"
+```
+
 **오류**: `timeout` 또는 `connection error`
 ```bash
-# 해결: 파일을 분할하여 업로드
-# 또는 VESSL 웹 UI에서 수동 업로드
+# 해결 1: 파일을 분할하여 업로드
+# 해결 2: timeout 설정 증가 (10GB 파일은 수 분 소요)
+# 해결 3: VESSL 웹 UI에서 수동 업로드
+```
+
+**오류**: 업로드가 멈춘 것처럼 보임
+```bash
+# 원인: 대용량 파일 (10GB+) 업로드는 시간 소요
+# 해결: 백그라운드로 실행하고 list-files로 주기적 확인
+
+# 백그라운드 실행
+vessl storage copy-file "large-file.bin" "volume://vessl-storage/models/" &
+
+# 진행 확인
+vessl storage list-files volume://vessl-storage/models/
 ```
 
 ### 9.3 MLflow 연결 실패
