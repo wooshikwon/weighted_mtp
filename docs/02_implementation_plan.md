@@ -175,46 +175,58 @@
 - **산출물**: value_weighting 패키지.  
 - **검증 기준**: 모든 unit test 통과, 수치 비교(참조 스크립트)에서 오차 허용 범위 내.
 
-### P6. 학습 파이프라인 Stage 0~3
+### P6. 독립 Pipeline 구현 및 CLI 연결
 - **목표**
-  - Stage0(환경 + 분산학습 초기화) → Stage1(trunk pretrain) → Stage2(weighted training) → Stage3(logging)을 오케스트레이션한다.
-  - **A100 4-GPU 분산학습**: FSDP 기반 모델 분산, DistributedSampler 기반 데이터 분산
-  - **Stage2 Critic Continual Learning**: Value loss를 auxiliary loss로 추가하여 policy 학습 중 critic도 지속 학습
-  - **Reference 모델 전략**: Rho-1 Stage에서 HuggingFace `AutoModelForCausalLM` 직접 사용 (Custom wrapper 불필요)
+  - 4개 독립 Pipeline 구현: Baseline, Critic, Verifiable, Rho-1
+  - CLI가 config의 `experiment.stage` 필드로 pipeline 라우팅
+  - **A100 4-GPU 분산학습**: DDP/FSDP 기반 모델 분산, DistributedSampler 기반 데이터 분산
+  - **Verifiable Critic Continual Learning**: Value loss를 auxiliary loss로 추가하여 policy 학습 중 critic도 지속 학습
+  - **Reference 모델 전략**: Rho-1 Pipeline에서 HuggingFace `AutoModelForCausalLM` 직접 사용 (Custom wrapper 불필요)
 - **주요 활동**
-  - `pipelines/training.py`: 환경 초기화, 데이터 로더, Stage1/2 실행, MLflow 로깅, 체크포인트 저장.
-  - **Policy 모델 로딩**: `MetaLlamaMTPAdapter.from_pretrained()`
-    - Critic/Verifiable: `initialize_value_head=True`
-    - Rho-1: `initialize_value_head=False`
-  - **Reference 모델 로딩** (Rho-1 전용):
-    - `AutoModelForCausalLM.from_pretrained(config.models.reference.path)`
-    - Tokenizer 공유: policy와 동일한 tokenizer 사용 (model_path/tokenizer/)
-    - Custom wrapper 없이 HuggingFace 표준 인터페이스 직접 활용
-  - **Stage0 분산 환경 초기화** (P3에서 구현된 runtime 모듈 활용):
-    - `runtime.distributed.init_distributed()`: torch.distributed 초기화 (NCCL backend)
-    - `runtime.distributed.create_distributed_sampler()`: 데이터를 4-GPU로 균등 분할 (중복 없음)
-    - `runtime.environment.setup_environment()`: Rank별 seed, device, backends 설정
-    - FSDP wrapping: 모델을 4-GPU로 자동 샤딩 (FULL_SHARD 전략)
-    - Rank 0 전용 로직 (runtime.distributed.is_main_process()): MLflow 로깅, 체크포인트 저장
-  - **Stage2 Loss 구조 구현**:
+  - **독립 Pipeline 구현**:
+    - `run_baseline.py`: 균등 가중치 MTP (Value head 없음, `initialize_value_head=False`)
+    - `run_critic.py`: Value Head 사전학습 (trunk frozen, `is_correct` 균형 샘플링)
+    - `run_verifiable.py`: TD error 기반 WMTP (critic checkpoint 의존, curriculum learning)
+    - `run_rho1.py`: Reference 모델 기반 weighting (Value head 없음)
+  - **공통 내부 흐름** (모든 Pipeline):
+    1. Config 로딩 (`defaults.yaml` + recipe 병합)
+    2. Distributed Init (`runtime.distributed.init_distributed()`)
+    3. Environment Setup (`runtime.environment.setup_environment()`: seed, device)
+    4. Model 로딩 (`MetaLlamaMTPAdapter.from_pretrained()` → DDP/FSDP wrapping)
+    5. Dataset 로딩 (메타데이터 기반 샘플링 → `DistributedSampler`)
+    6. Training Loop (pipeline별 loss 로직, gradient sync, validation, checkpoint)
+    7. MLflow Logging (Rank 0 전용)
+  - **CLI 라우터 구현** (`cli/train.py`):
+    - `experiment.stage` 필드 읽기 (baseline/critic/verifiable/rho1)
+    - 해당 pipeline 함수 import 및 실행
+    - Override params 전달 (`--run-name`, `--device`, `--use-micro-model`)
+  - **Verifiable Pipeline Loss 구조**:
     - `total_loss = weighted_ce_loss + value_coef * value_loss`
+    - TD error 계산 (`compute_td_errors()`) → Weight 산출 (`build_weights()`)
     - Value coefficient: 0.5 (기본) 또는 1.0 (recipe 설정)
-    - Value loss clipping: clip_range=0.2
     - Gradient clipping: max_grad_norm=0.5~1.0
-    - FSDP all-reduce로 gradient 자동 동기화
-  - `runtime/mlflow.py`: 실험 생성, 메트릭/아티팩트 기록 (Rank 0 전용).
-  - 통합 테스트: micro 모델 + small 데이터로 end-to-end smoke test (로컬 단일 GPU 모드).
+  - `runtime/mlflow.py`: 실험 생성, 메트릭/아티팩트 기록 (Rank 0 전용)
+  - 통합 테스트: micro 모델 + small 데이터로 각 pipeline별 smoke test
+- **실제 성과** (2025-11-14):
+  - ✅ 4개 독립 Pipeline 구현 완료 (`run_baseline.py`, `run_critic.py`, `run_verifiable.py`, `run_rho1.py`)
+  - ✅ 각 Pipeline별 config 파일 구성 (`baseline.yaml`, `critic.yaml`, `verifiable.yaml`, `rho1.yaml`)
+  - ✅ Runtime 모듈 구현 (`distributed.py`, `environment.py`, `ddp.py`)
+  - ✅ Integration tests 3개 작성 (`test_pipeline_baseline.py`, `test_pipeline_critic.py`, `test_pipeline_verifiable.py`)
+  - ✅ CLI 단순화 및 라우팅 로직 구현 (2025-11-17)
 - **산출물**:
-  - 학습 파이프라인 코드 (pipelines/training.py)
-  - MLflow 모듈 (runtime/mlflow.py)
-  - 통합 테스트 (tests/integration/test_stage*.py)
+  - 4개 Pipeline 모듈 (`pipelines/run_*.py`)
+  - CLI 라우터 (`cli/train.py`)
+  - Runtime 모듈 (`runtime/distributed.py`, `runtime/environment.py`)
+  - MLflow 모듈 (`runtime/mlflow.py`)
+  - 통합 테스트 (`tests/integration/test_pipeline_*.py`)
 - **검증 기준**:
-  - Smoke test 성공 (로컬 단일 GPU, runtime 모듈 자동 감지)
+  - CLI dry-run 동작 확인 (`--config configs/baseline/baseline.yaml --dry-run`)
+  - 로컬 smoke test 성공 (micro 모델, runtime 모듈 자동 감지)
   - VESSL A100 4-GPU 환경에서 torchrun 실행 성공
-  - DistributedSampler가 데이터를 4개 GPU로 중복 없이 분할 확인 (P3에서 구현됨)
-  - FSDP가 모델 파라미터를 4-GPU로 샤딩 확인
-  - MLflow에 핵심 메트릭 기록 (Rank 0만): TD error, weight entropy, value loss, value explained variance
-  - Stage2에서 value loss가 auxiliary loss로 추가되어 critic 지속 학습 확인
+  - DistributedSampler가 데이터를 4개 GPU로 중복 없이 분할 확인
+  - DDP/FSDP가 모델 파라미터를 GPU로 분산 확인
+  - MLflow에 핵심 메트릭 기록 (Rank 0만)
+  - Verifiable Pipeline에서 value loss가 auxiliary loss로 추가되어 critic 지속 학습 확인
 
 ### P7. 평가·분석 파이프라인
 - **목표**  

@@ -44,6 +44,16 @@ runtime:
   seed: 42
   mixed_precision: true
 
+training:
+  log_interval: 10
+  max_grad_norm: 0.5
+
+checkpoint:
+  save_checkpoint_every: 1.0
+  save_best: true
+  save_final: true
+  save_total_limit: 3
+
 mlflow:
   tracking_uri: "http://13.50.240.176"
   experiment: "weighted-mtp/production"
@@ -51,4 +61,4 @@ mlflow:
 
 logging:
   level: INFO
-  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  format: "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"

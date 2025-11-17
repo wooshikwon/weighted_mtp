@@ -15,8 +15,10 @@ import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
+from weighted_mtp.core.env import ensure_env_loaded
+from weighted_mtp.core.logging import setup_logging
 from weighted_mtp.data import AlpacaDataCollator, load_dataset
 from weighted_mtp.models.meta_mtp.adapter import MetaLlamaMTPAdapter
 from weighted_mtp.models.tokenizer_utils import load_tokenizer_from_config
@@ -42,16 +44,6 @@ from weighted_mtp.value_weighting.rho1_weighting import (
     compute_rho1_stats,
 )
 
-logger = logging.getLogger(__name__)
-
-
-def setup_logging(level: str = "INFO") -> None:
-    """로깅 설정"""
-    logging.basicConfig(
-        level=getattr(logging, level.upper()),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
 
 def load_adapter(config: dict, device: torch.device) -> MetaLlamaMTPAdapter:
     """Adapter 로드
@@ -71,23 +63,25 @@ def load_adapter(config: dict, device: torch.device) -> MetaLlamaMTPAdapter:
     return adapter
 
 
-def load_reference_model(config: dict, device: torch.device) -> AutoModelForCausalLM:
-    """Reference model 로드
+def load_reference_model(config: dict, device: torch.device) -> MetaLlamaMTPAdapter:
+    """Reference model 로드 (커스텀 Meta LLaMA MTP 모델)
 
     Args:
         config: 모델 설정
         device: 디바이스
 
     Returns:
-        Reference model (eval mode)
+        Reference model (eval mode, MetaLlamaMTPAdapter)
     """
     logger.info(f"Loading reference model: {config.models.reference.name}")
     logger.info(f"Path: {config.models.reference.path}")
 
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        config.models.reference.path,
-        torch_dtype=getattr(torch, config.models.reference.dtype),
-        device_map={"": device},
+    # MetaLlamaMTPAdapter로 로드 (Value head 불필요)
+    ref_model = MetaLlamaMTPAdapter.from_pretrained(
+        model_path=config.models.reference.path,
+        device=device,
+        dtype=config.models.reference.dtype,
+        initialize_value_head=False,
     )
 
     # Eval mode (gradient 불필요)
@@ -176,7 +170,7 @@ def create_dataloader(
 
 def validate_rho1(
     adapter: MetaLlamaMTPAdapter,
-    ref_model: AutoModelForCausalLM,
+    ref_model: MetaLlamaMTPAdapter,
     dataloader: DataLoader,
     device: torch.device,
     temperature: float,
@@ -185,7 +179,7 @@ def validate_rho1(
 
     Args:
         adapter: Adapter (DDP-wrapped 가능)
-        ref_model: Reference model
+        ref_model: Reference model (MetaLlamaMTPAdapter, eval mode)
         dataloader: Validation DataLoader
         device: 디바이스
         temperature: Softmax temperature
@@ -209,13 +203,12 @@ def validate_rho1(
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            # 2. Reference forward
-            ref_outputs = ref_model(input_ids, attention_mask=attention_mask)
-            ref_logits = ref_outputs.logits
+            # 2. Reference forward (NTP mode: 첫 번째 head만 사용)
+            ref_logits_mtp = ref_model.transformer.forward(input_ids, return_all_heads=False)
+            ref_logits = ref_logits_mtp.squeeze(2)  # [batch, seq, 1, vocab] -> [batch, seq, vocab]
 
-            # 3. Policy forward (MTP)
-            policy_outputs = unwrapped_adapter.full_forward(input_ids, attention_mask)
-            policy_logits = policy_outputs["logits"]
+            # 3. Policy forward (MTP, value_head 불필요하므로 transformer 직접 호출)
+            policy_logits = unwrapped_adapter.transformer.forward(input_ids, return_all_heads=True)
 
             batch_size, seq_len, n_future, vocab_size = policy_logits.shape
 
@@ -325,24 +318,30 @@ def run_rho1_training(config_path: str, **override_params: Any) -> tuple[dict[st
     Returns:
         (final_metrics, best_checkpoint_path)
     """
+    # 0. 환경변수 로드 (MLflow credentials 등)
+    ensure_env_loaded()
+
     # 1. Config 로딩 (defaults + rho1 config merge)
     defaults = OmegaConf.load("configs/defaults.yaml")
     config = OmegaConf.load(config_path)
     config = OmegaConf.merge(defaults, config, override_params)
 
-    # 2. 로깅 설정
-    setup_logging(config.logging.level)
+    # 2. Distributed 초기화 (torchrun 환경인 경우)
+    if "RANK" in os.environ:
+        rank, world_size = init_distributed()
+    else:
+        rank, world_size = 0, 1
+
+    # 3. 로깅 설정 (rank 정보 포함)
+    logger = setup_logging("RHO1", level=config.logging.level, rank=rank)
 
     logger.info("=== Rho-1 WMTP (Reference-based Weighting) ===")
     logger.info(f"Experiment: {config.experiment.name}")
     logger.info(f"Description: {config.experiment.description}")
 
-    # 3. Distributed 초기화 (torchrun 환경인 경우)
     if "RANK" in os.environ:
-        rank, world_size = init_distributed()
         logger.info(f"Distributed training: rank={rank}, world_size={world_size}")
     else:
-        rank, world_size = 0, 1
         logger.info("Local training (single device)")
 
     # 4. Environment setup (seed + device)
@@ -350,12 +349,13 @@ def run_rho1_training(config_path: str, **override_params: Any) -> tuple[dict[st
     logger.info(f"Device: {device}, Seed: {actual_seed}")
 
     # 5. MLflow 초기화 (Rank 0만)
-    if is_main_process():
+    use_mlflow = bool(config.mlflow.experiment)
+    if is_main_process() and use_mlflow:
         mlflow.set_tracking_uri(config.mlflow.tracking_uri)
         mlflow.set_experiment(config.mlflow.experiment)
         mlflow.start_run(
             run_name=config.experiment.name,
-            tags={tag: True for tag in config.experiment.tags},
+            tags={tag: "true" for tag in config.experiment.tags},
         )
         mlflow.log_params(OmegaConf.to_container(config, resolve=True))
 
@@ -368,7 +368,7 @@ def run_rho1_training(config_path: str, **override_params: Any) -> tuple[dict[st
     adapter = wrap_model_ddp(adapter, device)
 
     # Model size + System info 로깅 (Rank 0만)
-    if is_main_process():
+    if is_main_process() and use_mlflow:
         model_size = get_model_size(unwrap_model(adapter))
         mlflow.log_params(
             {
@@ -484,14 +484,13 @@ def run_rho1_training(config_path: str, **override_params: Any) -> tuple[dict[st
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            # Reference forward (no grad)
+            # Reference forward (no grad, NTP mode)
             with torch.no_grad():
-                ref_outputs = ref_model(input_ids, attention_mask=attention_mask)
-                ref_logits = ref_outputs.logits
+                ref_logits_mtp = ref_model.transformer.forward(input_ids, return_all_heads=False)
+                ref_logits = ref_logits_mtp.squeeze(2)  # [batch, seq, 1, vocab] -> [batch, seq, vocab]
 
-            # Policy forward (MTP)
-            policy_outputs = adapter.full_forward(input_ids, attention_mask)
-            policy_logits = policy_outputs["logits"]
+            # Policy forward (MTP, value_head 불필요하므로 transformer 직접 호출)
+            policy_logits = adapter.transformer.forward(input_ids, return_all_heads=True)
 
             batch_size, seq_len, n_future, vocab_size = policy_logits.shape
 
@@ -566,13 +565,14 @@ def run_rho1_training(config_path: str, **override_params: Any) -> tuple[dict[st
                 avg_excess_loss = all_reduce_scalar(excess_loss.mean().item())
 
                 if is_main_process():
-                    mlflow.log_metrics(
-                        {
-                            "train/weighted_ce_loss": avg_weighted_ce,
-                            "train/excess_loss": avg_excess_loss,
-                        },
-                        step=global_step,
-                    )
+                    if use_mlflow:
+                        mlflow.log_metrics(
+                            {
+                                "train/weighted_ce_loss": avg_weighted_ce,
+                                "train/excess_loss": avg_excess_loss,
+                            },
+                            step=global_step,
+                        )
                     logger.info(
                         f"Step {global_step}/{batches_to_run}, "
                         f"Weighted CE: {avg_weighted_ce:.4f}, "
@@ -603,15 +603,16 @@ def run_rho1_training(config_path: str, **override_params: Any) -> tuple[dict[st
 
         # Epoch-level 로깅 (Rank 0만)
         if is_main_process():
-            mlflow.log_metrics(
-                {
-                    "train/epoch_weighted_ce_loss": train_weighted_ce_avg,
-                    "train/epoch_excess_loss": train_excess_avg,
-                    "val/weighted_ce_loss": val_metrics["val_weighted_ce_loss"],
-                    "val/excess_loss": val_metrics["val_excess_loss"],
-                },
-                step=int(current_epoch * 100),
-            )
+            if use_mlflow:
+                mlflow.log_metrics(
+                    {
+                        "train/epoch_weighted_ce_loss": train_weighted_ce_avg,
+                        "train/epoch_excess_loss": train_excess_avg,
+                        "val/weighted_ce_loss": val_metrics["val_weighted_ce_loss"],
+                        "val/excess_loss": val_metrics["val_excess_loss"],
+                    },
+                    step=int(current_epoch * 100),
+                )
 
             logger.info(
                 f"Validation - Weighted CE: {val_metrics['val_weighted_ce_loss']:.4f}, "
@@ -678,7 +679,7 @@ def run_rho1_training(config_path: str, **override_params: Any) -> tuple[dict[st
         logger.info(f"Final checkpoint saved: {final_path.name}")
 
     # 10. MLflow artifact 업로드 (Rank 0만)
-    if is_main_process():
+    if is_main_process() and use_mlflow:
         # 최신 epoch checkpoint 업로드 (모두 validation loss 개선 시에만 저장되므로 best)
         epoch_checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"))
         if epoch_checkpoints:

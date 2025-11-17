@@ -17,6 +17,8 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
+from weighted_mtp.core.env import ensure_env_loaded
+from weighted_mtp.core.logging import setup_logging
 from weighted_mtp.data import AlpacaDataCollator, load_dataset
 from weighted_mtp.models.meta_mtp.adapter import MetaLlamaMTPAdapter
 from weighted_mtp.models.tokenizer_utils import load_tokenizer_from_config
@@ -42,16 +44,6 @@ from weighted_mtp.value_weighting.td_weighting import (
     compute_td_stats,
     compute_weight_stats,
 )
-
-logger = logging.getLogger(__name__)
-
-
-def setup_logging(level: str = "INFO") -> None:
-    """로깅 설정"""
-    logging.basicConfig(
-        level=getattr(logging, level.upper()),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
 
 
 def load_adapter(config: dict, device: torch.device) -> MetaLlamaMTPAdapter:
@@ -340,20 +332,26 @@ def run_verifiable_training(
     Returns:
         (final_metrics, best_checkpoint_path)
     """
+    # 0. 환경변수 로드 (MLflow credentials 등)
+    ensure_env_loaded()
+
     # 1. Config 로딩 (defaults + verifiable config merge)
     defaults = OmegaConf.load("configs/defaults.yaml")
     config = OmegaConf.load(config_path)
     config = OmegaConf.merge(defaults, config, override_params)
 
-    # 2. 로깅 설정
-    setup_logging(config.logging.level)
-
-    # 3. Distributed 초기화 (torchrun 환경인 경우)
+    # 2. Distributed 초기화 (torchrun 환경인 경우)
     if "RANK" in os.environ:
         rank, world_size = init_distributed()
-        logger.info(f"Distributed training: rank={rank}, world_size={world_size}")
     else:
         rank, world_size = 0, 1
+
+    # 3. 로깅 설정 (rank 정보 포함)
+    logger = setup_logging("VERIFIABLE", level=config.logging.level, rank=rank)
+
+    if "RANK" in os.environ:
+        logger.info(f"Distributed training: rank={rank}, world_size={world_size}")
+    else:
         logger.info("Local training (single device)")
 
     logger.info("=== Verifiable WMTP (Stage 2) ===")
@@ -379,7 +377,7 @@ def run_verifiable_training(
         mlflow.set_experiment(config.mlflow.experiment)
         mlflow.start_run(
             run_name=config.experiment.name,
-            tags={tag: True for tag in config.experiment.tags},
+            tags={tag: "true" for tag in config.experiment.tags},
         )
         # Config 로깅
         mlflow.log_params(OmegaConf.to_container(config, resolve=True))

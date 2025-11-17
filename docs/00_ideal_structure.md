@@ -78,31 +78,27 @@ WMTP 리팩토링 프로젝트는 `wmtp_research_proposal.md`에 정의된 목�
 ## 3. 시스템 아키텍처 개요
 
 ```
-CLI (torchrun --nproc_per_node=4 -m weighted_mtp.cli.train)
+CLI (단순 라우터: experiment.stage 식별 → Pipeline 실행)
     ↓
-Distributed Init (torch.distributed, rank, world_size)
+    ├─ Baseline Pipeline (균등 가중치 MTP)
+    ├─ Critic Pipeline (Value Head 사전학습)
+    ├─ Verifiable Pipeline (TD Error 기반 WMTP, critic checkpoint 의존)
+    └─ Rho-1 Pipeline (Reference 모델 기반 weighting)
     ↓
-Config Loader (yaml + .env) [Rank 0만 로깅]
-    ↓
-Runtime Context (seed, device:cuda:{rank}, console, MLflow)
-    ↓
-Resource Loader [각 GPU에서 병렬 실행]
-    ├─ ModelBundleLoader (Meta MTP adapter → FSDP wrapping)
-    ├─ DatasetRegistry (JSONL → HF Dataset → DistributedSampler)
-    └─ TokenizerFactory
-    ↓
-Pipeline Orchestrator [FSDP 동기화]
-    ├─ Stage 0: 분산 환경 준비 (FSDP, DistributedSampler)
-    ├─ Stage 1: Trunk Pretraining (선택, Verifiable 전용)
-    │   └─ Value Head도 FSDP로 분산 학습
-    ├─ Stage 2: TD Error 기반 WMTP Training
-    │   ├─ Value inference (FSDP forward)
-    │   ├─ Weight builder (각 GPU에서 독립 계산)
-    │   ├─ Weighted loss (FSDP backward, gradient sync)
-    │   └─ Gradient accumulation (effective batch size 증대)
-    └─ Stage 3: Eval & Artifact Upload [Rank 0만]
-    ↓
-Reports (MLflow [Rank 0], console, checkpoints, logs)
+각 Pipeline 내부 흐름 (독립 실행):
+    1. Distributed Init (torch.distributed, rank, world_size)
+    2. Config Loader (defaults.yaml + recipe.yaml 병합)
+    3. Runtime Context (seed, device:cuda:{rank}, console, MLflow)
+    4. Resource Loader [각 GPU에서 병렬 실행]
+       ├─ ModelBundleLoader (Meta MTP adapter → FSDP/DDP wrapping)
+       ├─ DatasetRegistry (JSONL → HF Dataset → DistributedSampler)
+       └─ TokenizerFactory
+    5. Training Loop [FSDP/DDP 동기화]
+       ├─ Forward pass (MTP + Value Head if applicable)
+       ├─ Loss 계산 (pipeline별 로직)
+       ├─ Backward & Gradient sync (all-reduce)
+       └─ Validation & Checkpoint (Rank 0만)
+    6. MLflow Logging & Artifact Upload (Rank 0만)
 ```
 
 **분산학습 핵심 원칙**:
@@ -311,24 +307,40 @@ weighted_mtp/
 
 ---
 
-## 5. 파이프라인 단계별 책임
+## 5. Pipeline별 책임 및 특성
 
-| 단계 | 모듈 | 주요 작업 | 분산학습 고려사항 | 입력 | 출력 |
-|------|------|-----------|------------------|------|------|
-| Stage 0 | `runtime.distributed` | 분산 환경 초기화 | `torch.distributed.init_process_group(backend="nccl")` | Config | rank, world_size |
-|        | `runtime.environment` | seed, dtype, device 설정 | `device = cuda:{rank}`, `seed = base_seed + rank` | Config, rank | Torch 전역 상태 |
-|        | `models.meta_mtp.adapter` | Meta 모델 로딩 및 FSDP wrapping | 모델을 FSDP로 감싸 4-GPU 분산 저장 | 모델 bundle | FSDP-wrapped Adapter |
-|        | `data.datasets` | 메타데이터 기반 데이터셋 로딩 및 DistributedSampler 설정 | 메타데이터로 샘플 선택 후 DistributedSampler로 분할 (각 GPU는 samples[rank::world_size]) | JSONL + metadata, Config | Dataset, DistributedSampler |
-| Stage 1 (옵션) | `pipelines.training.TrunkPretrainer` | trunk_forward 기반 Value Head 사전학습 | FSDP forward/backward, all-reduce gradient sync | FSDP Adapter, distributed dataset | pretrain checkpoint (Rank 0만 저장) |
-| Stage 2 | `value_weighting.td_error` | 표준 TD error 계산 (Intermediate: `γV(s_k)-V(s_{k-1})`, Terminal: `R-V(s_{T-1})`) | FSDP forward로 각 GPU에서 독립 계산 | FSDP Adapter, batch | TD error tensor (per GPU) |
-|        | `value_weighting.weight_builder` | TD error 기반 가중치 산출 (`exp(td_error/β)`, β=0.9) | 각 GPU에서 독립적으로 weight 계산 | TD error tensor | token weights (per GPU) |
-|        | `trainer.wmtp` | 가중치 기반 MTP loss 계산 및 업데이트 | FSDP backward로 gradient 계산 후 all-reduce 자동 동기화 | weights, logits | loss, metrics (per GPU) |
-|        | `runtime.distributed` | Gradient accumulation 관리 | accumulation_steps마다 optimizer.step() 호출 | accumulated gradients | synchronized update |
-| Stage 3 | `pipelines.training` | **Validation 평가**, **Best checkpoint 저장**, MLflow 로깅 | **Rank 0만** 실행 | Trainer state | artifacts (Rank 0만) |
-|        | `pipelines.training.evaluate_stage()` | Validation loss 계산 (step interval 기반) | FSDP forward로 각 GPU 독립 계산 후 all-reduce 평균 | FSDP Adapter, val_dataloader | val_loss, val_metrics |
-|        | **Best checkpoint tracking** | val_loss 기준 best checkpoint 저장 | Rank 0만: `if val_loss < best_val_loss: save_checkpoint()` | val_metrics, best_val_loss | checkpoint_stage{N}_best.pt |
-|        | **Step 기반 logging/evaluation** | Global step 기반 주기적 logging 및 evaluation | log_interval=10 (train loss), eval_interval=100 (val eval) | global_step counter | console output, MLflow metrics |
-|        | `runtime.mlflow` | MLflow 실험 추적 및 S3 업로드 | Rank 0만: params/metrics 로깅, checkpoint S3 업로드 | config, metrics, checkpoint paths | MLflow run (EC2 + S3) |
+| Pipeline | 모듈 | 주요 작업 | Value Head | 데이터 샘플링 | Weight 메커니즘 |
+|----------|------|-----------|-----------|--------------|----------------|
+| **Baseline** | `run_baseline.py` | 균등 가중치 MTP 학습 | ❌ 없음 (`initialize_value_head=False`) | `is_correct==True`만 (SFT 표준) | Uniform (weight=1.0) |
+| **Critic** | `run_critic.py` | Value Head 사전학습 | ✅ 학습 대상 (trunk frozen) | `is_correct` 균형 (50:50) | N/A (Value loss만) |
+| **Verifiable** | `run_verifiable.py` | TD error 기반 WMTP | ✅ Continual learning (policy와 함께 학습) | `is_correct` 혼합 + Curriculum Learning | `exp(td_error/β)`, β=0.9 |
+| **Rho-1** | `run_rho1.py` | Reference 모델 기반 weighting | ❌ 없음 | `is_correct==True`만 | Reference loss 기반 |
+
+### 공통 내부 흐름 (모든 Pipeline)
+
+1. **Distributed Init** (`runtime.distributed`)
+   - `torch.distributed.init_process_group(backend="nccl")`
+   - Rank, World size 설정
+
+2. **Environment Setup** (`runtime.environment`)
+   - Seed: `base_seed + rank` (재현성)
+   - Device: `cuda:{rank}` 자동 할당
+
+3. **Resource Loading**
+   - Model: `MetaLlamaMTPAdapter.from_pretrained()` → DDP/FSDP wrapping
+   - Dataset: 메타데이터 기반 샘플링 → `DistributedSampler` (각 GPU는 `samples[rank::world_size]`)
+   - Tokenizer: Shared tokenizer 로드
+
+4. **Training Loop**
+   - Forward pass (pipeline별 로직)
+   - Loss 계산 (Baseline: Uniform CE, Verifiable: Weighted CE + Value loss)
+   - Backward & Gradient sync (all-reduce)
+   - Gradient accumulation (effective batch size 증대)
+
+5. **Validation & Checkpoint** (Rank 0만)
+   - Validation loss 계산 (all-reduce 평균)
+   - Best checkpoint tracking (`val_loss < best_val_loss`)
+   - MLflow logging (params/metrics/artifacts)
 
 ### 5.5 모델 로딩 및 Value Head 전략
 
@@ -350,25 +362,27 @@ MetaLlamaMTPAdapter.from_pretrained(
 1. **Transformer 로딩**: `checkpoints.load_meta_mtp_model()` 호출
 2. **ModelArgs 파싱**: params.json 또는 config.json 자동 감지
 3. **Value Head 선택적 초기화**:
-   - `initialize_value_head=True`: Critic/Verifiable Stage용
-   - `initialize_value_head=False`: Rho-1 Stage용
+   - `initialize_value_head=True`: Critic/Verifiable Pipeline용
+   - `initialize_value_head=False`: Baseline/Rho-1 Pipeline용
 
-#### Stage별 Value Head 요구사항
+#### Pipeline별 Value Head 요구사항
 
-| Stage | Value Head | 근거 |
-|-------|-----------|------|
-| Critic (Stage 1) | **필수** (단독 학습) | PPO Critic처럼 Value head만 학습하여 TD error 계산 능력 확보 |
-| Verifiable (Stage 2) | **필수** (continual learning) | Policy 학습 중 Value loss를 auxiliary loss로 추가하여 critic drift 방지 |
-| Rho-1 (Stage 3) | **불필요** | Reference 모델 excess loss만 사용, Value head 연산 불필요 |
+| Pipeline | Value Head | 근거 |
+|----------|-----------|------|
+| Baseline | **불필요** | 균등 가중치로 학습, Value 추정 불필요 |
+| Critic | **필수** (단독 학습) | PPO Critic처럼 Value head만 학습하여 TD error 계산 능력 확보 |
+| Verifiable | **필수** (continual learning) | Policy 학습 중 Value loss를 auxiliary loss로 추가하여 critic drift 방지 |
+| Rho-1 | **불필요** | Reference 모델 excess loss만 사용, Value head 연산 불필요 |
 
 **구현 방식**:
+- **Baseline**: `from_pretrained(initialize_value_head=False)` → transformer 직접 호출, 균등 CE loss
 - **Critic**: `from_pretrained(initialize_value_head=True)` → trunk_forward()로 Value head 학습
 - **Verifiable**: `from_pretrained(initialize_value_head=True)` → full_forward()로 policy + value 동시 학습
 - **Rho-1**: `from_pretrained(initialize_value_head=False)` → MTP trunk만 사용, Reference 모델과 loss 비교
 
 #### Reference 모델 전략
 
-- **사용처**: Rho-1 Stage 전용
+- **사용처**: Rho-1 Pipeline 전용
 - **로딩 방법**: HuggingFace `AutoModelForCausalLM.from_pretrained()` 직접 사용
 - **Custom wrapper**: 불필요 (표준 인터페이스로 충분)
 - **Tokenizer**: Policy 모델과 공유 (`{model_path}/tokenizer/`)

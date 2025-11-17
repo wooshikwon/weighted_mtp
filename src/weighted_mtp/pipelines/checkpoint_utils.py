@@ -47,11 +47,14 @@ def save_checkpoint(
     checkpoint = {
         "epoch": epoch,
         "adapter_state_dict": adapter.state_dict(),
-        "value_head_state_dict": adapter.value_head.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "train_metrics": train_metrics,
         "val_metrics": val_metrics,
     }
+
+    # Value head가 있는 경우만 저장 (Baseline은 value_head=None)
+    if hasattr(adapter, "value_head") and adapter.value_head is not None:
+        checkpoint["value_head_state_dict"] = adapter.value_head.state_dict()
 
     torch.save(checkpoint, checkpoint_path)
     logger.info(f"Checkpoint 저장 완료: {checkpoint_path}")

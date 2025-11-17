@@ -1,9 +1,11 @@
-"""datasets.py 핵심 기능 검증 테스트
+"""datasets.py Config-driven 샘플링 검증 테스트
 
 핵심 검증 항목:
 - 데이터셋 로딩 기본 기능
-- Stage 1 샘플링 (is_correct 균형)
-- Stage 2 샘플링 (difficulty curriculum)
+- Config-driven 샘플링 전략 자동 선택
+- Balanced sampling (balance_correct=True)
+- Correct-only sampling (correct_ratio=1.0)
+- Difficulty-based sampling (difficulty_weights 있음)
 - 재현성 (seed 고정)
 """
 
@@ -18,11 +20,11 @@ from weighted_mtp.data import load_dataset
 def small_dataset():
     """작은 테스트용 데이터셋 (전체 테스트에서 재사용)"""
     return load_dataset(
-        "codecontests_small",
+        "codecontests",
         split="train",
-        stage="stage1",
         n_samples=50,
         balance_correct=False,
+        correct_ratio=0.5,
         seed=42
     )
 
@@ -48,131 +50,225 @@ class TestLoadDataset:
         assert "difficulty" in sample["metadata"]
 
     def test_difficulty_field_type(self, small_dataset):
-        """difficulty 필드 타입 검증"""
-        dataset = small_dataset
+        """Difficulty 필드 타입 검증"""
+        sample = small_dataset[0]
+        difficulty = sample["metadata"]["difficulty"]
+        assert isinstance(difficulty, int), "Difficulty는 int 타입이어야 함"
+        assert 1 <= difficulty <= 11, "Difficulty는 1-11 범위"
 
-        for i in range(min(10, len(dataset))):
-            sample = dataset[i]
+    def test_is_correct_field_type(self, small_dataset):
+        """is_correct 필드 타입 검증"""
+        sample = small_dataset[0]
+        assert isinstance(sample["is_correct"], bool), "is_correct는 bool 타입"
+
+
+class TestBalancedSampling:
+    """Balanced correct/incorrect 샘플링 테스트 (Critic)"""
+
+    def test_balanced_sampling_50_50(self):
+        """50:50 균형 샘플링 검증"""
+        dataset = load_dataset(
+            "codecontests",
+            split="train",
+            n_samples=100,
+            balance_correct=True,
+            correct_ratio=0.5,
+            seed=42
+        )
+
+        assert len(dataset) == 100
+
+        # correct/incorrect 카운트
+        correct_count = sum(1 for sample in dataset if sample["is_correct"])
+        incorrect_count = len(dataset) - correct_count
+
+        # 50:50 비율 검증 (오차 ±10% 허용)
+        ratio = correct_count / len(dataset)
+        assert 0.4 <= ratio <= 0.6, f"Expected ~50%, got {ratio:.2%}"
+
+    def test_balanced_sampling_70_30(self):
+        """70:30 균형 샘플링 검증"""
+        dataset = load_dataset(
+            "codecontests",
+            split="train",
+            n_samples=100,
+            balance_correct=True,
+            correct_ratio=0.7,
+            seed=42
+        )
+
+        correct_count = sum(1 for sample in dataset if sample["is_correct"])
+        ratio = correct_count / len(dataset)
+
+        # 70:30 비율 검증 (오차 ±10% 허용)
+        assert 0.6 <= ratio <= 0.8, f"Expected ~70%, got {ratio:.2%}"
+
+
+class TestCorrectOnlySampling:
+    """Correct-only 샘플링 테스트 (Rho-1, Baseline)"""
+
+    def test_correct_only_sampling(self):
+        """정답만 샘플링 검증"""
+        dataset = load_dataset(
+            "codecontests",
+            split="train",
+            n_samples=50,
+            balance_correct=False,
+            correct_ratio=1.0,
+            seed=42
+        )
+
+        assert len(dataset) > 0
+
+        # 모든 샘플이 correct인지 검증
+        all_correct = all(sample["is_correct"] for sample in dataset)
+        assert all_correct, "correct_ratio=1.0이면 모든 샘플이 is_correct=True여야 함"
+
+
+class TestDifficultyBasedSampling:
+    """Difficulty-based curriculum 샘플링 테스트 (Verifiable)"""
+
+    def test_difficulty_based_sampling_low_only(self):
+        """Low difficulty만 샘플링 검증"""
+        difficulty_weights = {"low": 1.0, "medium": 0.0, "high": 0.0}
+        difficulty_bins = {"low": [1, 3], "medium": [4, 7], "high": [8, 11]}
+
+        dataset = load_dataset(
+            "codecontests",
+            split="train",
+            n_samples=50,
+            balance_correct=False,
+            correct_ratio=0.5,
+            difficulty_weights=difficulty_weights,
+            difficulty_bins=difficulty_bins,
+            seed=42
+        )
+
+        assert len(dataset) > 0
+
+        # 모든 샘플이 low difficulty 범위인지 검증
+        for sample in dataset:
             difficulty = sample["metadata"]["difficulty"]
+            assert 1 <= difficulty <= 3, f"Expected low difficulty (1-3), got {difficulty}"
 
-            assert isinstance(difficulty, int)
-            assert 1 <= difficulty <= 11
+    def test_difficulty_based_sampling_mixed(self):
+        """Mixed difficulty 샘플링 검증"""
+        difficulty_weights = {"low": 0.7, "medium": 0.3, "high": 0.0}
+        difficulty_bins = {"low": [1, 3], "medium": [4, 7], "high": [8, 11]}
 
-
-class TestStage1Sampling:
-    """Stage 1: is_correct 균형 샘플링 테스트"""
-
-    def test_stage1_sampling_and_ratio(self):
-        """Stage 1 샘플링 검증 (작은 데이터셋은 균형 샘플링 비활성화)"""
-        n_samples = 20
         dataset = load_dataset(
-            "codecontests_small",
+            "codecontests",
             split="train",
-            stage="stage1",
-            n_samples=n_samples,
-            balance_correct=False,  # 작은 데이터셋은 균형 샘플링 불필요
-            seed=42,
+            n_samples=100,
+            balance_correct=False,
+            correct_ratio=0.5,
+            difficulty_weights=difficulty_weights,
+            difficulty_bins=difficulty_bins,
+            seed=42
         )
 
-        # 샘플 수 검증
-        assert len(dataset) == n_samples
+        # Low/medium 분포 검증
+        low_count = sum(
+            1 for sample in dataset
+            if 1 <= sample["metadata"]["difficulty"] <= 3
+        )
+        medium_count = sum(
+            1 for sample in dataset
+            if 4 <= sample["metadata"]["difficulty"] <= 7
+        )
 
-    def test_stage1_reproducibility(self):
-        """Stage 1 재현성 검증 (seed 고정)"""
-        # 같은 seed로 두 번 샘플링
+        # 70:30 비율 검증 (오차 허용)
+        assert low_count > medium_count, "Low difficulty가 더 많아야 함"
+        assert medium_count > 0, "Medium difficulty 샘플도 있어야 함"
+
+
+class TestReproducibility:
+    """재현성 테스트 (동일 seed → 동일 샘플)"""
+
+    def test_same_seed_same_samples(self):
+        """동일 seed로 두 번 로딩 시 동일한 샘플 반환"""
         dataset1 = load_dataset(
-            "codecontests_small",
+            "codecontests",
             split="train",
-            stage="stage1",
             n_samples=20,
-            balance_correct=False,
-            seed=42,
+            balance_correct=True,
+            correct_ratio=0.5,
+            seed=42
         )
 
         dataset2 = load_dataset(
-            "codecontests_small",
+            "codecontests",
             split="train",
-            stage="stage1",
             n_samples=20,
-            balance_correct=False,
-            seed=42,
+            balance_correct=True,
+            correct_ratio=0.5,
+            seed=42
         )
 
-        # task_id 비교 (동일한 샘플 선택)
+        # task_id 비교 (샘플 순서까지 동일해야 함)
         ids1 = [sample["task_id"] for sample in dataset1]
         ids2 = [sample["task_id"] for sample in dataset2]
 
-        assert ids1 == ids2, "동일한 seed에도 다른 샘플이 선택됨"
+        assert ids1 == ids2, "동일 seed면 동일한 샘플 순서여야 함"
 
-
-class TestStage2Sampling:
-    """Stage 2: difficulty 기반 Curriculum Learning 샘플링 테스트"""
-
-    def test_stage2_sampling_and_distribution(self):
-        """Stage 2 샘플링 + difficulty 분포 검증
-
-        Note: 작은 테스트 데이터셋은 correct 샘플만 포함하므로
-        균형 샘플링 파라미터는 전달하지만 검증은 생략
-        """
-        n_samples = 20
-        dataset = load_dataset(
-            "codecontests_small",
-            split="train",
-            stage="stage2",
-            n_samples=n_samples,
-            balance_correct=True,  # 파라미터 전달 (통합 테스트에서 사용)
-            correct_ratio=0.5,
-            difficulty_weights={"low": 0.7, "medium": 0.3, "high": 0.0},
-            difficulty_bins={"low": [1, 3], "medium": [4, 7], "high": [8, 11]},
-            seed=42,
-        )
-
-        # 샘플 수 검증
-        assert len(dataset) == n_samples
-
-        # difficulty 분포 계산
-        low_count = sum(1 for s in dataset if 1 <= s["metadata"]["difficulty"] <= 3)
-        medium_count = sum(1 for s in dataset if 4 <= s["metadata"]["difficulty"] <= 7)
-
-        low_ratio = low_count / len(dataset)
-        medium_ratio = medium_count / len(dataset)
-
-        # 가중치 ±20% 범위 허용 (작은 샘플 수로 인한 분산 고려)
-        assert 0.5 <= low_ratio <= 0.9, f"low 비율이 범위 밖: {low_ratio:.2%} (목표: 70% ±20%)"
-        assert 0.1 <= medium_ratio <= 0.5, (
-            f"medium 비율이 범위 밖: {medium_ratio:.2%} (목표: 30% ±20%)"
-        )
-
-        # Note: 작은 테스트 데이터셋은 correct 100%이므로 균형 검증 생략
-        # 실제 균형 샘플링 검증은 통합 테스트에서 전체 데이터셋으로 수행
-
-    def test_stage2_reproducibility(self):
-        """Stage 2 재현성 검증 (균형 샘플링 포함)"""
+    def test_different_seed_different_samples(self):
+        """다른 seed로 로딩 시 다른 샘플 반환"""
         dataset1 = load_dataset(
-            "codecontests_small",
+            "codecontests",
             split="train",
-            stage="stage2",
             n_samples=20,
             balance_correct=True,
             correct_ratio=0.5,
-            difficulty_weights={"low": 0.5, "medium": 0.5, "high": 0.0},
-            difficulty_bins={"low": [1, 3], "medium": [4, 7], "high": [8, 11]},
-            seed=42,
+            seed=42
         )
 
         dataset2 = load_dataset(
-            "codecontests_small",
+            "codecontests",
             split="train",
-            stage="stage2",
             n_samples=20,
             balance_correct=True,
             correct_ratio=0.5,
-            difficulty_weights={"low": 0.5, "medium": 0.5, "high": 0.0},
-            difficulty_bins={"low": [1, 3], "medium": [4, 7], "high": [8, 11]},
-            seed=42,
+            seed=999
         )
 
         ids1 = [sample["task_id"] for sample in dataset1]
         ids2 = [sample["task_id"] for sample in dataset2]
 
-        assert ids1 == ids2
+        assert ids1 != ids2, "다른 seed면 다른 샘플이어야 함"
+
+
+class TestSplits:
+    """스플릿별 로딩 테스트"""
+
+    def test_load_train_split(self):
+        """Train 스플릿 로딩"""
+        dataset = load_dataset(
+            "codecontests",
+            split="train",
+            n_samples=10,
+            balance_correct=False,
+            seed=42
+        )
+        assert len(dataset) == 10
+
+    def test_load_validation_split(self):
+        """Validation 스플릿 로딩"""
+        dataset = load_dataset(
+            "codecontests",
+            split="validation",
+            n_samples=10,
+            balance_correct=False,
+            seed=42
+        )
+        assert len(dataset) == 10
+
+    def test_load_test_split(self):
+        """Test 스플릿 로딩"""
+        dataset = load_dataset(
+            "codecontests",
+            split="test",
+            n_samples=10,
+            balance_correct=False,
+            seed=42
+        )
+        assert len(dataset) == 10

@@ -1,69 +1,21 @@
-"""학습 파이프라인 CLI 진입점"""
+"""학습 파이프라인 CLI 진입점
+
+독립된 Pipeline 라우터: config의 experiment.stage 필드를 읽고 해당 pipeline을 실행
+"""
 
 import argparse
+import sys
 from pathlib import Path
 
-import yaml
-from rich.console import Console
+from omegaconf import OmegaConf
 
-console = Console()
+from weighted_mtp.core.env import ensure_env_loaded
+from weighted_mtp.core.logging import setup_logging
 
+# 환경변수 로드 (MLflow credentials 등)
+ensure_env_loaded()
 
-def deep_merge(base: dict, override: dict) -> dict:
-    """재귀적으로 dict를 병합 (Deep merge)
-
-    Args:
-        base: 기본 설정 (defaults.yaml)
-        override: Override할 설정 (recipe, preset)
-
-    Returns:
-        병합된 설정 (중첩 구조 유지)
-
-    Examples:
-        >>> base = {"a": {"b": 1, "c": 2}, "d": 3}
-        >>> override = {"a": {"b": 10}, "e": 4}
-        >>> deep_merge(base, override)
-        {"a": {"b": 10, "c": 2}, "d": 3, "e": 4}
-    """
-    result = base.copy()
-
-    for key, value in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            # 둘 다 dict인 경우 재귀적으로 병합
-            result[key] = deep_merge(result[key], value)
-        else:
-            # 일반 값이거나 base에 없는 키는 덮어쓰기
-            result[key] = value
-
-    return result
-
-
-def load_config(config_path: Path, recipe_path: Path | None = None) -> dict:
-    """설정 파일 로딩 (Deep merge 지원)
-
-    Args:
-        config_path: 기본 설정 파일 (defaults.yaml)
-        recipe_path: 실험 recipe 파일 (선택적)
-
-    Returns:
-        병합된 설정
-
-    Examples:
-        >>> config = load_config(Path("configs/defaults.yaml"))
-        >>> config = load_config(
-        ...     Path("configs/defaults.yaml"),
-        ...     Path("configs/recipe.verifiable.yaml")
-        ... )
-    """
-    with open(config_path) as f:
-        config = yaml.safe_load(f)
-
-    if recipe_path:
-        with open(recipe_path) as f:
-            recipe = yaml.safe_load(f)
-        config = deep_merge(config, recipe)
-
-    return config
+logger = setup_logging("CLI")
 
 
 def main():
@@ -71,18 +23,16 @@ def main():
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/defaults.yaml"),
-        help="기본 설정 파일 경로",
+        required=True,
+        help="실험 config 경로 (예: configs/baseline/baseline.yaml)",
     )
     parser.add_argument(
-        "--recipe",
-        type=Path,
-        help="실험 recipe 파일 (baseline, verifiable, rho1_weighted)",
+        "--run-name",
+        help="MLflow run 이름 override",
     )
     parser.add_argument(
-        "--preset",
-        choices=["local-light"],
-        help="사전 정의된 preset",
+        "--device",
+        help="Device override (cuda/cpu/mps)",
     )
     parser.add_argument(
         "--use-micro-model",
@@ -94,38 +44,67 @@ def main():
         action="store_true",
         help="설정만 출력하고 종료",
     )
-    parser.add_argument(
-        "--run-name",
-        help="MLflow 실험 run 이름",
-    )
 
     args = parser.parse_args()
 
-    # 설정 로딩
-    config = load_config(args.config, args.recipe)
+    # Config 파일 존재 확인
+    if not args.config.exists():
+        logger.error(f"Config 파일을 찾을 수 없습니다: {args.config}")
+        sys.exit(1)
 
-    if args.preset == "local-light":
-        preset_path = Path("configs/local-light.yaml")
-        with open(preset_path) as f:
-            preset = yaml.safe_load(f)
-        # Deep merge preset override
-        config = deep_merge(config, preset.get("override", {}))
+    # Stage 식별 (config에서 experiment.stage 읽기)
+    try:
+        config_preview = OmegaConf.load(args.config)
+        stage = config_preview.experiment.stage
+    except Exception as e:
+        logger.error(f"Config 로딩 실패: {e}")
+        logger.error("Config 파일에 'experiment.stage' 필드가 있는지 확인하세요.")
+        sys.exit(1)
 
+    # Override params 생성
+    overrides = {}
+    if args.run_name:
+        overrides["experiment.name"] = args.run_name
+    if args.device:
+        overrides["runtime.device"] = args.device
     if args.use_micro_model:
-        config["models"]["policy"]["name"] = "micro-mtp"
-        config["models"]["policy"]["path"] = "storage/models_v2/micro-mtp"
+        overrides["models.policy.path"] = "storage/models_v2/micro-mtp"
 
     # Dry-run
     if args.dry_run:
-        console.print("[bold green]Dry-run mode: 설정 확인[/bold green]")
-        console.print(yaml.dump(config, default_flow_style=False, allow_unicode=True))
+        logger.info(f"Pipeline: {stage}")
+        logger.info(f"Config: {args.config}")
+        logger.info(f"Overrides: {overrides}")
         return
 
-    # TODO: Phase 6에서 실제 파이프라인 연결
-    console.print("[yellow]Phase 2: 파이프라인 미구현 (스텁)[/yellow]")
-    console.print(f"실험: {config.get('experiment', {}).get('name', 'N/A')}")
-    console.print(f"모델: {config['models']['policy']['name']}")
-    console.print(f"데이터셋: {config.get('dataset', {}).get('name', 'N/A')}")
+    # Pipeline 라우팅
+    logger.info(f"실행 Pipeline: {stage}")
+    logger.info(f"Config: {args.config}")
+
+    if stage == "baseline":
+        from weighted_mtp.pipelines.run_baseline import run_baseline_training
+
+        run_baseline_training(config_path=str(args.config), **overrides)
+
+    elif stage == "critic":
+        from weighted_mtp.pipelines.run_critic import run_critic_training
+
+        run_critic_training(config_path=str(args.config), **overrides)
+
+    elif stage == "verifiable":
+        from weighted_mtp.pipelines.run_verifiable import run_verifiable_training
+
+        run_verifiable_training(config_path=str(args.config), **overrides)
+
+    elif stage == "rho1":
+        from weighted_mtp.pipelines.run_rho1 import run_rho1_training
+
+        run_rho1_training(config_path=str(args.config), **overrides)
+
+    else:
+        logger.error(f"Unknown stage: {stage}")
+        logger.error("Available stages: baseline, critic, verifiable, rho1")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
