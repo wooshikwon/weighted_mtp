@@ -31,7 +31,7 @@ models:
       intermediate_size: 11008
       rope_theta: 10000.0
       vocab_size: 32000
-    dtype: float16
+    dtype: bfloat16
 
 # 데이터셋 설정
 dataset:

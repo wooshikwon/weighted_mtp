@@ -32,13 +32,13 @@ models:
       intermediate_size: 11008
       rope_theta: 10000.0
       vocab_size: 32000
-    dtype: float16
+    dtype: bfloat16
 
   # Rho-1 Reference model
   reference:
     name: ref-sheared-llama-2.7b
     path: storage/models/ref-sheared-llama-2.7b
-    dtype: float16
+    dtype: bfloat16
 
 # 데이터셋 설정
 dataset:

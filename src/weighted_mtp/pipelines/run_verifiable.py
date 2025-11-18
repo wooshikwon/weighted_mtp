@@ -68,6 +68,7 @@ def load_adapter(config: dict, device: torch.device) -> MetaLlamaMTPAdapter:
     adapter = MetaLlamaMTPAdapter.from_pretrained(
         model_path=config.models.policy.path,
         device=device,
+        dtype=config.models.policy.dtype,
     )
     return adapter
 

@@ -66,10 +66,12 @@ def wrap_model_fsdp(
     # Mixed precision 설정
     mp_policy = None
     if mixed_precision:
+        # 모델의 dtype을 자동 감지 (Config에서 정의된 dtype 사용)
+        model_dtype = next(model.parameters()).dtype
         mp_policy = MixedPrecision(
-            param_dtype=torch.float16,
-            reduce_dtype=torch.float16,
-            buffer_dtype=torch.float16,
+            param_dtype=model_dtype,
+            reduce_dtype=model_dtype,
+            buffer_dtype=model_dtype,
         )
 
     # CPU offload 설정
