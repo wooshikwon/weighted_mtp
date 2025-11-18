@@ -44,7 +44,10 @@ run:
       uv --version
 
       echo "=== Storage 심볼릭 링크 생성 ==="
-      ln -s /vessl storage
+      mkdir -p storage
+      ln -s /vessl/models storage/models
+      ln -s /vessl/datasets storage/datasets
+      ln -s /vessl/checkpoints storage/checkpoints
       ls -lh storage/
 
       echo "=== Python 의존성 설치 ==="
