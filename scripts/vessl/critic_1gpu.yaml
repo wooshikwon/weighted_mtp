@@ -62,4 +62,4 @@ run:
 
       echo "=== Critic Pretraining 시작 (1-GPU) ==="
       uv run python -m weighted_mtp.pipelines.run_critic \
-        --config configs/critic/critic.yaml
+        --config configs/critic/critic_1gpu.yaml
