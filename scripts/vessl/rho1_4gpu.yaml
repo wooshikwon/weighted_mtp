@@ -12,13 +12,13 @@ resources:
   preset: gpu-a100-large-spot
 image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
 import:
-  /workspace:
+  /app:
     git:
       url: github.com/wooshikwon/weighted_mtp.git
       ref: main
-  /workspace/storage/models: volume://vessl-storage/models
-  /workspace/storage/datasets: volume://vessl-storage/datasets
-  /workspace/storage/checkpoints: volume://vessl-storage/checkpoints
+  /vessl/models: volume://vessl-storage/models
+  /vessl/datasets: volume://vessl-storage/datasets
+  /vessl/checkpoints: volume://vessl-storage/checkpoints
 env:
   MLFLOW_TRACKING_USERNAME: "{{MLFLOW_TRACKING_USERNAME}}"
   MLFLOW_TRACKING_PASSWORD: "{{MLFLOW_TRACKING_PASSWORD}}"
@@ -30,17 +30,21 @@ env:
   TOKENIZERS_PARALLELISM: "false"
   NCCL_DEBUG: "INFO"
 run:
-  - workdir: /workspace
+  - workdir: /app
     command: |
       set -e
 
       echo "=== 시스템 패키지 설치 ==="
       apt-get update && apt-get install -y curl git
 
-      echo "=== uv 설치 ==="
+      echo "=== UV 설치 ==="
       curl -LsSf https://astral.sh/uv/install.sh | sh
       export PATH="$HOME/.local/bin:$PATH"
       uv --version
+
+      echo "=== Storage 심볼릭 링크 생성 ==="
+      ln -s /vessl storage
+      ls -lh storage/
 
       echo "=== Python 의존성 설치 ==="
       uv sync --frozen
@@ -50,17 +54,17 @@ run:
 
       echo "=== Storage Volume 확인 ==="
       echo "Models:"
-      ls -lh /workspace/storage/models/ | head -10
+      ls -lh storage/models/ | head -5
       echo "Datasets:"
-      ls -lh /workspace/storage/datasets/ | head -10
+      ls -lh storage/datasets/ | head -5
 
       echo "=== Reference Model 확인 ==="
-      ls -lh /workspace/storage/models/ref-sheared-llama-2.7b/ || echo "경고: Reference model이 존재하지 않습니다"
+      ls -lh storage/models/ref-sheared-llama-2.7b/ || echo "경고: Reference model이 존재하지 않습니다"
 
       echo "=== Rho-1 WMTP 학습 시작 (4-GPU Distributed) ==="
-      torchrun \
+      uv run torchrun \
         --nproc_per_node=4 \
         --nnodes=1 \
         --node_rank=0 \
-        -m weighted_mtp train \
+        -m weighted_mtp.pipelines.run_rho1 \
         --config configs/rho1/rho1.yaml
