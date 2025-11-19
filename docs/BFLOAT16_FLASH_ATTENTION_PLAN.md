@@ -114,13 +114,16 @@ output = torch.matmul(scores, values)
 
 **Training vs Inference:**
 ```python
-# Training: start_pos=0 (전체 sequence)
-# Inference: start_pos > 0 (incremental generation)
+# Training: start_pos=0 (전체 sequence) → Flash Attention 경로
+# Inference: start_pos > 0 (incremental generation) → KV cache 경로
 
-if self.cache_k is None or self.cache_k.device != x.device:
-    self.cache_k = torch.zeros(...)  # KV cache 생성
-
-self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk.detach()
+if start_pos == 0 and seqlen > 1:
+    # KV cache 미사용 (Flash Attention)
+    output = F.scaled_dot_product_attention(...)
+else:
+    if self.cache_k is None or self.cache_k.device != x.device:
+        self.cache_k = torch.zeros(...)  # KV cache 생성 (Inference 전용)
+    self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk  # detach 제거
 ```
 
 **Flash Attention 적용 전략:**
@@ -263,43 +266,41 @@ def forward(
     xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
     # Training 시 Flash Attention 사용 (start_pos=0, seqlen > 1)
-    # Inference 시 기존 KV cache 방식 유지 (start_pos > 0)
+    # Inference 시 기존 KV cache 방식 유지 (start_pos > 0 또는 seqlen=1)
     if start_pos == 0 and seqlen > 1:
-        # ✅ Flash Attention 경로 (Training)
-        # GQA 지원: keys/values repeat
+        # ✅ Flash Attention 경로 (Training 전용, KV cache 미사용)
         keys = repeat_kv(xk, self.n_rep)
         values = repeat_kv(xv, self.n_rep)
 
-        # Transpose: (batch, seq, n_heads, head_dim) → (batch, n_heads, seq, head_dim)
         xq = xq.transpose(1, 2)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
 
-        # Flash Attention (PyTorch 2.0+ 네이티브)
         output = F.scaled_dot_product_attention(
-            xq, keys, values,
-            attn_mask=None,  # is_causal=True 사용
+            xq,
+            keys,
+            values,
+            attn_mask=None,
             dropout_p=0.0,
-            is_causal=True,  # Causal masking 자동 적용
+            is_causal=True,
         )
-
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
     else:
-        # ✅ 기존 KV cache 경로 (Inference 또는 seqlen=1)
+        # ✅ KV cache 경로 (Inference 전용)
         if self.cache_k is None or self.cache_k.device != x.device:
             self.cache_k = torch.zeros(
                 (self.max_batch_size, self.max_seq_len, self.n_kv_heads, self.head_dim),
                 dtype=x.dtype,
-                device=x.device
+                device=x.device,
             )
             self.cache_v = torch.zeros(
                 (self.max_batch_size, self.max_seq_len, self.n_kv_heads, self.head_dim),
                 dtype=x.dtype,
-                device=x.device
+                device=x.device,
             )
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk.detach()
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv.detach()
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
