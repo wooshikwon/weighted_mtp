@@ -27,6 +27,7 @@ from weighted_mtp.utils import (
     GPUMonitor,
     ThroughputTracker,
     cleanup_old_checkpoints,
+    cleanup_s3_checkpoints,
     compute_gradient_clip_stats,
     compute_gradient_norm,
     compute_lambda_value_loss,
@@ -36,7 +37,9 @@ from weighted_mtp.utils import (
     get_scheduled_lambda,
     get_model_size,
     get_system_info,
+    s3_upload_executor,
     shutdown_s3_executor,
+    upload_to_s3_async,
 )
 from weighted_mtp.runtime import (
     init_distributed,
@@ -45,7 +48,6 @@ from weighted_mtp.runtime import (
     wrap_model_fsdp,
     unwrap_model,
     all_reduce_scalars,
-    barrier,
 )
 
 
@@ -318,6 +320,12 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
     # 0. 환경변수 로드 (MLflow credentials 등)
     ensure_env_loaded()
 
+    # Flash SDP 명시적 활성화 (SDPA memory efficiency 보장)
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(False)  # 비효율적 fallback 비활성화
+
     # 2. Distributed 초기화 (torchrun 환경인 경우)
     if "RANK" in os.environ:
         rank, world_size = init_distributed()
@@ -339,6 +347,13 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
     # 4. Environment setup (seed + device)
     actual_seed, device = setup_environment(config.runtime.seed)
     logger.info(f"Device: {device}, Seed: {actual_seed}")
+
+    # SDP backend 상태 로그
+    if torch.cuda.is_available():
+        flash_enabled = torch.backends.cuda.flash_sdp_enabled()
+        mem_eff_enabled = torch.backends.cuda.mem_efficient_sdp_enabled()
+        math_enabled = torch.backends.cuda.math_sdp_enabled()
+        logger.info(f"SDP backends: flash={flash_enabled}, mem_efficient={mem_eff_enabled}, math={math_enabled}")
 
     # 5. MLflow 초기화 (Rank 0만, experiment 이름이 있는 경우만)
     use_mlflow = bool(config.mlflow.experiment)
@@ -403,6 +418,16 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             lora_param_count = 0
             value_head_param_count = sum(p.numel() for p in value_model.parameters())
 
+    # 메모리 디버깅: FSDP wrapping 전
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        mem_before_fsdp = torch.cuda.memory_allocated() / 1024**3
+        logger.info(f"[MEM DEBUG] Before FSDP: {mem_before_fsdp:.2f} GB allocated")
+
+    # 모델 디바이스 위치 확인 (CPU에서 시작해야 FSDP 샤딩이 효율적)
+    model_device = next(value_model.parameters()).device
+    logger.info(f"[MEM DEBUG] Model device before FSDP: {model_device}")
+
     # FSDP wrapping
     value_model = wrap_model_fsdp(
         value_model,
@@ -412,6 +437,17 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
         cpu_offload=config.distributed.fsdp.cpu_offload,
         activation_checkpointing=config.distributed.fsdp.get("activation_checkpointing", False),
     )
+
+    # 메모리 디버깅: FSDP wrapping 후
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        mem_after_fsdp = torch.cuda.memory_allocated() / 1024**3
+        logger.info(f"[MEM DEBUG] After FSDP: {mem_after_fsdp:.2f} GB allocated")
+
+    # FSDP 샤딩 검증: 모델이 GPU로 이동했는지 확인
+    model_device_after = next(value_model.parameters()).device
+    logger.info(f"[MEM DEBUG] Model device after FSDP: {model_device_after}")
+    logger.info(f"[MEM DEBUG] FSDP sharding delta: {mem_after_fsdp - mem_before_fsdp:.2f} GB")
 
     # FSDP wrapping 후에 named_parameters()로 param 리스트 구성 (optimizer용)
     # use_orig_params=True이므로 원본 파라미터 이름 구조 유지됨
@@ -568,7 +604,7 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
     )
 
     # 7. Training loop
-    best_val_loss = float("inf")
+    best_val_margin = float("-inf")  # margin 기준 (높을수록 좋음)
     global_step = 0
 
     checkpoint_dir = Path(config.checkpoint.save_dir)
@@ -626,12 +662,13 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
     lam_end = lambda_schedule_config.get("end", 0.95)
     lam_warmup_steps = lambda_schedule_config.get("warmup_steps", 250)
     lam_decay_steps = lambda_schedule_config.get("decay_steps", 500)
+    lam_schedule_type = lambda_schedule_config.get("type", "linear")
 
     # Validation용 λ (Pure MC로 일관된 평가 기준 유지)
     val_lambda_lam = 1.0
 
     logger.info(f"λ-return: gamma={lambda_gamma}, coef={lambda_coef}")
-    logger.info(f"λ-schedule: start={lam_start}, end={lam_end}, warmup_steps={lam_warmup_steps}, decay_steps={lam_decay_steps}")
+    logger.info(f"λ-schedule: type={lam_schedule_type}, start={lam_start}, end={lam_end}, warmup={lam_warmup_steps}, decay={lam_decay_steps}")
     logger.info(f"λ-validation: lam={val_lambda_lam} (Pure MC)")
 
     # Gradient clipping
@@ -687,7 +724,19 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             combined_input_ids = torch.cat([pos_input_ids, neg_input_ids], dim=0)
             combined_attention_mask = torch.cat([pos_attention_mask, neg_attention_mask], dim=0)
 
+            # 메모리 디버깅: 첫 forward 전 (첫 배치에서만)
+            if global_step == 0 and accumulation_counter == 0 and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                mem_before_forward = torch.cuda.memory_allocated() / 1024**3
+                logger.info(f"[MEM DEBUG] Before 1st forward: {mem_before_forward:.2f} GB, batch_shape={combined_input_ids.shape}")
+
             combined_value_logits = value_model(combined_input_ids, combined_attention_mask)
+
+            # 메모리 디버깅: 첫 forward 후 (첫 배치에서만)
+            if global_step == 0 and accumulation_counter == 0 and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                mem_after_forward = torch.cuda.memory_allocated() / 1024**3
+                logger.info(f"[MEM DEBUG] After 1st forward: {mem_after_forward:.2f} GB")
 
             pos_value_logits = combined_value_logits[:batch_size]
             neg_value_logits = combined_value_logits[batch_size:]
@@ -698,7 +747,8 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
 
             # Lambda scheduling: step에 따라 λ 동적 조절
             current_lam = get_scheduled_lambda(
-                global_step, lam_warmup_steps, lam_decay_steps, lam_start, lam_end
+                global_step, lam_warmup_steps, lam_decay_steps, lam_start, lam_end,
+                schedule_type=lam_schedule_type,
             )
 
             # λ-return Value Loss 계산
@@ -928,33 +978,46 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             "val_neg_token_variance": avg_val_neg_variance,
         }
 
-        # Checkpoint 저장
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        # Checkpoint 저장 (validation margin 기준, rank 0만)
+        if avg_val_margin > best_val_margin:
+            best_val_margin = avg_val_margin
             checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}.pt"
 
-            save_value_model_checkpoint(
-                value_model=value_model,
-                optimizer=optimizer,
-                epoch=current_epoch,
-                train_metrics={"train_loss": train_loss_avg},
-                val_metrics=aggregated_val_metrics,
-                checkpoint_path=checkpoint_path,
-                config=config,
-            )
-
-            barrier()
-
             if is_main_process():
-                logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_loss: {best_val_loss:.4f})")
+                save_value_model_checkpoint(
+                    value_model=value_model,
+                    optimizer=optimizer,
+                    epoch=current_epoch,
+                    train_metrics={"train_loss": train_loss_avg},
+                    val_metrics=aggregated_val_metrics,
+                    checkpoint_path=checkpoint_path,
+                    config=config,
+                )
+                logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_margin: {best_val_margin:.4f})")
 
+                # S3 비동기 업로드
+                if use_s3_upload and mlflow_run_id:
+                    s3_upload_executor.submit(
+                        upload_to_s3_async, checkpoint_path, mlflow_run_id
+                    )
+                    logger.info(f"S3 upload queued: {checkpoint_path.name}")
+
+                # 로컬 cleanup
                 if config.checkpoint.save_total_limit:
                     cleanup_old_checkpoints(
                         checkpoint_dir=checkpoint_dir,
                         save_total_limit=config.checkpoint.save_total_limit,
                     )
+
+                    # S3 cleanup
+                    if use_s3_upload and mlflow_run_id:
+                        cleanup_s3_checkpoints(
+                            experiment_id=None,
+                            run_id=mlflow_run_id,
+                            save_total_limit=config.checkpoint.save_total_limit,
+                        )
         else:
-            logger.info(f"Validation loss did not improve ({avg_val_loss:.4f} >= {best_val_loss:.4f})")
+            logger.info(f"Validation margin did not improve ({avg_val_margin:.4f} <= {best_val_margin:.4f})")
 
         next_checkpoint_epoch += save_checkpoint_every
 
@@ -998,20 +1061,24 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             "val_margin": final_margin,
         }
 
-        save_value_model_checkpoint(
-            value_model=value_model,
-            optimizer=optimizer,
-            epoch=current_epoch,
-            train_metrics={"train_loss": train_loss_avg},
-            val_metrics=final_val_metrics,
-            checkpoint_path=final_path,
-            config=config,
-        )
-
-        barrier()
-
         if is_main_process():
+            save_value_model_checkpoint(
+                value_model=value_model,
+                optimizer=optimizer,
+                epoch=current_epoch,
+                train_metrics={"train_loss": train_loss_avg},
+                val_metrics=final_val_metrics,
+                checkpoint_path=final_path,
+                config=config,
+            )
             logger.info(f"Final checkpoint saved: {final_path.name}")
+
+            # S3 비동기 업로드
+            if use_s3_upload and mlflow_run_id:
+                s3_upload_executor.submit(
+                    upload_to_s3_async, final_path, mlflow_run_id
+                )
+                logger.info(f"S3 upload queued: {final_path.name}")
 
     # 9. 종료
     shutdown_s3_executor()

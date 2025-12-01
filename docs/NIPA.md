@@ -314,6 +314,8 @@ CUDA_VISIBLE_DEVICES=0,1,2 uv run torchrun --nproc_per_node=3 --nnodes=1 --node_
   --config configs/production/ref_tuning.yaml \
   --override mlflow.tracking_uri=$MLFLOW_URI
 
+MLFLOW_URI="file:///home/work/grad_school/wooshikwon/weighted_mtp/mlruns"
+
 # Verifiable Reward
 CUDA_VISIBLE_DEVICES=0,1,2 uv run torchrun --nproc_per_node=3 --nnodes=1 --node_rank=0 \
   --master_port=29501 \
@@ -395,8 +397,8 @@ tail -f logs/baseline_*.log
 ```bash
 # 특정 디렉토리 다운로드
 rsync -avz --progress -e "ssh -p 10507" \
-  work@proxy1.nipa2025.ktcloud.com:~/grad_school/wooshikwon/weighted_mtp/mlruns/869427667672898361/a0a47ff5fa7d410582ced2a813fa71fd/ \
-  ./storage/mlflow_logs/weighted-mtp_production/
+  work@proxy1.nipa2025.ktcloud.com:~/grad_school/wooshikwon/weighted_mtp/storage/checkpoints/critic/lora-critic-lambda-0.995-final/checkpoint_epoch_1.80.pt \
+  ./storage/critic/
 
 # mlruns 전체 다운로드
 rsync -avz --progress -e "ssh -p 10507" \

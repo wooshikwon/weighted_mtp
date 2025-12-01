@@ -114,6 +114,7 @@ def get_scheduled_lambda(
     decay_steps: int = 500,
     lam_start: float = 1.0,
     lam_end: float = 0.95,
+    schedule_type: str = "linear",
 ) -> float:
     """Lambda scheduling (Hold & Decay)
 
@@ -124,9 +125,9 @@ def get_scheduled_lambda(
         - 모델이 terminal reward 패턴을 확실히 학습
         - V=0.5 편향에서 벗어나도록 강제
 
-    Phase 2 (Decay): decay_steps 동안 start → end 선형 감소
-        - 부드러운 전환으로 학습 안정성 유지
-        - 부트스트랩 비중 점진적 증가
+    Phase 2 (Decay): decay_steps 동안 start → end 감소
+        - linear: 선형 감소
+        - cosine: 코사인 감소 (초반/후반 느리게, 중반 빠르게)
 
     Phase 3 (Stable): 이후 λ=end 유지
         - 토큰별 차별화된 타겟으로 일반화 성능 향상
@@ -137,15 +138,25 @@ def get_scheduled_lambda(
         decay_steps: Decay 기간 (start → end)
         lam_start: 초기 λ 값 (기본값 1.0, Pure MC)
         lam_end: 최종 λ 값 (기본값 0.95)
+        schedule_type: "linear" 또는 "cosine"
 
     Returns:
         현재 step의 λ 값
     """
+    import math
+
     if current_step < warmup_steps:
         return lam_start
     elif current_step < warmup_steps + decay_steps:
         progress = (current_step - warmup_steps) / decay_steps
-        return lam_start - progress * (lam_start - lam_end)
+
+        if schedule_type == "cosine":
+            # Cosine decay: 초반/후반 느리게, 중반 빠르게
+            decay_factor = 0.5 * (1 + math.cos(math.pi * progress))
+            return lam_end + (lam_start - lam_end) * decay_factor
+        else:
+            # Linear decay
+            return lam_start - progress * (lam_start - lam_end)
     else:
         return lam_end
 

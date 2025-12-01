@@ -105,6 +105,10 @@ class ValueModel(nn.Module):
         config = LlamaConfig.from_pretrained(model_path)
         config._attn_implementation = "sdpa"  # Config에 명시적 설정
 
+        # 분산학습 감지: FSDP 사용 시 CPU에 로드 (FSDP가 GPU 배치 담당)
+        import os
+        is_distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
         backbone = LlamaModel.from_pretrained(
             model_path,
             config=config,  # 수정된 config 전달
@@ -119,14 +123,21 @@ class ValueModel(nn.Module):
         actual_impl = getattr(config, "_attn_implementation", "unknown")
         logger.info(f"LlamaModel loaded with attn_implementation={actual_impl}")
 
-        # 디바이스 이동
-        if device != "cpu":
+        # 디바이스 이동: 분산학습 시 CPU 유지 (FSDP가 GPU 배치 담당)
+        # 단일 GPU에서만 직접 GPU로 이동
+        if not is_distributed and device != "cpu":
             backbone = backbone.to(device)
+            logger.info(f"Single GPU mode: backbone moved to {device}")
+        else:
+            logger.info("Distributed mode: backbone stays on CPU for FSDP sharding")
 
-        # Value Head 생성
+        # Value Head 생성 (분산학습 시에도 CPU에서 시작)
         hidden_size = config.hidden_size
         value_head = create_value_head(hidden_size, value_head_type, dropout)
-        value_head = value_head.to(device=device, dtype=torch_dtype)
+        if not is_distributed and device != "cpu":
+            value_head = value_head.to(device=device, dtype=torch_dtype)
+        else:
+            value_head = value_head.to(dtype=torch_dtype)  # dtype만 설정, device는 CPU
 
         model = cls(backbone, value_head, config)
 
