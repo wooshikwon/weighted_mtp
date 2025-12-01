@@ -276,7 +276,9 @@ def save_lora_checkpoint(
     - extra_heads 파라미터 (MTP heads, full fine-tuning)
     - value_head 파라미터 (선택적)
 
-    Base model은 별도로 유지하고, 추론 시 base model + checkpoint 조합으로 사용.
+    FSDP 환경에서 메모리 효율적 저장:
+    - summon_full_params()를 사용해 학습 가능 파라미터만 gather
+    - 전체 모델을 rank 0에 모으지 않아 OOM 방지
 
     Args:
         adapter: MetaLlamaMTPAdapter (FSDP-wrapped 또는 일반 모델, LoRA 적용됨)
@@ -308,77 +310,63 @@ def save_lora_checkpoint(
     """
     import torch.distributed as dist
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from torch.distributed.fsdp.fully_sharded_data_parallel import (
-        StateDictType,
-        FullStateDictConfig,
-    )
 
     checkpoint_path = Path(checkpoint_path)
+    is_fsdp = isinstance(adapter, FSDP)
 
-    # FSDP Full state dict gathering (모든 rank가 참여해야 함)
-    if isinstance(adapter, FSDP):
-        with FSDP.state_dict_type(
-            adapter,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        ):
-            full_state_dict = adapter.state_dict()
+    if is_fsdp:
+        # 메모리 효율적 저장: 학습 가능 파라미터만 추출
+        lora_state_dict, extra_heads_state_dict, value_head_state_dict, lora_config = \
+            _extract_trainable_params_fsdp(adapter, save_value_head)
 
         # rank 0만 실제 저장 수행
         if dist.is_initialized() and dist.get_rank() != 0:
             return
-
-        unwrapped = adapter.module
     else:
+        # 일반 모델 (single-device 환경)
         full_state_dict = adapter.state_dict()
         unwrapped = adapter
 
-    # LoRA 파라미터 추출 (trunk layers)
-    lora_state_dict = {
-        k: v for k, v in full_state_dict.items()
-        if "lora_A" in k or "lora_B" in k
-    }
-
-    # extra_heads 파라미터 추출 (MTP heads, full fine-tuning)
-    extra_heads_state_dict = {
-        k: v for k, v in full_state_dict.items()
-        if "transformer.extra_heads." in k
-    }
-
-    # Value head 파라미터 추출 (선택적)
-    value_head_state_dict = {}
-    if save_value_head:
-        value_head_state_dict = {
+        # LoRA 파라미터 추출
+        lora_state_dict = {
             k: v for k, v in full_state_dict.items()
-            if "value_head" in k
+            if "lora_A" in k or "lora_B" in k
         }
 
-    # LoRA config 추출 (adapter에서)
-    lora_config = None
-    if hasattr(unwrapped, "lora_enabled") and unwrapped.lora_enabled:
-        # transformer의 첫 번째 LoRALinear에서 config 추출
-        for _, module in unwrapped.transformer.named_modules():
-            if hasattr(module, "rank") and hasattr(module, "alpha"):
-                lora_config = {
-                    "rank": module.rank,
-                    "alpha": module.alpha,
-                }
-                break
+        # extra_heads 파라미터 추출
+        extra_heads_state_dict = {
+            k: v for k, v in full_state_dict.items()
+            if "transformer.extra_heads." in k
+        }
 
-    # 크기 비교 로깅
-    full_size = sum(v.numel() for v in full_state_dict.values())
+        # Value head 파라미터 추출
+        value_head_state_dict = {}
+        if save_value_head:
+            value_head_state_dict = {
+                k: v for k, v in full_state_dict.items()
+                if "value_head" in k
+            }
+
+        # LoRA config 추출
+        lora_config = None
+        if hasattr(unwrapped, "lora_enabled") and unwrapped.lora_enabled:
+            for _, module in unwrapped.transformer.named_modules():
+                if hasattr(module, "rank") and hasattr(module, "alpha"):
+                    lora_config = {"rank": module.rank, "alpha": module.alpha}
+                    break
+
+    # 크기 로깅
     lora_size = sum(v.numel() for v in lora_state_dict.values())
     extra_heads_size = sum(v.numel() for v in extra_heads_state_dict.values())
     vh_size = sum(v.numel() for v in value_head_state_dict.values())
     saved_size = lora_size + extra_heads_size + vh_size
 
     logger.info(f"LoRA checkpoint 저장:")
-    logger.info(f"  전체 모델: {full_size:,} params")
-    logger.info(f"  LoRA: {lora_size:,} params ({lora_size/full_size*100:.2f}%)")
-    logger.info(f"  extra_heads: {extra_heads_size:,} params ({extra_heads_size/full_size*100:.2f}%)")
+    logger.info(f"  LoRA: {lora_size:,} params")
+    logger.info(f"  extra_heads: {extra_heads_size:,} params")
     if save_value_head and vh_size > 0:
-        logger.info(f"  Value head: {vh_size:,} params ({vh_size/full_size*100:.2f}%)")
-    logger.info(f"  저장 크기: {saved_size:,} params ({saved_size/full_size*100:.2f}%)")
+        logger.info(f"  Value head: {vh_size:,} params")
+    logger.info(f"  총 저장 크기: {saved_size:,} params")
 
     # 저장
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -411,6 +399,60 @@ def save_lora_checkpoint(
         logger.warning(f"S3 업로드 건너뜀 (experiment_name 없음): {checkpoint_path.name}")
 
 
+def _extract_trainable_params_fsdp(
+    adapter,
+    save_value_head: bool = True,
+) -> tuple[dict, dict, dict, dict | None]:
+    """FSDP 환경에서 학습 가능 파라미터만 메모리 효율적으로 추출
+
+    FSDP summon_full_params()를 사용해 trainable=True인 파라미터만 gather.
+    전체 모델을 rank 0에 모으지 않아 OOM 방지.
+
+    Args:
+        adapter: FSDP-wrapped MetaLlamaMTPAdapter
+        save_value_head: Value head 포함 여부
+
+    Returns:
+        (lora_state_dict, extra_heads_state_dict, value_head_state_dict, lora_config)
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    unwrapped = adapter.module
+    lora_state_dict = {}
+    extra_heads_state_dict = {}
+    value_head_state_dict = {}
+    lora_config = None
+
+    # summon_full_params: 학습 가능 파라미터만 gather (writeback=False로 읽기 전용)
+    with FSDP.summon_full_params(adapter, writeback=False, offload_to_cpu=True, rank0_only=True):
+        # 학습 가능 파라미터 순회하며 추출
+        for name, param in adapter.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # CPU로 복사 (rank 0에서만 유효)
+            param_cpu = param.detach().cpu().clone()
+
+            # LoRA 파라미터
+            if "lora_A" in name or "lora_B" in name:
+                lora_state_dict[name] = param_cpu
+            # extra_heads 파라미터
+            elif "transformer.extra_heads." in name:
+                extra_heads_state_dict[name] = param_cpu
+            # Value head 파라미터
+            elif save_value_head and "value_head" in name:
+                value_head_state_dict[name] = param_cpu
+
+        # LoRA config 추출
+        if hasattr(unwrapped, "lora_enabled") and unwrapped.lora_enabled:
+            for _, module in unwrapped.transformer.named_modules():
+                if hasattr(module, "rank") and hasattr(module, "alpha"):
+                    lora_config = {"rank": module.rank, "alpha": module.alpha}
+                    break
+
+    return lora_state_dict, extra_heads_state_dict, value_head_state_dict, lora_config
+
+
 def save_value_model_checkpoint(
     value_model,
     optimizer: torch.optim.Optimizer,
@@ -422,14 +464,15 @@ def save_value_model_checkpoint(
     s3_upload: bool = False,
     experiment_name: str | None = None,
 ) -> None:
-    """Value Model checkpoint 저장 (FSDP 지원)
+    """Value Model checkpoint 저장 (FSDP 지원, 메모리 효율적)
 
     ValueModel (backbone + value_head 구조)의 checkpoint를 저장합니다.
     LoRA 모드에서는 LoRA weights + value head만 저장하고,
     Full 모드에서는 전체 backbone + value head를 저장합니다.
 
-    FSDP 환경에서는 모든 rank가 state_dict gathering에 참여하고,
-    실제 저장은 rank 0만 수행합니다.
+    FSDP 환경에서 메모리 효율적 저장:
+    - LoRA 모드: summon_full_params()로 학습 가능 파라미터만 gather (OOM 방지)
+    - Full 모드: FULL_STATE_DICT 사용 (전체 모델 저장 필요)
 
     Args:
         value_model: ValueModel 인스턴스 (FSDP-wrapped 가능)
@@ -477,47 +520,50 @@ def save_value_model_checkpoint(
     checkpoint_path = Path(checkpoint_path)
     is_fsdp = isinstance(value_model, FSDP)
 
+    # LoRA 모드 확인
     if is_fsdp:
-        # FSDP: 모든 rank가 gathering에 참여
-        with FSDP.state_dict_type(
-            value_model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        ):
-            full_state_dict = value_model.state_dict()
-
-        # rank 0만 실제 저장 수행
-        if dist.is_initialized() and dist.get_rank() != 0:
-            return
-
-        # LoRA 파라미터 추출
-        lora_state_dict = {
-            k: v for k, v in full_state_dict.items()
-            if "lora_A" in k or "lora_B" in k
-        }
-        # value_head 파라미터 추출 (prefix 제거)
-        value_head_state_dict = {
-            k.replace("value_head.", ""): v
-            for k, v in full_state_dict.items()
-            if "value_head" in k
-        }
-        # backbone 파라미터 추출 (full 모드용)
-        backbone_state_dict = {
-            k.replace("backbone.", ""): v
-            for k, v in full_state_dict.items()
-            if "backbone" in k and "lora" not in k
-        }
-
-        # LoRA 모드 확인
         unwrapped = value_model.module
-        use_lora = getattr(unwrapped, "lora_enabled", False)
-        lora_config = getattr(unwrapped, "lora_config", None)
+    else:
+        unwrapped = value_model
+    use_lora = getattr(unwrapped, "lora_enabled", False)
+    lora_config = getattr(unwrapped, "lora_config", None)
+
+    if is_fsdp:
+        if use_lora:
+            # LoRA 모드: 메모리 효율적 저장 (summon_full_params 사용)
+            lora_state_dict, value_head_state_dict = \
+                _extract_value_model_trainable_params_fsdp(value_model)
+
+            # rank 0만 실제 저장 수행
+            if dist.is_initialized() and dist.get_rank() != 0:
+                return
+        else:
+            # Full 모드: 전체 모델 저장 필요
+            with FSDP.state_dict_type(
+                value_model,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+            ):
+                full_state_dict = value_model.state_dict()
+
+            if dist.is_initialized() and dist.get_rank() != 0:
+                return
+
+            # backbone 파라미터 추출 (prefix 제거)
+            backbone_state_dict = {
+                k.replace("backbone.", ""): v
+                for k, v in full_state_dict.items()
+                if "backbone" in k and "lora" not in k
+            }
+            # value_head 파라미터 추출 (prefix 제거)
+            value_head_state_dict = {
+                k.replace("value_head.", ""): v
+                for k, v in full_state_dict.items()
+                if "value_head" in k
+            }
+            lora_state_dict = {}
     else:
         # Non-FSDP: 단일 디바이스 환경
-        unwrapped = value_model
-        use_lora = getattr(unwrapped, "lora_enabled", False)
-        lora_config = getattr(unwrapped, "lora_config", None)
-
         if use_lora:
             from weighted_mtp.models.lora import get_hf_lora_state_dict
             lora_state_dict = get_hf_lora_state_dict(unwrapped.backbone)
@@ -587,6 +633,45 @@ def save_value_model_checkpoint(
         logger.info(f"S3 업로드 예약: {checkpoint_path.name}")
     elif s3_upload and not experiment_name:
         logger.warning(f"S3 업로드 건너뜀 (experiment_name 없음): {checkpoint_path.name}")
+
+
+def _extract_value_model_trainable_params_fsdp(
+    value_model,
+) -> tuple[dict, dict]:
+    """FSDP 환경에서 ValueModel의 학습 가능 파라미터만 메모리 효율적으로 추출
+
+    summon_full_params()를 사용해 trainable=True인 파라미터만 gather.
+    전체 2.7B 모델을 rank 0에 모으지 않아 OOM 방지.
+
+    Args:
+        value_model: FSDP-wrapped ValueModel
+
+    Returns:
+        (lora_state_dict, value_head_state_dict)
+        - lora_state_dict: backbone의 LoRA 파라미터 (backbone. prefix 포함)
+        - value_head_state_dict: value head 파라미터 (prefix 제거됨)
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    lora_state_dict = {}
+    value_head_state_dict = {}
+
+    with FSDP.summon_full_params(value_model, writeback=False, offload_to_cpu=True, rank0_only=True):
+        for name, param in value_model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            param_cpu = param.detach().cpu().clone()
+
+            # LoRA 파라미터 (backbone. prefix 유지)
+            if "lora_A" in name or "lora_B" in name:
+                lora_state_dict[name] = param_cpu
+            # Value head 파라미터 (prefix 제거)
+            elif "value_head" in name:
+                key = name.replace("value_head.", "")
+                value_head_state_dict[key] = param_cpu
+
+    return lora_state_dict, value_head_state_dict
 
 
 def load_lora_checkpoint(

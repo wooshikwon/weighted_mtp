@@ -17,6 +17,7 @@ GRAD_ACCUM=""
 MAX_SAMPLES=""
 VALUE_HEAD="sigmoid"  # sigmoid, linear, mlp
 USE_CUSTOM_IMAGE=false
+S3_UPLOAD=""  # 빈 값이면 yaml 기본값 사용
 
 # CLI 인자 파싱
 while [[ $# -gt 0 ]]; do
@@ -45,9 +46,17 @@ while [[ $# -gt 0 ]]; do
       VALUE_HEAD="$2"
       shift 2
       ;;
+    --s3-upload)
+      S3_UPLOAD="true"
+      shift 1
+      ;;
+    --no-s3-upload)
+      S3_UPLOAD="false"
+      shift 1
+      ;;
     *)
       echo "알 수 없는 옵션: $1"
-      echo "사용법: $0 --ngpus <1|2|4> [--value-head sigmoid|linear|mlp] [--batch-size N] [--grad-accum N] [--max-samples N] [--use-custom-image]"
+      echo "사용법: $0 --ngpus <1|2|4> [--value-head sigmoid|linear|mlp] [--batch-size N] [--grad-accum N] [--max-samples N] [--use-custom-image] [--s3-upload|--no-s3-upload]"
       exit 1
       ;;
   esac
@@ -90,6 +99,9 @@ if [ -n "$GRAD_ACCUM" ]; then
 fi
 if [ -n "$MAX_SAMPLES" ]; then
   OVERRIDE_ARGS="$OVERRIDE_ARGS --override data_sampling.problems.max_samples=$MAX_SAMPLES"
+fi
+if [ -n "$S3_UPLOAD" ]; then
+  OVERRIDE_ARGS="$OVERRIDE_ARGS --override checkpoint.s3_upload=$S3_UPLOAD"
 fi
 
 # Train command 생성
@@ -170,6 +182,11 @@ rm -f "$SETUP_FILE"
 # 환경변수 치환
 sed -i.bak "s|{{HF_TOKEN}}|$HF_TOKEN|g" "$TEMP_YAML"
 
+# AWS credentials 치환 (S3 업로드용, .env에서 로드)
+sed -i.bak "s|{{AWS_ACCESS_KEY_ID}}|${AWS_ACCESS_KEY_ID:-}|g" "$TEMP_YAML"
+sed -i.bak "s|{{AWS_SECRET_ACCESS_KEY}}|${AWS_SECRET_ACCESS_KEY:-}|g" "$TEMP_YAML"
+sed -i.bak "s|{{AWS_DEFAULT_REGION}}|${AWS_DEFAULT_REGION:-eu-north-1}|g" "$TEMP_YAML"
+
 echo "환경변수 치환 완료"
 echo "임시 YAML: $TEMP_YAML"
 
@@ -177,10 +194,12 @@ echo "임시 YAML: $TEMP_YAML"
 echo ""
 echo "=== 실행 설정 ==="
 echo "GPU 개수: $NGPUS"
+echo "Config: $CONFIG"
 echo "Value Head: $VALUE_HEAD"
 [ -n "$BATCH_SIZE" ] && echo "Batch Size: $BATCH_SIZE (override)"
 [ -n "$GRAD_ACCUM" ] && echo "Gradient Accumulation: $GRAD_ACCUM (override)"
 [ -n "$MAX_SAMPLES" ] && echo "Max Samples: $MAX_SAMPLES (override)"
+[ -n "$S3_UPLOAD" ] && echo "S3 Upload: $S3_UPLOAD (override)"
 
 # VESSL Run 실행
 echo ""

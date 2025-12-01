@@ -52,7 +52,7 @@ data_sampling:
 # 학습 설정 (H200 3-GPU 최적화)
 training:
   n_epochs: 2.0
-  batch_size: 32
+  batch_size: 24
   gradient_accumulation_steps: 1  # Effective batch size = 32 × 1 × 3 = 96
 
   # Global 설정 (FSDP 제약으로 분리 불가)
@@ -98,8 +98,8 @@ training:
       type: linear          # "linear" 또는 "cosine"
       start: 1.0            # 초기 λ (Pure MC, 모든 토큰 타겟=R)
       end: 0.995            # 최종 λ (거의 Pure MC, 0.5% 부트스트랩)
-      warmup_steps: 625     # Hold 기간 (λ=1.0 유지)
-      decay_steps: 625      # Decay 기간 (cosine으로 천천히)
+      warmup_steps: 500     # Hold 기간 (λ=1.0 유지)
+      decay_steps: 1200      # Decay 기간 (cosine으로 천천히)
 
   # Learning rate scheduler (공유)
   lr_scheduler:

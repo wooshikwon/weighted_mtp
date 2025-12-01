@@ -38,7 +38,7 @@ models:
 
   # Value Model (Critic checkpoint에서 로드, eval only)
   value_model:
-    checkpoint_path: storage/checkpoints/critic/lora-critic-lambda-0.995-final/checkpoint_epoch_1.80.pt
+    checkpoint_path: storage/checkpoints/critic/lora-critic-lambda-0.995-final/checkpoint_final.pt
     base_model_path: storage/models/ref-sheared-llama-2.7b/raw
 
 # 데이터셋 설정
@@ -75,7 +75,7 @@ training:
   max_grad_norm: 1.0
 
   # TD error weighting (Terminal-only binary reward이므로 MC 방식 사용)
-  beta: 0.9
+  beta: 1.2
   weight_clip_min: 0.1
   weight_clip_max: 3
 
@@ -103,7 +103,7 @@ training:
   # Learning rate scheduler
   lr_scheduler:
     type: cosine
-    warmup_ratio: 0.1
+    warmup_ratio: 0.03
     min_lr_ratio: 0.005
 
 # 체크포인트

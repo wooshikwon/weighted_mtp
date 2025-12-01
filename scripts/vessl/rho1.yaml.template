@@ -23,7 +23,11 @@ import:
 env:
   HF_TOKEN: "{{HF_TOKEN}}"
   PYTHONUNBUFFERED: "1"
-  TOKENIZERS_PARALLELISM: "false"{{NCCL_DEBUG}}
+  TOKENIZERS_PARALLELISM: "false"
+  # S3 업로드용 AWS credentials (s3_upload: true 시 필요)
+  AWS_ACCESS_KEY_ID: "{{AWS_ACCESS_KEY_ID}}"
+  AWS_SECRET_ACCESS_KEY: "{{AWS_SECRET_ACCESS_KEY}}"
+  AWS_DEFAULT_REGION: "{{AWS_DEFAULT_REGION}}"{{NCCL_DEBUG}}
 run:
   - workdir: /workspace/code
     command: |
