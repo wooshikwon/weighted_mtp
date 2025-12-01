@@ -11,6 +11,7 @@ from weighted_mtp.utils.checkpoint_utils import (
     save_hf_checkpoint,
     save_hf_lora_checkpoint,
     save_lora_checkpoint,
+    save_value_model_checkpoint,
 )
 from weighted_mtp.utils.evaluation_utils import (
     compute_pass_at_k,
@@ -76,6 +77,7 @@ __all__ = [
     "save_hf_checkpoint",
     "save_hf_lora_checkpoint",
     "save_lora_checkpoint",
+    "save_value_model_checkpoint",
     # Evaluation utils
     "compute_pass_at_k",
     "evaluate_gsm8k_answer",

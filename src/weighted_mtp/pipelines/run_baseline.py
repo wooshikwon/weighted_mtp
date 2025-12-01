@@ -555,48 +555,49 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
 
         logger.info(f"Validation - Loss: {val_metrics['val_loss']:.4f}")
 
-        # Checkpoint 저장 (validation loss 개선 시만, rank 0만)
+        # Checkpoint 저장 (validation loss 개선 시만)
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}.pt"
 
-            if is_main_process():
-                save_lora_only = config.checkpoint.get("save_lora_only", False) and use_lora
+            save_lora_only = config.checkpoint.get("save_lora_only", False) and use_lora
 
-                if save_lora_only:
-                    save_lora_checkpoint(
-                        adapter=adapter,
-                        optimizer=optimizer,
-                        epoch=current_epoch,
-                        train_metrics={"train_loss": train_loss_avg},
-                        val_metrics=val_metrics,
-                        checkpoint_path=checkpoint_path,
-                        config={"model": {"path": config.models.policy.path}},
-                        s3_upload=use_s3_upload,
-                        mlflow_run_id=mlflow_run_id,
-                    )
-                else:
-                    save_checkpoint(
-                        adapter=adapter,
-                        optimizer=optimizer,
-                        epoch=current_epoch,
-                        train_metrics={"train_loss": train_loss_avg},
-                        val_metrics=val_metrics,
-                        checkpoint_path=checkpoint_path,
-                        config={"model": {"path": config.models.policy.path}},
-                        s3_upload=use_s3_upload,
-                        mlflow_run_id=mlflow_run_id,
-                    )
+            # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
+            if save_lora_only:
+                save_lora_checkpoint(
+                    adapter=adapter,
+                    optimizer=optimizer,
+                    epoch=current_epoch,
+                    train_metrics={"train_loss": train_loss_avg},
+                    val_metrics=val_metrics,
+                    checkpoint_path=checkpoint_path,
+                    config={"model": {"path": config.models.policy.path}},
+                    s3_upload=use_s3_upload,
+                    mlflow_run_id=mlflow_run_id,
+                )
+            else:
+                save_checkpoint(
+                    adapter=adapter,
+                    optimizer=optimizer,
+                    epoch=current_epoch,
+                    train_metrics={"train_loss": train_loss_avg},
+                    val_metrics=val_metrics,
+                    checkpoint_path=checkpoint_path,
+                    config={"model": {"path": config.models.policy.path}},
+                    s3_upload=use_s3_upload,
+                    mlflow_run_id=mlflow_run_id,
+                )
+
+            # 로깅 및 cleanup은 rank 0만 수행
+            if is_main_process():
                 logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_loss: {best_val_loss:.4f})")
 
-                # 오래된 checkpoint 정리
                 if config.checkpoint.save_total_limit:
                     cleanup_old_checkpoints(
                         checkpoint_dir=checkpoint_dir,
                         save_total_limit=config.checkpoint.save_total_limit,
                     )
 
-                    # S3 정리 (비동기)
                     if use_s3_upload:
                         s3_upload_executor.submit(
                             cleanup_s3_checkpoints,
@@ -613,7 +614,7 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
         # Throughput tracker 리셋
         throughput_tracker.start_epoch()
 
-    # 9. Final checkpoint (rank 0만)
+    # 9. Final checkpoint
     if config.checkpoint.save_final:
         final_path = checkpoint_dir / "checkpoint_final.pt"
 
@@ -625,33 +626,35 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
             device=device,
         )
 
-        if is_main_process():
-            save_lora_only = config.checkpoint.get("save_lora_only", False) and use_lora
+        save_lora_only = config.checkpoint.get("save_lora_only", False) and use_lora
 
-            if save_lora_only:
-                save_lora_checkpoint(
-                    adapter=adapter,
-                    optimizer=optimizer,
-                    epoch=current_epoch,
-                    train_metrics={"train_loss": train_loss_avg},
-                    val_metrics=final_val_metrics,
-                    checkpoint_path=final_path,
-                    config={"model": {"path": config.models.policy.path}},
-                    s3_upload=use_s3_upload,
-                    mlflow_run_id=mlflow_run_id,
-                )
-            else:
-                save_checkpoint(
-                    adapter=adapter,
-                    optimizer=optimizer,
-                    epoch=current_epoch,
-                    train_metrics={"train_loss": train_loss_avg},
-                    val_metrics=final_val_metrics,
-                    checkpoint_path=final_path,
-                    config={"model": {"path": config.models.policy.path}},
-                    s3_upload=use_s3_upload,
-                    mlflow_run_id=mlflow_run_id,
-                )
+        # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
+        if save_lora_only:
+            save_lora_checkpoint(
+                adapter=adapter,
+                optimizer=optimizer,
+                epoch=current_epoch,
+                train_metrics={"train_loss": train_loss_avg},
+                val_metrics=final_val_metrics,
+                checkpoint_path=final_path,
+                config={"model": {"path": config.models.policy.path}},
+                s3_upload=use_s3_upload,
+                mlflow_run_id=mlflow_run_id,
+            )
+        else:
+            save_checkpoint(
+                adapter=adapter,
+                optimizer=optimizer,
+                epoch=current_epoch,
+                train_metrics={"train_loss": train_loss_avg},
+                val_metrics=final_val_metrics,
+                checkpoint_path=final_path,
+                config={"model": {"path": config.models.policy.path}},
+                s3_upload=use_s3_upload,
+                mlflow_run_id=mlflow_run_id,
+            )
+
+        if is_main_process():
             logger.info(f"Final checkpoint saved: {final_path.name}")
 
     # 10. 모든 S3 업로드 완료 대기 및 MLflow 종료

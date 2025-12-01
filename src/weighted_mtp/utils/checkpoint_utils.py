@@ -411,6 +411,184 @@ def save_lora_checkpoint(
         logger.warning(f"S3 업로드 건너뜀 (run_id 없음): {checkpoint_path.name}")
 
 
+def save_value_model_checkpoint(
+    value_model,
+    optimizer: torch.optim.Optimizer,
+    epoch: float,
+    train_metrics: dict[str, float],
+    val_metrics: dict[str, float],
+    checkpoint_path: Path | str,
+    config: Any = None,
+    s3_upload: bool = False,
+    mlflow_run_id: str | None = None,
+) -> None:
+    """Value Model checkpoint 저장 (FSDP 지원)
+
+    ValueModel (backbone + value_head 구조)의 checkpoint를 저장합니다.
+    LoRA 모드에서는 LoRA weights + value head만 저장하고,
+    Full 모드에서는 전체 backbone + value head를 저장합니다.
+
+    FSDP 환경에서는 모든 rank가 state_dict gathering에 참여하고,
+    실제 저장은 rank 0만 수행합니다.
+
+    Args:
+        value_model: ValueModel 인스턴스 (FSDP-wrapped 가능)
+        optimizer: torch.optim.Optimizer
+        epoch: 현재 epoch
+        train_metrics: Training metrics
+        val_metrics: Validation metrics
+        checkpoint_path: 저장 경로
+        config: 학습 설정 (OmegaConf DictConfig 또는 dict)
+        s3_upload: S3 업로드 여부
+        mlflow_run_id: MLflow run ID (S3 업로드 시 필요)
+
+    Saved checkpoint format (LoRA mode):
+        {
+            "checkpoint_type": "hf_lora",
+            "lora_state_dict": dict,
+            "value_head_state_dict": dict,
+            "lora_config": dict,
+            "base_model_path": str,
+            "epoch": float,
+            "train_metrics": dict,
+            "val_metrics": dict,
+            "config": dict,
+        }
+
+    Saved checkpoint format (Full mode):
+        {
+            "checkpoint_type": "full",
+            "backbone_state_dict": dict,
+            "value_head_state_dict": dict,
+            "optimizer_state_dict": dict,
+            "epoch": float,
+            "train_metrics": dict,
+            "val_metrics": dict,
+            "config": dict,
+        }
+    """
+    import torch.distributed as dist
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp.fully_sharded_data_parallel import (
+        StateDictType,
+        FullStateDictConfig,
+    )
+
+    checkpoint_path = Path(checkpoint_path)
+    is_fsdp = isinstance(value_model, FSDP)
+
+    if is_fsdp:
+        # FSDP: 모든 rank가 gathering에 참여
+        with FSDP.state_dict_type(
+            value_model,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        ):
+            full_state_dict = value_model.state_dict()
+
+        # rank 0만 실제 저장 수행
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        # LoRA 파라미터 추출
+        lora_state_dict = {
+            k: v for k, v in full_state_dict.items()
+            if "lora_A" in k or "lora_B" in k
+        }
+        # value_head 파라미터 추출 (prefix 제거)
+        value_head_state_dict = {
+            k.replace("value_head.", ""): v
+            for k, v in full_state_dict.items()
+            if "value_head" in k
+        }
+        # backbone 파라미터 추출 (full 모드용)
+        backbone_state_dict = {
+            k.replace("backbone.", ""): v
+            for k, v in full_state_dict.items()
+            if "backbone" in k and "lora" not in k
+        }
+
+        # LoRA 모드 확인
+        unwrapped = value_model.module
+        use_lora = getattr(unwrapped, "lora_enabled", False)
+        lora_config = getattr(unwrapped, "lora_config", None)
+    else:
+        # Non-FSDP: 단일 디바이스 환경
+        unwrapped = value_model
+        use_lora = getattr(unwrapped, "lora_enabled", False)
+        lora_config = getattr(unwrapped, "lora_config", None)
+
+        if use_lora:
+            from weighted_mtp.models.lora import get_hf_lora_state_dict
+            lora_state_dict = get_hf_lora_state_dict(unwrapped.backbone)
+        else:
+            lora_state_dict = {}
+            backbone_state_dict = unwrapped.backbone.state_dict()
+
+        value_head_state_dict = unwrapped.value_head.state_dict()
+
+    # Config 변환 (OmegaConf → dict)
+    config_dict = None
+    if config is not None:
+        try:
+            from omegaconf import OmegaConf
+            if hasattr(config, "_metadata"):  # OmegaConf DictConfig
+                config_dict = OmegaConf.to_container(config, resolve=True)
+            else:
+                config_dict = dict(config) if not isinstance(config, dict) else config
+        except ImportError:
+            config_dict = dict(config) if not isinstance(config, dict) else config
+
+    # base_model_path 추출
+    base_model_path = None
+    if config is not None:
+        if hasattr(config, "models") and hasattr(config.models, "value_model"):
+            base_model_path = config.models.value_model.path
+        elif isinstance(config, dict) and "models" in config:
+            base_model_path = config.get("models", {}).get("value_model", {}).get("path")
+
+    # Checkpoint 구성
+    if use_lora:
+        checkpoint = {
+            "checkpoint_type": "hf_lora",
+            "lora_state_dict": lora_state_dict,
+            "value_head_state_dict": value_head_state_dict,
+            "lora_config": lora_config,
+            "base_model_path": base_model_path,
+            "epoch": epoch,
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics,
+            "config": config_dict,
+        }
+    else:
+        checkpoint = {
+            "checkpoint_type": "full",
+            "backbone_state_dict": backbone_state_dict,
+            "value_head_state_dict": value_head_state_dict,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics,
+            "config": config_dict,
+        }
+
+    # 저장
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint, checkpoint_path)
+    logger.info(f"Value Model checkpoint 저장 완료: {checkpoint_path}")
+    logger.info(f"  Epoch: {epoch}")
+    logger.info(f"  Val loss: {val_metrics.get('val_loss', 'N/A')}")
+    logger.info(f"  Mode: {'LoRA' if use_lora else 'Full'}")
+
+    # S3 업로드 (비동기)
+    if s3_upload and mlflow_run_id:
+        from weighted_mtp.utils.s3_utils import s3_upload_executor, upload_to_s3_async
+        s3_upload_executor.submit(upload_to_s3_async, checkpoint_path, mlflow_run_id)
+        logger.info(f"S3 업로드 예약: {checkpoint_path.name}")
+    elif s3_upload and not mlflow_run_id:
+        logger.warning(f"S3 업로드 건너뜀 (run_id 없음): {checkpoint_path.name}")
+
+
 def load_lora_checkpoint(
     adapter,
     checkpoint_path: Path | str,

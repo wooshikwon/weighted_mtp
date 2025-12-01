@@ -679,35 +679,37 @@ def run_verifiable_training(
             "val_loss": avg_val_unweighted_ce,
         }
 
-        # Checkpoint 저장 (rank 0만)
+        # Checkpoint 저장
         if avg_val_unweighted_ce < best_val_loss:
             best_val_loss = avg_val_unweighted_ce
             checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}.pt"
 
-            if is_main_process():
-                # LoRA only 저장 옵션
-                save_lora_only = config.checkpoint.get("save_lora_only", False) and use_lora
+            save_lora_only = config.checkpoint.get("save_lora_only", False) and use_lora
 
-                if save_lora_only:
-                    save_lora_checkpoint(
-                        adapter=policy_model,
-                        optimizer=optimizer,
-                        epoch=current_epoch,
-                        train_metrics={"train_weighted_ce": train_weighted_ce_avg},
-                        val_metrics=aggregated_val_metrics,
-                        checkpoint_path=checkpoint_path,
-                        config={"model": {"path": config.models.policy.path}},
-                    )
-                else:
-                    save_checkpoint(
-                        adapter=policy_model,
-                        optimizer=optimizer,
-                        epoch=current_epoch,
-                        train_metrics={"train_weighted_ce": train_weighted_ce_avg},
-                        val_metrics=aggregated_val_metrics,
-                        checkpoint_path=checkpoint_path,
-                        config={"model": {"path": config.models.policy.path}},
-                    )
+            # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
+            if save_lora_only:
+                save_lora_checkpoint(
+                    adapter=policy_model,
+                    optimizer=optimizer,
+                    epoch=current_epoch,
+                    train_metrics={"train_weighted_ce": train_weighted_ce_avg},
+                    val_metrics=aggregated_val_metrics,
+                    checkpoint_path=checkpoint_path,
+                    config={"model": {"path": config.models.policy.path}},
+                )
+            else:
+                save_checkpoint(
+                    adapter=policy_model,
+                    optimizer=optimizer,
+                    epoch=current_epoch,
+                    train_metrics={"train_weighted_ce": train_weighted_ce_avg},
+                    val_metrics=aggregated_val_metrics,
+                    checkpoint_path=checkpoint_path,
+                    config={"model": {"path": config.models.policy.path}},
+                )
+
+            # 로깅 및 cleanup은 rank 0만 수행
+            if is_main_process():
                 logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_loss: {best_val_loss:.4f})")
 
                 if config.checkpoint.save_total_limit:
@@ -720,7 +722,7 @@ def run_verifiable_training(
 
         next_checkpoint_epoch += save_checkpoint_every
 
-    # 11. Final checkpoint (rank 0만)
+    # 11. Final checkpoint
     if config.checkpoint.save_final:
         final_path = checkpoint_dir / "checkpoint_final.pt"
 
@@ -747,29 +749,31 @@ def run_verifiable_training(
             "val_loss": reduced_final["val_unweighted_ce"],
         }
 
-        if is_main_process():
-            save_lora_only = config.checkpoint.get("save_lora_only", False) and use_lora
+        save_lora_only = config.checkpoint.get("save_lora_only", False) and use_lora
 
-            if save_lora_only:
-                save_lora_checkpoint(
-                    adapter=policy_model,
-                    optimizer=optimizer,
-                    epoch=current_epoch,
-                    train_metrics={"train_weighted_ce": train_weighted_ce_avg},
-                    val_metrics=final_aggregated,
-                    checkpoint_path=final_path,
-                    config={"model": {"path": config.models.policy.path}},
-                )
-            else:
-                save_checkpoint(
-                    adapter=policy_model,
-                    optimizer=optimizer,
-                    epoch=current_epoch,
-                    train_metrics={"train_weighted_ce": train_weighted_ce_avg},
-                    val_metrics=final_aggregated,
-                    checkpoint_path=final_path,
-                    config={"model": {"path": config.models.policy.path}},
-                )
+        # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
+        if save_lora_only:
+            save_lora_checkpoint(
+                adapter=policy_model,
+                optimizer=optimizer,
+                epoch=current_epoch,
+                train_metrics={"train_weighted_ce": train_weighted_ce_avg},
+                val_metrics=final_aggregated,
+                checkpoint_path=final_path,
+                config={"model": {"path": config.models.policy.path}},
+            )
+        else:
+            save_checkpoint(
+                adapter=policy_model,
+                optimizer=optimizer,
+                epoch=current_epoch,
+                train_metrics={"train_weighted_ce": train_weighted_ce_avg},
+                val_metrics=final_aggregated,
+                checkpoint_path=final_path,
+                config={"model": {"path": config.models.policy.path}},
+            )
+
+        if is_main_process():
             logger.info(f"Final checkpoint saved: {final_path.name}")
 
     # 12. 종료

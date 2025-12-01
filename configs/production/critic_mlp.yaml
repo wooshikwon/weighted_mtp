@@ -95,7 +95,7 @@ training:
     # Lambda scheduling (Hold & Decay)
     # 초기 Pure MC로 방향성 확립 후 아주 천천히 미세 부트스트랩 도입
     lambda_schedule:
-      type: cosine          # "linear" 또는 "cosine"
+      type: linear          # "linear" 또는 "cosine"
       start: 1.0            # 초기 λ (Pure MC, 모든 토큰 타겟=R)
       end: 0.995            # 최종 λ (거의 Pure MC, 0.5% 부트스트랩)
       warmup_steps: 625     # Hold 기간 (λ=1.0 유지)

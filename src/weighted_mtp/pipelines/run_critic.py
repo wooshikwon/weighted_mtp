@@ -8,10 +8,8 @@ Policy Model과 완전 분리된 별도 모델 사용.
 """
 
 import argparse
-import logging
 import os
 from pathlib import Path
-from typing import Any
 
 import mlflow
 import torch
@@ -37,16 +35,14 @@ from weighted_mtp.utils import (
     get_scheduled_lambda,
     get_model_size,
     get_system_info,
-    s3_upload_executor,
+    save_value_model_checkpoint,
     shutdown_s3_executor,
-    upload_to_s3_async,
 )
 from weighted_mtp.runtime import (
     init_distributed,
     setup_environment,
     is_main_process,
     wrap_model_fsdp,
-    unwrap_model,
     all_reduce_scalars,
 )
 
@@ -116,66 +112,6 @@ def load_value_model(
     )
 
     return value_model
-
-
-def save_value_model_checkpoint(
-    value_model: ValueModel,
-    optimizer: torch.optim.Optimizer,
-    epoch: float,
-    train_metrics: dict,
-    val_metrics: dict,
-    checkpoint_path: Path,
-    config: DictConfig = None,
-) -> None:
-    """Value Model checkpoint 저장
-
-    LoRA 모드: checkpoint_type="hf_lora"로 저장 (LoRA weights + value head만)
-    Full 모드: checkpoint_type="full"로 저장 (전체 backbone + value head)
-
-    Args:
-        value_model: ValueModel 인스턴스
-        optimizer: Optimizer
-        epoch: 현재 epoch
-        train_metrics: Train metrics
-        val_metrics: Validation metrics
-        checkpoint_path: 저장 경로
-        config: Config (OmegaConf DictConfig)
-    """
-    # FSDP unwrap
-    unwrapped = unwrap_model(value_model)
-
-    # LoRA 모드 확인
-    use_lora = getattr(unwrapped, "lora_enabled", False)
-
-    if use_lora:
-        # LoRA checkpoint (경량)
-        from weighted_mtp.models.lora import get_hf_lora_state_dict
-
-        checkpoint = {
-            "checkpoint_type": "hf_lora",
-            "lora_state_dict": get_hf_lora_state_dict(unwrapped.backbone),
-            "value_head_state_dict": unwrapped.value_head.state_dict(),
-            "lora_config": unwrapped.lora_config,
-            "base_model_path": config.models.value_model.path if config else None,
-            "epoch": epoch,
-            "train_metrics": train_metrics,
-            "val_metrics": val_metrics,
-            "config": OmegaConf.to_container(config, resolve=True) if config else None,
-        }
-    else:
-        # Full checkpoint
-        checkpoint = {
-            "checkpoint_type": "full",
-            "epoch": epoch,
-            "backbone_state_dict": unwrapped.backbone.state_dict(),
-            "value_head_state_dict": unwrapped.value_head.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "train_metrics": train_metrics,
-            "val_metrics": val_metrics,
-            "config": OmegaConf.to_container(config, resolve=True) if config else None,
-        }
-
-    torch.save(checkpoint, checkpoint_path)
 
 
 def validate_critic(
@@ -978,38 +914,34 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             "val_neg_token_variance": avg_val_neg_variance,
         }
 
-        # Checkpoint 저장 (validation margin 기준, rank 0만)
+        # Checkpoint 저장 (validation margin 기준)
         if avg_val_margin > best_val_margin:
             best_val_margin = avg_val_margin
             checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}.pt"
 
+            # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
+            save_value_model_checkpoint(
+                value_model=value_model,
+                optimizer=optimizer,
+                epoch=current_epoch,
+                train_metrics={"train_loss": train_loss_avg},
+                val_metrics=aggregated_val_metrics,
+                checkpoint_path=checkpoint_path,
+                config=config,
+                s3_upload=use_s3_upload,
+                mlflow_run_id=mlflow_run_id,
+            )
+
+            # 로깅 및 cleanup은 rank 0만 수행
             if is_main_process():
-                save_value_model_checkpoint(
-                    value_model=value_model,
-                    optimizer=optimizer,
-                    epoch=current_epoch,
-                    train_metrics={"train_loss": train_loss_avg},
-                    val_metrics=aggregated_val_metrics,
-                    checkpoint_path=checkpoint_path,
-                    config=config,
-                )
                 logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_margin: {best_val_margin:.4f})")
 
-                # S3 비동기 업로드
-                if use_s3_upload and mlflow_run_id:
-                    s3_upload_executor.submit(
-                        upload_to_s3_async, checkpoint_path, mlflow_run_id
-                    )
-                    logger.info(f"S3 upload queued: {checkpoint_path.name}")
-
-                # 로컬 cleanup
                 if config.checkpoint.save_total_limit:
                     cleanup_old_checkpoints(
                         checkpoint_dir=checkpoint_dir,
                         save_total_limit=config.checkpoint.save_total_limit,
                     )
 
-                    # S3 cleanup
                     if use_s3_upload and mlflow_run_id:
                         cleanup_s3_checkpoints(
                             experiment_id=None,
@@ -1061,24 +993,21 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             "val_margin": final_margin,
         }
 
-        if is_main_process():
-            save_value_model_checkpoint(
-                value_model=value_model,
-                optimizer=optimizer,
-                epoch=current_epoch,
-                train_metrics={"train_loss": train_loss_avg},
-                val_metrics=final_val_metrics,
-                checkpoint_path=final_path,
-                config=config,
-            )
-            logger.info(f"Final checkpoint saved: {final_path.name}")
+        # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
+        save_value_model_checkpoint(
+            value_model=value_model,
+            optimizer=optimizer,
+            epoch=current_epoch,
+            train_metrics={"train_loss": train_loss_avg},
+            val_metrics=final_val_metrics,
+            checkpoint_path=final_path,
+            config=config,
+            s3_upload=use_s3_upload,
+            mlflow_run_id=mlflow_run_id,
+        )
 
-            # S3 비동기 업로드
-            if use_s3_upload and mlflow_run_id:
-                s3_upload_executor.submit(
-                    upload_to_s3_async, final_path, mlflow_run_id
-                )
-                logger.info(f"S3 upload queued: {final_path.name}")
+        if is_main_process():
+            logger.info(f"Final checkpoint saved: {final_path.name}")
 
     # 9. 종료
     shutdown_s3_executor()

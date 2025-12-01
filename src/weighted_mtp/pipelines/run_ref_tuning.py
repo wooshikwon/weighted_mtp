@@ -545,38 +545,38 @@ def run_ref_tuning_training(config: DictConfig) -> tuple[dict[str, float], str]:
 
         logger.info(f"Validation - Loss: {avg_val_loss:.4f}")
 
-        # Checkpoint 저장 (rank 0만)
+        # Checkpoint 저장
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
 
+            # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
+            if use_lora:
+                checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}.pt"
+                save_hf_lora_checkpoint(
+                    model=model,
+                    checkpoint_path=checkpoint_path,
+                    config=config,
+                    epoch=current_epoch,
+                    val_metrics={"val_loss": avg_val_loss},
+                )
+            else:
+                checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}"
+                save_hf_checkpoint(
+                    model=model,
+                    tokenizer=tokenizer,
+                    save_dir=checkpoint_path,
+                    epoch=current_epoch,
+                    val_metrics={"val_loss": avg_val_loss},
+                )
+
             if is_main_process():
-                if use_lora:
-                    # LoRA checkpoint (.pt 파일)
-                    checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}.pt"
-                    save_hf_lora_checkpoint(
-                        model=model,
-                        checkpoint_path=checkpoint_path,
-                        config=config,
-                        epoch=current_epoch,
-                        val_metrics={"val_loss": avg_val_loss},
-                    )
-                else:
-                    # HuggingFace 형식 (디렉토리)
-                    checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}"
-                    save_hf_checkpoint(
-                        model=model,
-                        tokenizer=tokenizer,
-                        save_dir=checkpoint_path,
-                        epoch=current_epoch,
-                        val_metrics={"val_loss": avg_val_loss},
-                    )
                 logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_loss: {best_val_loss:.4f})")
         else:
             logger.info(f"Validation loss did not improve ({avg_val_loss:.4f} >= {best_val_loss:.4f})")
 
         next_checkpoint_epoch += save_checkpoint_every
 
-    # 11. Final checkpoint (rank 0만)
+    # 11. Final checkpoint
     if config.checkpoint.save_final:
         logger.info("--- Final Validation ---")
         final_val_metrics = validate_ref_tuning(
@@ -588,27 +588,27 @@ def run_ref_tuning_training(config: DictConfig) -> tuple[dict[str, float], str]:
         reduced_final = all_reduce_scalars({"val_loss": final_val_metrics["val_loss"]})
         final_val_metrics["val_loss"] = reduced_final["val_loss"]
 
+        # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
+        if use_lora:
+            final_path = checkpoint_dir / "checkpoint_final.pt"
+            save_hf_lora_checkpoint(
+                model=model,
+                checkpoint_path=final_path,
+                config=config,
+                epoch=current_epoch,
+                val_metrics=final_val_metrics,
+            )
+        else:
+            final_path = checkpoint_dir / "checkpoint_final"
+            save_hf_checkpoint(
+                model=model,
+                tokenizer=tokenizer,
+                save_dir=final_path,
+                epoch=current_epoch,
+                val_metrics=final_val_metrics,
+            )
+
         if is_main_process():
-            if use_lora:
-                # LoRA checkpoint (.pt 파일)
-                final_path = checkpoint_dir / "checkpoint_final.pt"
-                save_hf_lora_checkpoint(
-                    model=model,
-                    checkpoint_path=final_path,
-                    config=config,
-                    epoch=current_epoch,
-                    val_metrics=final_val_metrics,
-                )
-            else:
-                # HuggingFace 형식 (디렉토리)
-                final_path = checkpoint_dir / "checkpoint_final"
-                save_hf_checkpoint(
-                    model=model,
-                    tokenizer=tokenizer,
-                    save_dir=final_path,
-                    epoch=current_epoch,
-                    val_metrics=final_val_metrics,
-                )
             logger.info(f"Final checkpoint saved: {final_path.name}")
 
     # 12. MLflow 종료
