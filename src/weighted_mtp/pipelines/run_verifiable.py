@@ -171,8 +171,8 @@ def validate_verifiable(
             value_logits = value_model(pos_input_ids, pos_attention_mask)
 
             # Policy Model forward (MTP logits)
-            policy_outputs = policy_model(pos_input_ids, pos_attention_mask)
-            pos_logits = policy_outputs  # [batch, seq, n_future_tokens, vocab]
+            # MetaLlamaMTPAdapter는 attention_mask 미사용 (absolute positional encoding)
+            pos_logits = policy_model(pos_input_ids)  # [batch, seq, n_future_tokens, vocab]
 
             # 학습 대상 토큰 마스크 (labels != -100)
             pos_loss_mask = (pos_labels != -100)
