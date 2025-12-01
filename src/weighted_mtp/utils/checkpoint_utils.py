@@ -357,7 +357,7 @@ def save_lora_checkpoint(
     lora_config = None
     if hasattr(unwrapped, "lora_enabled") and unwrapped.lora_enabled:
         # transformer의 첫 번째 LoRALinear에서 config 추출
-        for name, module in unwrapped.transformer.named_modules():
+        for _, module in unwrapped.transformer.named_modules():
             if hasattr(module, "rank") and hasattr(module, "alpha"):
                 lora_config = {
                     "rank": module.rank,
@@ -820,7 +820,6 @@ def save_hf_lora_checkpoint(
         StateDictType,
         FullStateDictConfig,
     )
-    from weighted_mtp.models.lora import get_hf_lora_state_dict
 
     checkpoint_path = Path(checkpoint_path)
 
@@ -835,11 +834,8 @@ def save_hf_lora_checkpoint(
 
         if dist.is_initialized() and dist.get_rank() != 0:
             return
-
-        unwrapped = model.module
     else:
         full_state_dict = model.state_dict()
-        unwrapped = model
 
     # LoRA 파라미터 추출
     lora_state_dict = {
