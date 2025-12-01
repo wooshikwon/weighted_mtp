@@ -228,10 +228,15 @@ class ValueModel(nn.Module):
             lora_config=lora_config,
         )
 
-        # LoRA weights 로드
+        # LoRA weights 로드 (backbone. prefix 제거)
         lora_state_dict = checkpoint.get("lora_state_dict", {})
         if lora_state_dict:
-            load_hf_lora_state_dict(model.backbone, lora_state_dict)
+            # 체크포인트 키: backbone.layers.0... → 모델 키: layers.0...
+            remapped_lora = {
+                k.replace("backbone.", "", 1) if k.startswith("backbone.") else k: v
+                for k, v in lora_state_dict.items()
+            }
+            load_hf_lora_state_dict(model.backbone, remapped_lora)
 
         # Value head 로드
         value_head_state_dict = checkpoint.get("value_head_state_dict", {})
