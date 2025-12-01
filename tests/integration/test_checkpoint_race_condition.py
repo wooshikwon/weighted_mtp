@@ -3,7 +3,8 @@
 save_total_limit 설정 시 S3 업로드 중 로컬 checkpoint 삭제로 인한
 race condition이 발생하지 않는지 검증
 
-boto3 직접 사용 방식으로 리팩토링됨
+임시 복사본 사용으로 race condition 방지:
+- 원본 파일이 삭제되어도 임시 복사본에서 업로드 성공
 """
 
 import time
@@ -26,10 +27,10 @@ def test_race_condition_prevented(tmp_path):
 
     시나리오:
     1. 첫 번째 checkpoint 저장
-    2. S3 업로드 시작 (비동기)
+    2. S3 업로드 시작 (비동기, 임시 복사본 사용)
     3. 두 번째 checkpoint 저장 (더 좋음)
     4. cleanup 즉시 실행 → 첫 번째 checkpoint 삭제
-    5. S3 업로드는 예외 없이 완료되어야 함
+    5. S3 업로드는 임시 복사본에서 성공
     """
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
@@ -55,10 +56,10 @@ def test_race_condition_prevented(tmp_path):
     upload_error = None
 
     def slow_upload_mock(local_path, bucket, s3_key):
-        """느린 업로드 시뮬레이션 (파일 읽기)"""
+        """느린 업로드 시뮬레이션 (임시 복사본에서 파일 읽기)"""
         nonlocal upload_completed, upload_error
         try:
-            # 업로드 시뮬레이션
+            # 업로드 시뮬레이션 (임시 복사본에서 읽기)
             time.sleep(0.2)  # 업로드 시간 시뮬레이션
             with open(local_path, 'rb') as f:
                 f.read()
@@ -73,11 +74,12 @@ def test_race_condition_prevented(tmp_path):
         mock_s3.upload_file.side_effect = slow_upload_mock
 
         # S3 업로드 시작 (비동기, experiment_name 사용)
+        # upload_to_s3_async가 임시 복사본을 만들고 그 경로에서 업로드
         upload_future = s3_utils.s3_upload_executor.submit(
             upload_to_s3_async, checkpoint1, "test-experiment"
         )
 
-        # 짧은 대기 (업로드 시작 확인)
+        # 복사가 완료될 시간 확보 후 cleanup
         time.sleep(0.1)
 
         # 두 번째 checkpoint 저장 (더 좋음)
@@ -100,14 +102,14 @@ def test_race_condition_prevented(tmp_path):
         assert not checkpoint1.exists(), "첫 번째 checkpoint가 삭제되어야 함"
         assert checkpoint2.exists(), "두 번째 checkpoint는 유지되어야 함"
 
-        # S3 업로드는 예외 없이 완료되어야 함
+        # S3 업로드는 예외 없이 완료되어야 함 (임시 복사본 사용)
         try:
             upload_future.result(timeout=10)
         except Exception as e:
             pytest.fail(f"S3 upload failed: {e}")
 
-    # 검증
-    assert upload_completed, "업로드가 완료되어야 함"
+    # 검증: 임시 복사본 덕분에 원본 삭제 후에도 업로드 성공
+    assert upload_completed, "업로드가 완료되어야 함 (임시 복사본 사용)"
     assert upload_error is None, f"업로드 에러 발생: {upload_error}"
 
 
@@ -122,7 +124,7 @@ def test_multiple_checkpoints_race_condition(tmp_path):
     checkpoints = []
     upload_futures = []
 
-    # 간단한 mock (실제 업로드 시뮬레이션)
+    # 간단한 mock (임시 복사본에서 실제 업로드 시뮬레이션)
     def simple_upload_mock(local_path, bucket, s3_key):
         time.sleep(0.05)
         with open(local_path, 'rb') as f:
@@ -168,3 +170,38 @@ def test_multiple_checkpoints_race_condition(tmp_path):
     assert len(remaining) == 2, f"2개만 남아있어야 하는데 {len(remaining)}개 있음"
     assert remaining[0].name == "checkpoint_epoch_4.00.pt"
     assert remaining[1].name == "checkpoint_epoch_5.00.pt"
+
+
+def test_temp_copy_cleanup_on_error(tmp_path):
+    """업로드 실패 시에도 임시 복사본 정리 확인"""
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+
+    model = torch.nn.Linear(10, 10)
+    optimizer = torch.optim.Adam(model.parameters())
+
+    checkpoint = checkpoint_dir / "checkpoint_epoch_1.00.pt"
+    save_checkpoint(
+        adapter=model,
+        optimizer=optimizer,
+        epoch=1.0,
+        train_metrics={"loss": 2.5},
+        val_metrics={"val_loss": 2.5},
+        checkpoint_path=checkpoint,
+    )
+
+    # S3 업로드 실패 시뮬레이션
+    with patch("weighted_mtp.utils.s3_utils.boto3") as mock_boto3:
+        mock_s3 = MagicMock()
+        mock_boto3.client.return_value = mock_s3
+        mock_s3.upload_file.side_effect = Exception("S3 connection error")
+
+        # 업로드 실행 (예외는 캐치되어야 함)
+        upload_to_s3_async(checkpoint, "test-experiment")
+
+    # 임시 디렉터리가 정리되었는지 확인 (s3_upload_ 접두사)
+    import tempfile
+    temp_base = Path(tempfile.gettempdir())
+    s3_upload_dirs = list(temp_base.glob("s3_upload_*"))
+    # 정리되었으므로 없거나 최소한이어야 함
+    assert len(s3_upload_dirs) == 0, f"임시 디렉터리가 정리되지 않음: {s3_upload_dirs}"

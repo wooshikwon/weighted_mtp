@@ -35,7 +35,7 @@ def test_upload_to_s3_async_file_not_found(tmp_path, caplog):
 
 @patch("weighted_mtp.utils.s3_utils.boto3")
 def test_upload_to_s3_async_success(mock_boto3, temp_checkpoint):
-    """boto3 직접 사용 S3 업로드 성공"""
+    """boto3 직접 사용 S3 업로드 성공 (임시 복사본 사용)"""
     mock_s3 = MagicMock()
     mock_boto3.client.return_value = mock_s3
 
@@ -47,9 +47,14 @@ def test_upload_to_s3_async_success(mock_boto3, temp_checkpoint):
     # upload_file 호출 확인
     mock_s3.upload_file.assert_called_once()
     call_args = mock_s3.upload_file.call_args
-    assert call_args[0][0] == str(temp_checkpoint)  # 로컬 파일 경로
+
+    # 임시 복사본 경로에서 업로드됨 (s3_upload_ 접두사)
+    local_path = call_args[0][0]
+    assert "s3_upload_" in local_path  # 임시 디렉터리에서 업로드
+    assert local_path.endswith("checkpoint_epoch_1.00.pt")  # 파일명은 동일
+
     assert call_args[0][1] == "wmtp"  # S3 버킷 이름
-    assert "checkpoints/test-experiment/checkpoint_epoch_1.00.pt" in call_args[0][2]  # S3 키
+    assert call_args[0][2] == "checkpoints/test-experiment/checkpoint_epoch_1.00.pt"  # S3 키
 
 
 @patch("weighted_mtp.utils.s3_utils.boto3")
