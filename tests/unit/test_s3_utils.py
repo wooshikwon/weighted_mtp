@@ -1,4 +1,7 @@
-"""S3 유틸리티 단위 테스트"""
+"""S3 유틸리티 단위 테스트
+
+boto3 직접 사용 방식으로 리팩토링된 s3_utils 테스트
+"""
 
 import os
 from pathlib import Path
@@ -10,6 +13,7 @@ from weighted_mtp.utils import (
     cleanup_s3_checkpoints,
     reset_s3_executor,
     shutdown_s3_executor,
+    sync_mlruns_to_s3,
     upload_to_s3_async,
 )
 
@@ -22,93 +26,90 @@ def temp_checkpoint(tmp_path):
     return checkpoint_path
 
 
-def test_upload_to_s3_async_no_run_id(temp_checkpoint, caplog):
-    """run_id가 없으면 업로드 스킵"""
-    # run_id 없이 호출
-    upload_to_s3_async(temp_checkpoint, run_id=None)
-    # 경고 로그 확인
+def test_upload_to_s3_async_file_not_found(tmp_path, caplog):
+    """파일이 존재하지 않으면 업로드 스킵"""
+    non_existent_path = tmp_path / "non_existent.pt"
+    upload_to_s3_async(non_existent_path, experiment_name="test-experiment")
     assert "S3 upload skipped" in caplog.text
 
 
-def test_upload_to_s3_async_empty_run_id(temp_checkpoint, caplog):
-    """빈 run_id로 호출 시 업로드 스킵"""
-    upload_to_s3_async(temp_checkpoint, run_id="")
-    assert "S3 upload skipped" in caplog.text
+@patch("weighted_mtp.utils.s3_utils.boto3")
+def test_upload_to_s3_async_success(mock_boto3, temp_checkpoint):
+    """boto3 직접 사용 S3 업로드 성공"""
+    mock_s3 = MagicMock()
+    mock_boto3.client.return_value = mock_s3
+
+    upload_to_s3_async(temp_checkpoint, experiment_name="test-experiment")
+
+    # boto3 client 생성 확인
+    mock_boto3.client.assert_called_once_with("s3")
+
+    # upload_file 호출 확인
+    mock_s3.upload_file.assert_called_once()
+    call_args = mock_s3.upload_file.call_args
+    assert call_args[0][0] == str(temp_checkpoint)  # 로컬 파일 경로
+    assert call_args[0][1] == "wmtp"  # S3 버킷 이름
+    assert "checkpoints/test-experiment/checkpoint_epoch_1.00.pt" in call_args[0][2]  # S3 키
 
 
-def test_upload_to_s3_async_success(temp_checkpoint):
-    """임시 복사본을 통한 S3 업로드 성공"""
-    # tempfile mock 설정
-    mock_tmp_instance = MagicMock()
-    mock_tmp_instance.name = "/tmp/checkpoint_upload_test"
-    mock_tmp_instance.cleanup = MagicMock()
-
-    with patch("tempfile.TemporaryDirectory", return_value=mock_tmp_instance):
-        with patch("shutil.copy2") as mock_copy:
-            with patch("weighted_mtp.utils.s3_utils.MlflowClient") as mock_client_class:
-                mock_client = MagicMock()
-                mock_client_class.return_value = mock_client
-
-                # 업로드 실행
-                upload_to_s3_async(temp_checkpoint, run_id="test-run-id-123")
-
-                # 복사 호출 확인
-                mock_copy.assert_called_once()
-
-                # MlflowClient.log_artifact 호출 확인 (run_id 포함)
-                mock_client.log_artifact.assert_called_once()
-                call_args = mock_client.log_artifact.call_args
-                assert call_args[0][0] == "test-run-id-123"  # run_id가 첫 번째 인자
-
-                # cleanup 호출 확인
-                mock_tmp_instance.cleanup.assert_called_once()
-
-
-def test_upload_to_s3_async_failure(temp_checkpoint, caplog):
+@patch("weighted_mtp.utils.s3_utils.boto3")
+def test_upload_to_s3_async_failure(mock_boto3, temp_checkpoint, caplog):
     """S3 업로드 실패 케이스"""
-    with patch("weighted_mtp.utils.s3_utils.MlflowClient") as mock_client_class:
-        mock_client = MagicMock()
-        mock_client_class.return_value = mock_client
-        mock_client.log_artifact.side_effect = Exception("S3 connection error")
+    from botocore.exceptions import ClientError
 
-        # 업로드 실행 (예외는 캐치되어야 함)
-        upload_to_s3_async(temp_checkpoint, run_id="test-run-id")
+    mock_s3 = MagicMock()
+    mock_boto3.client.return_value = mock_s3
+    mock_s3.upload_file.side_effect = ClientError(
+        {"Error": {"Code": "500", "Message": "Internal Server Error"}},
+        "upload_file",
+    )
 
-        # 에러 로그 확인
-        assert "S3 upload failed" in caplog.text
-        assert "S3 connection error" in caplog.text
+    # 업로드 실행 (예외는 캐치되어야 함)
+    upload_to_s3_async(temp_checkpoint, experiment_name="test-experiment")
+
+    # 에러 로그 확인
+    assert "S3 upload failed" in caplog.text
 
 
 @patch("weighted_mtp.utils.s3_utils.boto3")
 def test_cleanup_s3_checkpoints_success(mock_boto3):
     """S3 checkpoint 정리 성공 케이스"""
-    # Mock S3 클라이언트 설정
     mock_s3 = Mock()
     mock_boto3.client.return_value = mock_s3
 
-    # S3 list_objects_v2 응답 mock (5개 checkpoint)
     from datetime import datetime, timedelta
+
     base_time = datetime(2025, 1, 1)
 
+    # S3 list_objects_v2 응답 mock (5개 checkpoint)
     mock_s3.list_objects_v2.return_value = {
         "Contents": [
-            {"Key": "mlflow-artifacts/abc123/artifacts/checkpoints/checkpoint_epoch_1.00.pt",
-             "LastModified": base_time + timedelta(hours=1)},
-            {"Key": "mlflow-artifacts/abc123/artifacts/checkpoints/checkpoint_epoch_2.00.pt",
-             "LastModified": base_time + timedelta(hours=2)},
-            {"Key": "mlflow-artifacts/abc123/artifacts/checkpoints/checkpoint_epoch_3.00.pt",
-             "LastModified": base_time + timedelta(hours=3)},
-            {"Key": "mlflow-artifacts/abc123/artifacts/checkpoints/checkpoint_epoch_4.00.pt",
-             "LastModified": base_time + timedelta(hours=4)},
-            {"Key": "mlflow-artifacts/abc123/artifacts/checkpoints/checkpoint_epoch_5.00.pt",
-             "LastModified": base_time + timedelta(hours=5)},
+            {
+                "Key": "checkpoints/test-experiment/checkpoint_epoch_1.00.pt",
+                "LastModified": base_time + timedelta(hours=1),
+            },
+            {
+                "Key": "checkpoints/test-experiment/checkpoint_epoch_2.00.pt",
+                "LastModified": base_time + timedelta(hours=2),
+            },
+            {
+                "Key": "checkpoints/test-experiment/checkpoint_epoch_3.00.pt",
+                "LastModified": base_time + timedelta(hours=3),
+            },
+            {
+                "Key": "checkpoints/test-experiment/checkpoint_epoch_4.00.pt",
+                "LastModified": base_time + timedelta(hours=4),
+            },
+            {
+                "Key": "checkpoints/test-experiment/checkpoint_epoch_5.00.pt",
+                "LastModified": base_time + timedelta(hours=5),
+            },
         ]
     }
 
     # S3 정리 실행 (최대 2개 유지 -> 3개 삭제)
     cleanup_s3_checkpoints(
-        experiment_id="1",
-        run_id="abc123",
+        experiment_name="test-experiment",
         save_total_limit=2,
     )
 
@@ -117,36 +118,103 @@ def test_cleanup_s3_checkpoints_success(mock_boto3):
 
     # 삭제된 파일 확인
     deleted_keys = [call.kwargs["Key"] for call in mock_s3.delete_object.call_args_list]
-    assert "mlflow-artifacts/abc123/artifacts/checkpoints/checkpoint_epoch_1.00.pt" in deleted_keys
-    assert "mlflow-artifacts/abc123/artifacts/checkpoints/checkpoint_epoch_2.00.pt" in deleted_keys
-    assert "mlflow-artifacts/abc123/artifacts/checkpoints/checkpoint_epoch_3.00.pt" in deleted_keys
+    assert "checkpoints/test-experiment/checkpoint_epoch_1.00.pt" in deleted_keys
+    assert "checkpoints/test-experiment/checkpoint_epoch_2.00.pt" in deleted_keys
+    assert "checkpoints/test-experiment/checkpoint_epoch_3.00.pt" in deleted_keys
+
+
+@patch("weighted_mtp.utils.s3_utils.boto3")
+def test_cleanup_s3_checkpoints_preserves_special_files(mock_boto3):
+    """checkpoint_best.pt와 checkpoint_final.pt는 삭제하지 않음"""
+    mock_s3 = Mock()
+    mock_boto3.client.return_value = mock_s3
+
+    from datetime import datetime, timedelta
+
+    base_time = datetime(2025, 1, 1)
+
+    # checkpoint_best.pt, checkpoint_final.pt 포함
+    mock_s3.list_objects_v2.return_value = {
+        "Contents": [
+            {
+                "Key": "checkpoints/test-experiment/checkpoint_epoch_1.00.pt",
+                "LastModified": base_time + timedelta(hours=1),
+            },
+            {
+                "Key": "checkpoints/test-experiment/checkpoint_epoch_2.00.pt",
+                "LastModified": base_time + timedelta(hours=2),
+            },
+            {
+                "Key": "checkpoints/test-experiment/checkpoint_best.pt",
+                "LastModified": base_time + timedelta(hours=3),
+            },
+            {
+                "Key": "checkpoints/test-experiment/checkpoint_final.pt",
+                "LastModified": base_time + timedelta(hours=4),
+            },
+        ]
+    }
+
+    # S3 정리 실행 (최대 1개 유지 -> epoch checkpoint 1개만 삭제)
+    cleanup_s3_checkpoints(
+        experiment_name="test-experiment",
+        save_total_limit=1,
+    )
+
+    # checkpoint_epoch_*.pt만 삭제 (1개)
+    assert mock_s3.delete_object.call_count == 1
+
+    # 삭제된 파일 확인 (가장 오래된 epoch checkpoint)
+    deleted_keys = [call.kwargs["Key"] for call in mock_s3.delete_object.call_args_list]
+    assert "checkpoints/test-experiment/checkpoint_epoch_1.00.pt" in deleted_keys
 
 
 @patch("weighted_mtp.utils.s3_utils.boto3")
 def test_cleanup_s3_checkpoints_no_deletion(mock_boto3):
     """삭제할 checkpoint가 없는 경우"""
-    # Mock S3 클라이언트 설정
     mock_s3 = Mock()
     mock_boto3.client.return_value = mock_s3
 
-    # S3 list_objects_v2 응답 mock (2개만 존재)
     from datetime import datetime, timedelta
+
     base_time = datetime(2025, 1, 1)
 
     mock_s3.list_objects_v2.return_value = {
         "Contents": [
-            {"Key": "mlflow-artifacts/abc123/artifacts/checkpoints/checkpoint_epoch_4.00.pt",
-             "LastModified": base_time + timedelta(hours=4)},
-            {"Key": "mlflow-artifacts/abc123/artifacts/checkpoints/checkpoint_epoch_5.00.pt",
-             "LastModified": base_time + timedelta(hours=5)},
+            {
+                "Key": "checkpoints/test-experiment/checkpoint_epoch_4.00.pt",
+                "LastModified": base_time + timedelta(hours=4),
+            },
+            {
+                "Key": "checkpoints/test-experiment/checkpoint_epoch_5.00.pt",
+                "LastModified": base_time + timedelta(hours=5),
+            },
         ]
     }
 
     # S3 정리 실행 (최대 3개 유지 -> 삭제 없음)
     cleanup_s3_checkpoints(
-        experiment_id="1",
-        run_id="abc123",
+        experiment_name="test-experiment",
         save_total_limit=3,
+    )
+
+    # S3 삭제 호출되지 않음
+    mock_s3.delete_object.assert_not_called()
+
+
+@patch("weighted_mtp.utils.s3_utils.boto3")
+def test_cleanup_s3_checkpoints_empty_bucket(mock_boto3):
+    """버킷이 비어있는 경우"""
+    mock_s3 = Mock()
+    mock_boto3.client.return_value = mock_s3
+
+    # Contents 키가 없는 응답
+    mock_s3.list_objects_v2.return_value = {}
+
+    # S3 정리 실행 (예외 없이 완료되어야 함)
+    cleanup_s3_checkpoints(
+        experiment_name="test-experiment",
+        save_total_limit=2,
     )
 
     # S3 삭제 호출되지 않음
@@ -156,98 +224,70 @@ def test_cleanup_s3_checkpoints_no_deletion(mock_boto3):
 @patch("weighted_mtp.utils.s3_utils.boto3")
 def test_cleanup_s3_checkpoints_failure(mock_boto3, caplog):
     """S3 정리 실패 케이스"""
-    # S3 클라이언트 실패 시뮬레이션
     mock_boto3.client.side_effect = Exception("S3 connection error")
 
     # S3 정리 실행 (예외는 캐치되어야 함)
     cleanup_s3_checkpoints(
-        experiment_id="1",
-        run_id="abc123",
+        experiment_name="test-experiment",
         save_total_limit=2,
     )
 
     # 경고 로그 확인
     assert "S3 cleanup failed" in caplog.text
-    assert "S3 connection error" in caplog.text
 
 
 def test_shutdown_s3_executor():
     """S3 executor shutdown 테스트"""
-    # Executor shutdown 실행
     shutdown_s3_executor()
-
     # 테스트 격리를 위해 executor 재생성
     reset_s3_executor()
 
 
-def test_upload_cleans_temp_on_error(temp_checkpoint):
-    """업로드 실패 시에도 임시 디렉터리 정리 확인"""
-    # tempfile mock 설정
-    mock_tmp_instance = MagicMock()
-    mock_tmp_instance.name = "/tmp/checkpoint_upload_test"
-    mock_tmp_instance.cleanup = MagicMock()
+@patch("weighted_mtp.utils.s3_utils.subprocess")
+def test_sync_mlruns_to_s3_success(mock_subprocess, tmp_path):
+    """mlruns 동기화 성공"""
+    # mlruns 디렉터리 생성
+    mlruns_dir = tmp_path / "mlruns"
+    mlruns_dir.mkdir()
 
-    with patch("tempfile.TemporaryDirectory", return_value=mock_tmp_instance):
-        with patch("weighted_mtp.utils.s3_utils.MlflowClient") as mock_client_class:
-            mock_client = MagicMock()
-            mock_client_class.return_value = mock_client
-            mock_client.log_artifact.side_effect = Exception("S3 error")
+    mock_result = Mock()
+    mock_result.returncode = 0
+    mock_subprocess.run.return_value = mock_result
 
-            # 업로드 실행 (예외는 캐치되어야 함)
-            upload_to_s3_async(temp_checkpoint, run_id="test-run-id")
+    result = sync_mlruns_to_s3(mlruns_dir=str(mlruns_dir))
 
-            # cleanup 호출 확인 (에러 발생 시에도)
-            mock_tmp_instance.cleanup.assert_called_once()
+    assert result is True
+    mock_subprocess.run.assert_called_once()
+
+    # aws s3 sync 명령 확인
+    call_args = mock_subprocess.run.call_args[0][0]
+    assert call_args[0] == "aws"
+    assert call_args[1] == "s3"
+    assert call_args[2] == "sync"
 
 
-def test_original_file_deletable_during_upload(tmp_path):
-    """업로드 중 원본 파일 삭제 가능 확인 (핵심 race condition 방지 테스트)"""
-    import time
-    from concurrent.futures import ThreadPoolExecutor
+@patch("weighted_mtp.utils.s3_utils.subprocess")
+def test_sync_mlruns_to_s3_failure(mock_subprocess, tmp_path, caplog):
+    """mlruns 동기화 실패"""
+    mlruns_dir = tmp_path / "mlruns"
+    mlruns_dir.mkdir()
 
-    # 실제 임시 checkpoint 파일 생성
-    checkpoint_path = tmp_path / "checkpoint_epoch_1.00.pt"
-    checkpoint_path.write_bytes(b"test checkpoint data" * 1000)
+    mock_result = Mock()
+    mock_result.returncode = 1
+    mock_result.stderr = "aws cli error"
+    mock_subprocess.run.return_value = mock_result
 
-    upload_completed = False
-    upload_error = None
+    result = sync_mlruns_to_s3(mlruns_dir=str(mlruns_dir))
 
-    def slow_upload_mock(run_id, path, artifact_path):
-        """업로드를 시뮬레이션하는 느린 함수"""
-        nonlocal upload_completed, upload_error
-        try:
-            # 업로드 시뮬레이션 (파일 읽기)
-            time.sleep(0.1)
-            with open(path, 'rb') as f:
-                f.read()
-            upload_completed = True
-        except Exception as e:
-            upload_error = e
+    assert result is False
+    assert "mlruns sync failed" in caplog.text
 
-    # MlflowClient.log_artifact를 slow mock으로 교체
-    with patch("weighted_mtp.utils.s3_utils.MlflowClient") as mock_client_class:
-        mock_client = MagicMock()
-        mock_client_class.return_value = mock_client
-        mock_client.log_artifact.side_effect = slow_upload_mock
 
-        # 백그라운드에서 업로드 시작
-        executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(upload_to_s3_async, checkpoint_path, "test-run-id")
+def test_sync_mlruns_to_s3_directory_not_found(tmp_path, caplog):
+    """mlruns 디렉터리가 없는 경우"""
+    non_existent_dir = tmp_path / "non_existent_mlruns"
 
-        # 짧은 대기 (업로드 시작 확인)
-        time.sleep(0.05)
+    result = sync_mlruns_to_s3(mlruns_dir=str(non_existent_dir))
 
-        # 원본 파일 삭제 시도 (업로드 진행 중)
-        if checkpoint_path.exists():
-            checkpoint_path.unlink()
-
-        # 업로드 완료 대기
-        future.result(timeout=5)
-        executor.shutdown(wait=True)
-
-    # 검증: 원본 파일은 삭제되었어야 함
-    assert not checkpoint_path.exists(), "원본 파일이 삭제되어야 함"
-
-    # 검증: 업로드는 성공했어야 함 (임시 복사본 사용)
-    assert upload_completed, "업로드가 완료되어야 함"
-    assert upload_error is None, f"업로드 에러 발생: {upload_error}"
+    assert result is False
+    assert "mlruns directory not found" in caplog.text

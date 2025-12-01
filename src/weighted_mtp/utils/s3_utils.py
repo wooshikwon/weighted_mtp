@@ -1,100 +1,75 @@
-"""S3 checkpoint 관리 유틸리티
+"""S3 스토리지 유틸리티
 
-비동기 업로드 및 정리 기능 제공
+boto3를 사용한 직접 S3 업로드 및 동기화 기능 제공
+MLflow 서버 없이 독립적으로 동작
 """
 
 import logging
-import shutil
-import tempfile
+import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import boto3
-from mlflow import MlflowClient
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-# 전역 executor (파이프라인 초기화 시 생성)
+# S3 설정
+S3_BUCKET = "wmtp"
+
+# 전역 executor (비동기 업로드용)
 s3_upload_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="s3-upload")
 
 
-def upload_to_s3_async(checkpoint_path: Path, run_id: str) -> None:
-    """임시 복사본을 생성하여 S3에 안전하게 업로드
-
-    원본 파일을 임시 디렉터리에 복사한 후 업로드하여
-    업로드 중 원본 파일 삭제로 인한 race condition 방지
-
-    MlflowClient를 사용하여 별도 스레드에서도 artifact 업로드 가능
-    (mlflow.log_artifact()는 메인 스레드의 active_run 컨텍스트 필요)
+def upload_to_s3_async(checkpoint_path: Path, experiment_name: str) -> None:
+    """체크포인트를 S3에 직접 업로드 (boto3 사용)
 
     Args:
         checkpoint_path: 업로드할 checkpoint 경로
-        run_id: MLflow run ID (스레드에서 사용하기 위해 명시적 전달)
+        experiment_name: 실험 이름 (S3 경로 구성에 사용)
 
-    Note:
-        임시 복사본은 업로드 완료 후 자동 삭제
-        원본 파일과 완전히 독립적으로 동작
-        S3에는 원본 파일명으로 저장됨
+    S3 저장 경로:
+        s3://wmtp/checkpoints/{experiment_name}/{checkpoint_filename}
     """
-    if not run_id:
-        logger.warning(f"S3 upload skipped (no run_id): {checkpoint_path.name}")
+    if not checkpoint_path.exists():
+        logger.warning(f"S3 upload skipped (file not found): {checkpoint_path}")
         return
 
-    tmp_dir = None
     try:
-        # 임시 디렉터리 생성
-        tmp_dir = tempfile.TemporaryDirectory(prefix="checkpoint_upload_")
-        tmp_dir_path = Path(tmp_dir.name)
+        s3 = boto3.client("s3")
+        s3_key = f"checkpoints/{experiment_name}/{checkpoint_path.name}"
 
-        # 원본 파일명 유지하여 복사
-        tmp_checkpoint = tmp_dir_path / checkpoint_path.name
-        shutil.copy2(checkpoint_path, tmp_checkpoint)
-        logger.debug(f"Created temp copy for upload: {tmp_checkpoint}")
+        s3.upload_file(str(checkpoint_path), S3_BUCKET, s3_key)
+        logger.info(f"S3 upload complete: {checkpoint_path.name} -> s3://{S3_BUCKET}/{s3_key}")
 
-        # MlflowClient로 명시적 run_id 사용 (스레드 안전)
-        client = MlflowClient()
-        client.log_artifact(run_id, str(tmp_checkpoint), artifact_path="checkpoints")
-
-        logger.info(f"S3 upload complete: {checkpoint_path.name} -> run_id={run_id}")
-
+    except ClientError as e:
+        logger.error(f"S3 upload failed: {checkpoint_path.name} - {e}")
     except Exception as e:
         logger.error(f"S3 upload failed: {checkpoint_path.name} - {e}")
 
-    finally:
-        # 임시 디렉터리 정리
-        if tmp_dir is not None:
-            try:
-                tmp_dir.cleanup()
-            except Exception:
-                pass  # cleanup 실패는 무시
-
 
 def cleanup_s3_checkpoints(
-    experiment_id: str,
-    run_id: str,
+    experiment_name: str,
     save_total_limit: int,
 ) -> None:
     """S3에서 오래된 checkpoint 삭제
 
-    MLflow artifact store (S3)에서 checkpoint_epoch_*.pt 파일만 정리
+    checkpoint_epoch_*.pt 파일만 정리
     checkpoint_best.pt와 checkpoint_final.pt는 유지
 
     Args:
-        experiment_id: MLflow experiment ID (사용되지 않음, 호환성 유지)
-        run_id: MLflow run ID
+        experiment_name: 실험 이름
         save_total_limit: 유지할 최대 개수
     """
     try:
         s3 = boto3.client("s3")
-        bucket = "wmtp"
-        # MLflow artifact URI 구조: s3://wmtp/mlflow-artifacts/{run_id}/artifacts/
-        prefix = f"mlflow-artifacts/{run_id}/artifacts/checkpoints/"
+        prefix = f"checkpoints/{experiment_name}/"
 
-        # S3에서 checkpoint 목록 직접 조회
-        response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
 
         if "Contents" not in response:
-            return  # checkpoint가 없으면 종료
+            return
 
         # checkpoint_epoch_*.pt 파일만 필터링
         epoch_checkpoints = []
@@ -104,20 +79,110 @@ def cleanup_s3_checkpoints(
             if filename.startswith("checkpoint_epoch_") and filename.endswith(".pt"):
                 epoch_checkpoints.append({"key": key, "last_modified": obj["LastModified"]})
 
-        # 시간순 정렬 (LastModified 기준)
         epoch_checkpoints.sort(key=lambda x: x["last_modified"])
 
-        # 삭제할 파일 개수 계산
         n_to_delete = len(epoch_checkpoints) - save_total_limit
 
         if n_to_delete > 0:
             for checkpoint in epoch_checkpoints[:n_to_delete]:
-                s3.delete_object(Bucket=bucket, Key=checkpoint["key"])
+                s3.delete_object(Bucket=S3_BUCKET, Key=checkpoint["key"])
                 filename = checkpoint["key"].split("/")[-1]
                 logger.info(f"S3 checkpoint deleted: {filename}")
 
     except Exception as e:
         logger.warning(f"S3 cleanup failed: {e}")
+
+
+def sync_mlruns_to_s3(
+    mlruns_dir: Path | str = "./mlruns",
+    experiment_name: str | None = None,
+) -> bool:
+    """mlruns 디렉터리를 S3에 동기화
+
+    학습 종료 후 호출하여 MLflow 메트릭/파라미터를 S3에 백업
+    나중에 로컬로 다운받아 mlflow ui로 확인 가능
+
+    Args:
+        mlruns_dir: mlruns 디렉터리 경로 (기본값: ./mlruns)
+        experiment_name: 실험 이름 (None이면 mlruns 전체 동기화)
+
+    Returns:
+        성공 여부
+
+    S3 저장 경로:
+        s3://wmtp/mlruns/...
+    """
+    mlruns_path = Path(mlruns_dir)
+
+    if not mlruns_path.exists():
+        logger.warning(f"mlruns directory not found: {mlruns_path}")
+        return False
+
+    try:
+        s3_dest = f"s3://{S3_BUCKET}/mlruns/"
+
+        # aws s3 sync 명령 사용 (효율적인 증분 동기화)
+        cmd = ["aws", "s3", "sync", str(mlruns_path), s3_dest, "--quiet"]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+        if result.returncode == 0:
+            logger.info(f"mlruns synced to S3: {s3_dest}")
+            return True
+        else:
+            logger.error(f"mlruns sync failed: {result.stderr}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        logger.error("mlruns sync timeout (300s)")
+        return False
+    except Exception as e:
+        logger.error(f"mlruns sync failed: {e}")
+        return False
+
+
+def sync_checkpoints_to_s3(
+    checkpoint_dir: Path | str,
+    experiment_name: str,
+) -> bool:
+    """체크포인트 디렉터리를 S3에 동기화
+
+    Args:
+        checkpoint_dir: 체크포인트 디렉터리 경로
+        experiment_name: 실험 이름
+
+    Returns:
+        성공 여부
+
+    S3 저장 경로:
+        s3://wmtp/checkpoints/{experiment_name}/...
+    """
+    checkpoint_path = Path(checkpoint_dir)
+
+    if not checkpoint_path.exists():
+        logger.warning(f"Checkpoint directory not found: {checkpoint_path}")
+        return False
+
+    try:
+        s3_dest = f"s3://{S3_BUCKET}/checkpoints/{experiment_name}/"
+
+        cmd = ["aws", "s3", "sync", str(checkpoint_path), s3_dest, "--quiet"]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+        if result.returncode == 0:
+            logger.info(f"Checkpoints synced to S3: {s3_dest}")
+            return True
+        else:
+            logger.error(f"Checkpoints sync failed: {result.stderr}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        logger.error("Checkpoints sync timeout (600s)")
+        return False
+    except Exception as e:
+        logger.error(f"Checkpoints sync failed: {e}")
+        return False
 
 
 def shutdown_s3_executor() -> None:

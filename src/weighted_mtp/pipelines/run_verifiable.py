@@ -26,6 +26,7 @@ from weighted_mtp.utils import (
     GPUMonitor,
     ThroughputTracker,
     cleanup_old_checkpoints,
+    cleanup_s3_checkpoints,
     compute_gradient_clip_stats,
     compute_mtp_ce_loss,
     compute_value_function_stats,
@@ -36,6 +37,7 @@ from weighted_mtp.utils import (
     save_checkpoint,
     save_lora_checkpoint,
     shutdown_s3_executor,
+    sync_mlruns_to_s3,
 )
 from weighted_mtp.runtime import (
     init_distributed,
@@ -256,6 +258,7 @@ def run_verifiable_training(
 
     # 4. MLflow 초기화
     use_mlflow = bool(config.mlflow.experiment)
+    use_s3_upload = config.checkpoint.get("s3_upload", True) and use_mlflow
     mlflow_run_id = None
     if is_main_process() and use_mlflow:
         mlflow.set_tracking_uri(config.mlflow.tracking_uri)
@@ -696,6 +699,8 @@ def run_verifiable_training(
                     val_metrics=aggregated_val_metrics,
                     checkpoint_path=checkpoint_path,
                     config={"model": {"path": config.models.policy.path}},
+                    s3_upload=use_s3_upload,
+                    experiment_name=config.experiment.name,
                 )
             else:
                 save_checkpoint(
@@ -706,6 +711,8 @@ def run_verifiable_training(
                     val_metrics=aggregated_val_metrics,
                     checkpoint_path=checkpoint_path,
                     config={"model": {"path": config.models.policy.path}},
+                    s3_upload=use_s3_upload,
+                    experiment_name=config.experiment.name,
                 )
 
             # 로깅 및 cleanup은 rank 0만 수행
@@ -717,6 +724,12 @@ def run_verifiable_training(
                         checkpoint_dir=checkpoint_dir,
                         save_total_limit=config.checkpoint.save_total_limit,
                     )
+
+                    if use_s3_upload:
+                        cleanup_s3_checkpoints(
+                            experiment_name=config.experiment.name,
+                            save_total_limit=config.checkpoint.save_total_limit,
+                        )
         else:
             logger.info(f"Validation loss did not improve ({avg_val_unweighted_ce:.4f} >= {best_val_loss:.4f})")
 
@@ -761,6 +774,8 @@ def run_verifiable_training(
                 val_metrics=final_aggregated,
                 checkpoint_path=final_path,
                 config={"model": {"path": config.models.policy.path}},
+                s3_upload=use_s3_upload,
+                experiment_name=config.experiment.name,
             )
         else:
             save_checkpoint(
@@ -771,6 +786,8 @@ def run_verifiable_training(
                 val_metrics=final_aggregated,
                 checkpoint_path=final_path,
                 config={"model": {"path": config.models.policy.path}},
+                s3_upload=use_s3_upload,
+                experiment_name=config.experiment.name,
             )
 
         if is_main_process():
@@ -780,6 +797,10 @@ def run_verifiable_training(
     shutdown_s3_executor()
     if is_main_process() and use_mlflow:
         mlflow.end_run()
+
+        # MLflow 메트릭/파라미터 S3 백업
+        if use_s3_upload:
+            sync_mlruns_to_s3()
 
     epoch_checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"))
     latest_checkpoint_path = str(epoch_checkpoints[-1]) if epoch_checkpoints else None

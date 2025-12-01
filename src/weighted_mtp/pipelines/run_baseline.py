@@ -30,10 +30,10 @@ from weighted_mtp.utils import (
     create_scheduler,
     get_model_size,
     get_system_info,
-    s3_upload_executor,
     save_checkpoint,
     save_lora_checkpoint,
     shutdown_s3_executor,
+    sync_mlruns_to_s3,
 )
 from weighted_mtp.runtime import (
     init_distributed,
@@ -573,7 +573,7 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
                     checkpoint_path=checkpoint_path,
                     config={"model": {"path": config.models.policy.path}},
                     s3_upload=use_s3_upload,
-                    mlflow_run_id=mlflow_run_id,
+                    experiment_name=config.experiment.name,
                 )
             else:
                 save_checkpoint(
@@ -585,7 +585,7 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
                     checkpoint_path=checkpoint_path,
                     config={"model": {"path": config.models.policy.path}},
                     s3_upload=use_s3_upload,
-                    mlflow_run_id=mlflow_run_id,
+                    experiment_name=config.experiment.name,
                 )
 
             # 로깅 및 cleanup은 rank 0만 수행
@@ -599,10 +599,8 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
                     )
 
                     if use_s3_upload:
-                        s3_upload_executor.submit(
-                            cleanup_s3_checkpoints,
-                            experiment_id=mlflow.active_run().info.experiment_id,
-                            run_id=mlflow.active_run().info.run_id,
+                        cleanup_s3_checkpoints(
+                            experiment_name=config.experiment.name,
                             save_total_limit=config.checkpoint.save_total_limit,
                         )
         else:
@@ -639,7 +637,7 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
                 checkpoint_path=final_path,
                 config={"model": {"path": config.models.policy.path}},
                 s3_upload=use_s3_upload,
-                mlflow_run_id=mlflow_run_id,
+                experiment_name=config.experiment.name,
             )
         else:
             save_checkpoint(
@@ -651,7 +649,7 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
                 checkpoint_path=final_path,
                 config={"model": {"path": config.models.policy.path}},
                 s3_upload=use_s3_upload,
-                mlflow_run_id=mlflow_run_id,
+                experiment_name=config.experiment.name,
             )
 
         if is_main_process():
@@ -661,6 +659,10 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
     shutdown_s3_executor()
     if is_main_process() and use_mlflow:
         mlflow.end_run()
+
+        # MLflow 메트릭/파라미터 S3 백업
+        if use_s3_upload:
+            sync_mlruns_to_s3()
 
     # 최신 checkpoint 경로 반환
     epoch_checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"))

@@ -2,6 +2,8 @@
 
 save_total_limit 설정 시 S3 업로드 중 로컬 checkpoint 삭제로 인한
 race condition이 발생하지 않는지 검증
+
+boto3 직접 사용 방식으로 리팩토링됨
 """
 
 import time
@@ -27,7 +29,7 @@ def test_race_condition_prevented(tmp_path):
     2. S3 업로드 시작 (비동기)
     3. 두 번째 checkpoint 저장 (더 좋음)
     4. cleanup 즉시 실행 → 첫 번째 checkpoint 삭제
-    5. S3 업로드는 예외 없이 완료되어야 함 (임시 복사본 사용)
+    5. S3 업로드는 예외 없이 완료되어야 함
     """
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
@@ -52,27 +54,27 @@ def test_race_condition_prevented(tmp_path):
     upload_completed = False
     upload_error = None
 
-    def slow_upload_mock(run_id, path, artifact_path):
+    def slow_upload_mock(local_path, bucket, s3_key):
         """느린 업로드 시뮬레이션 (파일 읽기)"""
         nonlocal upload_completed, upload_error
         try:
             # 업로드 시뮬레이션
             time.sleep(0.2)  # 업로드 시간 시뮬레이션
-            with open(path, 'rb') as f:
+            with open(local_path, 'rb') as f:
                 f.read()
             upload_completed = True
         except Exception as e:
             upload_error = e
 
-    # MlflowClient mock
-    with patch("weighted_mtp.utils.s3_utils.MlflowClient") as mock_client_class:
-        mock_client = MagicMock()
-        mock_client_class.return_value = mock_client
-        mock_client.log_artifact.side_effect = slow_upload_mock
+    # boto3 mock
+    with patch("weighted_mtp.utils.s3_utils.boto3") as mock_boto3:
+        mock_s3 = MagicMock()
+        mock_boto3.client.return_value = mock_s3
+        mock_s3.upload_file.side_effect = slow_upload_mock
 
-        # S3 업로드 시작 (비동기, run_id 사용)
+        # S3 업로드 시작 (비동기, experiment_name 사용)
         upload_future = s3_utils.s3_upload_executor.submit(
-            upload_to_s3_async, checkpoint1, "test-run-id"
+            upload_to_s3_async, checkpoint1, "test-experiment"
         )
 
         # 짧은 대기 (업로드 시작 확인)
@@ -121,16 +123,16 @@ def test_multiple_checkpoints_race_condition(tmp_path):
     upload_futures = []
 
     # 간단한 mock (실제 업로드 시뮬레이션)
-    def simple_upload_mock(run_id, path, artifact_path):
+    def simple_upload_mock(local_path, bucket, s3_key):
         time.sleep(0.05)
-        with open(path, 'rb') as f:
+        with open(local_path, 'rb') as f:
             f.read()
 
-    # MlflowClient mock
-    with patch("weighted_mtp.utils.s3_utils.MlflowClient") as mock_client_class:
-        mock_client = MagicMock()
-        mock_client_class.return_value = mock_client
-        mock_client.log_artifact.side_effect = simple_upload_mock
+    # boto3 mock
+    with patch("weighted_mtp.utils.s3_utils.boto3") as mock_boto3:
+        mock_s3 = MagicMock()
+        mock_boto3.client.return_value = mock_s3
+        mock_s3.upload_file.side_effect = simple_upload_mock
 
         # 5개 checkpoint 빠르게 생성
         for i in range(5):
@@ -145,9 +147,9 @@ def test_multiple_checkpoints_race_condition(tmp_path):
             )
             checkpoints.append(checkpoint_path)
 
-            # S3 업로드 시작 (비동기, run_id 사용)
+            # S3 업로드 시작 (비동기, experiment_name 사용)
             future = s3_utils.s3_upload_executor.submit(
-                upload_to_s3_async, checkpoint_path, "test-run-id"
+                upload_to_s3_async, checkpoint_path, "test-experiment"
             )
             upload_futures.append(future)
 

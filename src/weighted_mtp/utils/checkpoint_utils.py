@@ -22,7 +22,7 @@ def save_checkpoint(
     checkpoint_path: Path | str,
     config: dict | None = None,
     s3_upload: bool = False,
-    mlflow_run_id: str | None = None,
+    experiment_name: str | None = None,
     td_ema_state: dict | None = None,
 ) -> None:
     """Checkpoint 저장 (FSDP 지원, S3 업로드 옵션)
@@ -38,8 +38,8 @@ def save_checkpoint(
         val_metrics: Validation metrics
         checkpoint_path: 저장 경로
         config: 학습 설정 정보 (모델 경로 등, 평가 시 필요)
-        s3_upload: S3 업로드 여부 (MLflow artifact로 업로드)
-        mlflow_run_id: MLflow run ID (S3 업로드 시 스레드 안전을 위해 필요)
+        s3_upload: S3 업로드 여부
+        experiment_name: 실험 이름 (S3 경로 구성에 사용)
         td_ema_state: TD EMA 통계 state dict (TDStatsEMA.state_dict())
 
     Saved checkpoint format:
@@ -96,13 +96,13 @@ def save_checkpoint(
     logger.info(f"  Epoch: {epoch}")
     logger.info(f"  Val loss: {val_metrics.get('val_loss', 'N/A')}")
 
-    # S3 업로드 (비동기, MlflowClient 사용)
-    if s3_upload and mlflow_run_id:
+    # S3 업로드 (비동기, boto3 직접 사용)
+    if s3_upload and experiment_name:
         from weighted_mtp.utils.s3_utils import s3_upload_executor, upload_to_s3_async
-        s3_upload_executor.submit(upload_to_s3_async, checkpoint_path, mlflow_run_id)
-        logger.info(f"S3 업로드 예약: {checkpoint_path.name} -> run_id={mlflow_run_id}")
-    elif s3_upload and not mlflow_run_id:
-        logger.warning(f"S3 업로드 건너뜀 (run_id 없음): {checkpoint_path.name}")
+        s3_upload_executor.submit(upload_to_s3_async, checkpoint_path, experiment_name)
+        logger.info(f"S3 업로드 예약: {checkpoint_path.name}")
+    elif s3_upload and not experiment_name:
+        logger.warning(f"S3 업로드 건너뜀 (experiment_name 없음): {checkpoint_path.name}")
 
 
 def load_checkpoint_for_evaluation(
@@ -265,7 +265,7 @@ def save_lora_checkpoint(
     checkpoint_path: Path | str,
     config: dict | None = None,
     s3_upload: bool = False,
-    mlflow_run_id: str | None = None,
+    experiment_name: str | None = None,
     save_value_head: bool = True,
     td_ema_state: dict | None = None,
 ) -> None:
@@ -287,7 +287,7 @@ def save_lora_checkpoint(
         checkpoint_path: 저장 경로
         config: 학습 설정 정보 (base model 경로 등)
         s3_upload: S3 업로드 여부
-        mlflow_run_id: MLflow run ID
+        experiment_name: 실험 이름 (S3 경로 구성에 사용)
         save_value_head: Value head도 함께 저장할지 여부
         td_ema_state: TD EMA 통계 state dict (TDStatsEMA.state_dict())
 
@@ -402,13 +402,13 @@ def save_lora_checkpoint(
     logger.info(f"  Epoch: {epoch}")
     logger.info(f"  Val loss: {val_metrics.get('val_loss', 'N/A')}")
 
-    # S3 업로드 (비동기)
-    if s3_upload and mlflow_run_id:
+    # S3 업로드 (비동기, boto3 직접 사용)
+    if s3_upload and experiment_name:
         from weighted_mtp.utils.s3_utils import s3_upload_executor, upload_to_s3_async
-        s3_upload_executor.submit(upload_to_s3_async, checkpoint_path, mlflow_run_id)
+        s3_upload_executor.submit(upload_to_s3_async, checkpoint_path, experiment_name)
         logger.info(f"S3 업로드 예약: {checkpoint_path.name}")
-    elif s3_upload and not mlflow_run_id:
-        logger.warning(f"S3 업로드 건너뜀 (run_id 없음): {checkpoint_path.name}")
+    elif s3_upload and not experiment_name:
+        logger.warning(f"S3 업로드 건너뜀 (experiment_name 없음): {checkpoint_path.name}")
 
 
 def save_value_model_checkpoint(
@@ -420,7 +420,7 @@ def save_value_model_checkpoint(
     checkpoint_path: Path | str,
     config: Any = None,
     s3_upload: bool = False,
-    mlflow_run_id: str | None = None,
+    experiment_name: str | None = None,
 ) -> None:
     """Value Model checkpoint 저장 (FSDP 지원)
 
@@ -440,7 +440,7 @@ def save_value_model_checkpoint(
         checkpoint_path: 저장 경로
         config: 학습 설정 (OmegaConf DictConfig 또는 dict)
         s3_upload: S3 업로드 여부
-        mlflow_run_id: MLflow run ID (S3 업로드 시 필요)
+        experiment_name: 실험 이름 (S3 경로 구성에 사용)
 
     Saved checkpoint format (LoRA mode):
         {
@@ -580,13 +580,13 @@ def save_value_model_checkpoint(
     logger.info(f"  Val loss: {val_metrics.get('val_loss', 'N/A')}")
     logger.info(f"  Mode: {'LoRA' if use_lora else 'Full'}")
 
-    # S3 업로드 (비동기)
-    if s3_upload and mlflow_run_id:
+    # S3 업로드 (비동기, boto3 직접 사용)
+    if s3_upload and experiment_name:
         from weighted_mtp.utils.s3_utils import s3_upload_executor, upload_to_s3_async
-        s3_upload_executor.submit(upload_to_s3_async, checkpoint_path, mlflow_run_id)
+        s3_upload_executor.submit(upload_to_s3_async, checkpoint_path, experiment_name)
         logger.info(f"S3 업로드 예약: {checkpoint_path.name}")
-    elif s3_upload and not mlflow_run_id:
-        logger.warning(f"S3 업로드 건너뜀 (run_id 없음): {checkpoint_path.name}")
+    elif s3_upload and not experiment_name:
+        logger.warning(f"S3 업로드 건너뜀 (experiment_name 없음): {checkpoint_path.name}")
 
 
 def load_lora_checkpoint(

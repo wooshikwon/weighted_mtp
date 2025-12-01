@@ -45,6 +45,8 @@ from weighted_mtp.utils.s3_utils import (
     reset_s3_executor,
     s3_upload_executor,
     shutdown_s3_executor,
+    sync_checkpoints_to_s3,
+    sync_mlruns_to_s3,
     upload_to_s3_async,
 )
 from weighted_mtp.utils.scheduler_utils import (
@@ -98,6 +100,8 @@ __all__ = [
     "reset_s3_executor",
     "s3_upload_executor",
     "shutdown_s3_executor",
+    "sync_checkpoints_to_s3",
+    "sync_mlruns_to_s3",
     "upload_to_s3_async",
     # Logging utils
     "compute_classification_metrics_from_counts",

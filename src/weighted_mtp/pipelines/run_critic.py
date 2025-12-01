@@ -37,6 +37,7 @@ from weighted_mtp.utils import (
     get_system_info,
     save_value_model_checkpoint,
     shutdown_s3_executor,
+    sync_mlruns_to_s3,
 )
 from weighted_mtp.runtime import (
     init_distributed,
@@ -929,7 +930,7 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
                 checkpoint_path=checkpoint_path,
                 config=config,
                 s3_upload=use_s3_upload,
-                mlflow_run_id=mlflow_run_id,
+                experiment_name=config.experiment.name,
             )
 
             # 로깅 및 cleanup은 rank 0만 수행
@@ -942,10 +943,9 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
                         save_total_limit=config.checkpoint.save_total_limit,
                     )
 
-                    if use_s3_upload and mlflow_run_id:
+                    if use_s3_upload:
                         cleanup_s3_checkpoints(
-                            experiment_id=None,
-                            run_id=mlflow_run_id,
+                            experiment_name=config.experiment.name,
                             save_total_limit=config.checkpoint.save_total_limit,
                         )
         else:
@@ -1003,7 +1003,7 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             checkpoint_path=final_path,
             config=config,
             s3_upload=use_s3_upload,
-            mlflow_run_id=mlflow_run_id,
+            experiment_name=config.experiment.name,
         )
 
         if is_main_process():
@@ -1013,6 +1013,10 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
     shutdown_s3_executor()
     if is_main_process() and use_mlflow:
         mlflow.end_run()
+
+        # MLflow 메트릭/파라미터 S3 백업
+        if use_s3_upload:
+            sync_mlruns_to_s3()
 
     epoch_checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"))
     latest_checkpoint_path = str(epoch_checkpoints[-1]) if epoch_checkpoints else None
