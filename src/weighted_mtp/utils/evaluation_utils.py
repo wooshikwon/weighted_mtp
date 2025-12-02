@@ -119,6 +119,99 @@ def execute_mbpp_tests(
     return passed
 
 
+def execute_codecontests_tests(
+    code: str,
+    tests: dict,
+    timeout: int = 10,
+) -> dict:
+    """CodeContests 형식의 테스트 실행
+
+    stdin으로 입력을 전달하고 stdout 출력을 expected와 비교.
+
+    Args:
+        code: 생성된 Python 코드
+        tests: {"input": [str, ...], "output": [str, ...]}
+        timeout: 테스트당 실행 제한 시간 (초)
+
+    Returns:
+        {
+            "passed": int,
+            "total": int,
+            "pass_rate": float,
+            "details": [{"input": str, "expected": str, "actual": str, "passed": bool}, ...]
+        }
+    """
+    inputs = tests.get("input", [])
+    expected_outputs = tests.get("output", [])
+
+    if not inputs or not expected_outputs:
+        return {
+            "passed": 0,
+            "total": 0,
+            "pass_rate": 0.0,
+            "details": [],
+        }
+
+    # 임시 파일로 코드 저장
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write(code)
+        temp_path = f.name
+
+    results = []
+    passed_count = 0
+
+    try:
+        for test_input, expected in zip(inputs, expected_outputs):
+            try:
+                # subprocess로 실행, stdin에 입력 전달
+                result = subprocess.run(
+                    ['python', temp_path],
+                    input=test_input,
+                    capture_output=True,
+                    timeout=timeout,
+                    text=True,
+                )
+
+                actual = result.stdout
+                # 출력 비교 (trailing whitespace 무시)
+                is_passed = actual.strip() == expected.strip()
+
+                if is_passed:
+                    passed_count += 1
+
+                results.append({
+                    "input": test_input[:100] + "..." if len(test_input) > 100 else test_input,
+                    "expected": expected[:100] + "..." if len(expected) > 100 else expected,
+                    "actual": actual[:100] + "..." if len(actual) > 100 else actual,
+                    "passed": is_passed,
+                })
+
+            except subprocess.TimeoutExpired:
+                results.append({
+                    "input": test_input[:100] + "..." if len(test_input) > 100 else test_input,
+                    "expected": expected[:100] + "..." if len(expected) > 100 else expected,
+                    "actual": "[TIMEOUT]",
+                    "passed": False,
+                })
+            except Exception as e:
+                results.append({
+                    "input": test_input[:100] + "..." if len(test_input) > 100 else test_input,
+                    "expected": expected[:100] + "..." if len(expected) > 100 else expected,
+                    "actual": f"[ERROR: {str(e)[:50]}]",
+                    "passed": False,
+                })
+    finally:
+        Path(temp_path).unlink(missing_ok=True)
+
+    total = len(inputs)
+    return {
+        "passed": passed_count,
+        "total": total,
+        "pass_rate": passed_count / total if total > 0 else 0.0,
+        "details": results,
+    }
+
+
 def extract_gsm8k_answer(text: str) -> str | None:
     """GSM8K 형식의 텍스트에서 최종 답 추출
 

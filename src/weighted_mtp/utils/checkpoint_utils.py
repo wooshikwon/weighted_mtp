@@ -108,6 +108,8 @@ def save_checkpoint(
 def load_checkpoint_for_evaluation(
     checkpoint_path: Path,
     device: torch.device,
+    inference_only: bool = True,
+    dtype: torch.dtype | None = None,
 ):
     """평가용 checkpoint 로드 (full 또는 LoRA checkpoint 자동 감지)
 
@@ -118,6 +120,9 @@ def load_checkpoint_for_evaluation(
     Args:
         checkpoint_path: Checkpoint 파일 경로
         device: torch.device
+        inference_only: True면 extra_heads, value_head 로드 스킵 (메모리 절약 ~1.2GB)
+                       평가/추론 시에는 head 0만 사용하므로 True 권장
+        dtype: 모델 dtype 지정 (None이면 원본 유지, MPS는 bfloat16 미지원으로 float16 권장)
 
     Returns:
         (model, checkpoint_metadata)
@@ -133,14 +138,17 @@ def load_checkpoint_for_evaluation(
         KeyError: checkpoint에 필수 키가 없음
 
     Examples:
+        >>> # 기본 사용 (inference_only=True, 메모리 최적화)
         >>> model, metadata = load_checkpoint_for_evaluation(
         ...     checkpoint_path=Path("storage/checkpoints/baseline/checkpoint_best.pt"),
         ...     device=torch.device("cpu"),
         ... )
-        >>> print(metadata["epoch"])
-        5.0
-        >>> print(metadata["val_metrics"]["val_loss"])
-        2.34
+        >>> # MPS (Apple Silicon) 사용 시
+        >>> model, metadata = load_checkpoint_for_evaluation(
+        ...     checkpoint_path=Path("checkpoint.pt"),
+        ...     device=torch.device("mps"),
+        ...     dtype=torch.float16,  # MPS는 bfloat16 미지원
+        ... )
     """
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint 파일이 존재하지 않습니다: {checkpoint_path}")
@@ -174,20 +182,35 @@ def load_checkpoint_for_evaluation(
             lora_config=lora_config,
         )
 
-        # LoRA + extra_heads + value_head 적용
+        # LoRA 파라미터 적용 (필수)
         current_state_dict = model.state_dict()
 
         for key, value in checkpoint.get("lora_state_dict", {}).items():
             if key in current_state_dict:
                 current_state_dict[key] = value
 
-        for key, value in checkpoint.get("extra_heads_state_dict", {}).items():
-            if key in current_state_dict:
-                current_state_dict[key] = value
+        # extra_heads, value_head 적용 (inference_only=False일 때만)
+        skipped_params = 0
+        if not inference_only:
+            for key, value in checkpoint.get("extra_heads_state_dict", {}).items():
+                if key in current_state_dict:
+                    current_state_dict[key] = value
 
-        for key, value in checkpoint.get("value_head_state_dict", {}).items():
-            if key in current_state_dict:
-                current_state_dict[key] = value
+            for key, value in checkpoint.get("value_head_state_dict", {}).items():
+                if key in current_state_dict:
+                    current_state_dict[key] = value
+        else:
+            # 스킵된 파라미터 수 계산 (로깅용)
+            extra_heads_params = sum(
+                v.numel() for v in checkpoint.get("extra_heads_state_dict", {}).values()
+            )
+            value_head_params = sum(
+                v.numel() for v in checkpoint.get("value_head_state_dict", {}).values()
+            )
+            skipped_params = extra_heads_params + value_head_params
+            if skipped_params > 0:
+                skipped_mb = skipped_params * 2 / 1024 / 1024  # bfloat16 기준
+                logger.info(f"inference_only=True: extra_heads/value_head 스킵 ({skipped_params:,} params, ~{skipped_mb:.0f}MB 절약)")
 
         model.load_state_dict(current_state_dict)
         logger.info("LoRA checkpoint 적용 완료")
@@ -210,6 +233,11 @@ def load_checkpoint_for_evaluation(
         logger.info("Full checkpoint 적용 완료")
 
     model.eval()
+
+    # dtype 변환 (MPS는 bfloat16 미지원, float16 사용 권장)
+    if dtype is not None:
+        model = model.to(dtype=dtype)
+        logger.info(f"모델 dtype 변환: {dtype}")
 
     # Metadata 구성
     checkpoint_metadata = {

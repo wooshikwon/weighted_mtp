@@ -33,7 +33,7 @@ def main():
         "--dataset",
         type=str,
         default="humaneval",
-        choices=["humaneval", "mbpp", "codecontests"],
+        choices=["humaneval", "mbpp", "gsm8k", "codecontests"],
         help="평가 데이터셋 (기본: humaneval)",
     )
 
@@ -51,6 +51,12 @@ def main():
         help="Sampling temperature (0=greedy, 기본: 0.2)",
     )
     parser.add_argument(
+        "--temperature-search",
+        type=str,
+        default=None,
+        help="Temperature 탐색 범위 (예: '0.5,0.6,0.7,0.8,0.9'). 지정 시 --temperature 무시",
+    )
+    parser.add_argument(
         "--max-tokens",
         type=int,
         default=512,
@@ -63,6 +69,13 @@ def main():
         type=str,
         default="auto",
         help="디바이스 (cuda, cpu, mps, auto, 기본: auto)",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default=None,
+        choices=["float16", "bfloat16"],
+        help="모델 dtype (MPS는 bfloat16 미지원, float16 권장)",
     )
     parser.add_argument(
         "--no-mlflow",
@@ -86,35 +99,81 @@ def main():
         logger.error(f"Checkpoint 파일을 찾을 수 없습니다: {args.checkpoint}")
         sys.exit(1)
 
-    logger.info("=== 평가 파이프라인 시작 ===")
-    logger.info(f"Checkpoint: {args.checkpoint}")
-    logger.info(f"Dataset: {args.dataset}")
+    # Temperature search 모드 확인
+    if args.temperature_search:
+        temperatures = [float(t.strip()) for t in args.temperature_search.split(",")]
+        logger.info("=== Temperature Search 모드 ===")
+        logger.info(f"Checkpoint: {args.checkpoint}")
+        logger.info(f"Dataset: {args.dataset}")
+        logger.info(f"Temperatures: {temperatures}")
+    else:
+        temperatures = [args.temperature]
+        logger.info("=== 평가 파이프라인 시작 ===")
+        logger.info(f"Checkpoint: {args.checkpoint}")
+        logger.info(f"Dataset: {args.dataset}")
+        logger.info(f"Temperature: {args.temperature}")
+
     logger.info(f"Samples per task: {args.num_samples}")
-    logger.info(f"Temperature: {args.temperature}")
     logger.info(f"Max tokens: {args.max_tokens}")
     logger.info(f"Device: {args.device}")
+    logger.info(f"dtype: {args.dtype or 'auto'}")
     logger.info(f"MLflow: {'disabled' if args.no_mlflow else 'enabled'}")
 
     # Run evaluation
     try:
-        results = run_evaluation(
-            checkpoint_path=args.checkpoint,
-            dataset_name=args.dataset,
-            num_samples_per_task=args.num_samples,
-            temperature=args.temperature,
-            max_new_tokens=args.max_tokens,
-            device=args.device,
-            mlflow_enabled=not args.no_mlflow,
-            max_tasks=args.max_tasks,
-        )
+        all_results = []
 
-        # Print summary
-        print("\n" + "=" * 50)
-        print("평가 결과 요약")
-        print("=" * 50)
-        for k, v in results["pass_at_k"].items():
-            print(f"{k}: {v:.2%}")
-        print("=" * 50)
+        for temp in temperatures:
+            if len(temperatures) > 1:
+                logger.info(f"\n--- Temperature {temp} 평가 시작 ---")
+
+            results = run_evaluation(
+                checkpoint_path=args.checkpoint,
+                dataset_name=args.dataset,
+                num_samples_per_task=args.num_samples,
+                temperature=temp,
+                max_new_tokens=args.max_tokens,
+                device=args.device,
+                dtype=args.dtype,
+                mlflow_enabled=not args.no_mlflow,
+                max_tasks=args.max_tasks,
+            )
+            results["temperature"] = temp
+            all_results.append(results)
+
+        # Temperature Search 결과 출력
+        if len(temperatures) > 1:
+            print("\n" + "=" * 60)
+            print("Temperature Search 결과")
+            print("=" * 60)
+
+            # 각 temperature 결과
+            for r in all_results:
+                temp = r["temperature"]
+                pass1 = r["pass_at_k"].get("pass@1", 0)
+                print(f"Temperature {temp}: pass@1 = {pass1:.2%}")
+
+            # 최적 temperature 찾기 (pass@1 기준)
+            best_result = max(all_results, key=lambda x: x["pass_at_k"].get("pass@1", 0))
+            best_temp = best_result["temperature"]
+
+            print("=" * 60)
+            print(f"최적 Temperature: {best_temp}")
+            print("=" * 60)
+            for k, v in best_result["pass_at_k"].items():
+                print(f"{k}: {v:.2%}")
+            print("=" * 60)
+
+            results = best_result
+        else:
+            # 단일 temperature 결과 출력
+            print("\n" + "=" * 50)
+            print("평가 결과 요약")
+            print("=" * 50)
+            for k, v in results["pass_at_k"].items():
+                print(f"{k}: {v:.2%}")
+            print("=" * 50)
+
         print(f"총 평가 태스크: {len(results['per_task'])}")
         print(f"Checkpoint epoch: {results['checkpoint_metadata']['epoch']}")
         print(f"Checkpoint val_loss: {results['checkpoint_metadata']['val_metrics']['val_loss']:.4f}")

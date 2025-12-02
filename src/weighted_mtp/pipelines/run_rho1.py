@@ -132,6 +132,7 @@ def load_reference_model(config: dict, device: torch.device) -> nn.Module:
                 base_model_path,
                 torch_dtype=dtype,
                 low_cpu_mem_usage=True,
+                attn_implementation="sdpa",
             ).to(device)
 
             # LoRA 적용
@@ -156,6 +157,7 @@ def load_reference_model(config: dict, device: torch.device) -> nn.Module:
             checkpoint_path,
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
+            attn_implementation="sdpa",
         ).to(device)
 
     # Eval mode (gradient 불필요)

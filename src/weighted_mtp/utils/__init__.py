@@ -18,6 +18,7 @@ from weighted_mtp.utils.evaluation_utils import (
     evaluate_gsm8k_answer,
     evaluate_pass_at_k,
     execute_code_with_tests,
+    execute_codecontests_tests,
     execute_mbpp_tests,
     extract_gsm8k_answer,
 )
@@ -85,6 +86,7 @@ __all__ = [
     "evaluate_gsm8k_answer",
     "evaluate_pass_at_k",
     "execute_code_with_tests",
+    "execute_codecontests_tests",
     "execute_mbpp_tests",
     "extract_gsm8k_answer",
     # Generation utils

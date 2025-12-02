@@ -111,11 +111,45 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        # KV cache (동적 생성으로 변경, device-agnostic)
-        self.cache_k = None
-        self.cache_v = None
-        self.max_batch_size = args.max_batch_size
-        self.max_seq_len = args.max_seq_len
+        # KV cache (setup_caches()로 초기화)
+        self.cache_k: Optional[torch.Tensor] = None
+        self.cache_v: Optional[torch.Tensor] = None
+        self._cache_batch_size: int = 0
+        self._cache_seq_len: int = 0
+
+    def setup_caches(
+        self,
+        max_batch_size: int,
+        max_seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        """KV cache 사전 할당 (inference 시작 전 1회 호출)
+
+        Args:
+            max_batch_size: 최대 batch 크기 (inference 시 보통 1 또는 num_return_sequences)
+            max_seq_len: 최대 시퀀스 길이
+            dtype: 텐서 dtype
+            device: 텐서 device
+        """
+        self.cache_k = torch.zeros(
+            (max_batch_size, max_seq_len, self.n_kv_heads, self.head_dim),
+            dtype=dtype,
+            device=device,
+        )
+        self.cache_v = torch.zeros(
+            (max_batch_size, max_seq_len, self.n_kv_heads, self.head_dim),
+            dtype=dtype,
+            device=device,
+        )
+        self._cache_batch_size = max_batch_size
+        self._cache_seq_len = max_seq_len
+
+    def reset_caches(self) -> None:
+        """KV cache 초기화 (새 시퀀스 생성 전 호출)"""
+        if self.cache_k is not None:
+            self.cache_k.zero_()
+            self.cache_v.zero_()
 
     def forward(
         self,
@@ -133,8 +167,8 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        # Training: Flash Attention (start_pos=0, seqlen>1)
-        if start_pos == 0 and seqlen > 1:
+        # Training mode: Flash Attention (KV cache 미사용)
+        if self.training:
             keys = repeat_kv(xk, self.n_rep)
             values = repeat_kv(xv, self.n_rep)
 
@@ -150,24 +184,22 @@ class Attention(nn.Module):
             )
             output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
-        # Inference: KV cache 사용
+        # Inference mode: KV cache 사용 (prefill + decode 모두)
         else:
-            # KV cache 동적 생성 (device-agnostic)
-            if self.cache_k is None or self.cache_k.device != x.device:
-                self.cache_k = torch.zeros(
-                    (self.max_batch_size, self.max_seq_len, self.n_kv_heads, self.head_dim),
+            # KV cache가 setup되지 않은 경우 동적 생성 (fallback)
+            if self.cache_k is None:
+                self.setup_caches(
+                    max_batch_size=bsz,
+                    max_seq_len=2048,  # 기본값
                     dtype=x.dtype,
-                    device=x.device
-                )
-                self.cache_v = torch.zeros(
-                    (self.max_batch_size, self.max_seq_len, self.n_kv_heads, self.head_dim),
-                    dtype=x.dtype,
-                    device=x.device
+                    device=x.device,
                 )
 
+            # KV cache 업데이트
             self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
             self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
+            # 캐시에서 필요한 범위 읽기
             keys = self.cache_k[:bsz, : start_pos + seqlen]
             values = self.cache_v[:bsz, : start_pos + seqlen]
 
@@ -178,11 +210,23 @@ class Attention(nn.Module):
             keys = keys.transpose(1, 2)
             values = values.transpose(1, 2)
 
-            scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-            if mask is not None:
-                scores = scores + mask
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            output = torch.matmul(scores, values)
+            # Prefill (seqlen > 1): Flash Attention 사용 가능
+            if seqlen > 1 and start_pos == 0:
+                # Prefill 시 Flash Attention으로 속도 향상
+                output = F.scaled_dot_product_attention(
+                    xq, keys, values,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=True,
+                )
+            else:
+                # Decode (seqlen=1) 또는 continuation: 수동 attention
+                scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+                if mask is not None:
+                    scores = scores + mask
+                scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+                output = torch.matmul(scores, values)
+
             output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
         return self.wo(output)
@@ -277,6 +321,43 @@ class Transformer(nn.Module):
             params.max_seq_len * 2,
             theta=params.rope_theta
         )
+
+    def setup_caches(
+        self,
+        max_batch_size: int,
+        max_seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        """모든 Attention layer의 KV cache 사전 할당
+
+        Inference 시작 전 호출하여 메모리를 효율적으로 관리.
+
+        Args:
+            max_batch_size: 최대 batch 크기 (batch generation 시 num_return_sequences)
+            max_seq_len: 최대 시퀀스 길이 (prompt + max_new_tokens)
+            dtype: 텐서 dtype
+            device: 텐서 device
+
+        Example:
+            >>> model.setup_caches(
+            ...     max_batch_size=20,  # Pass@20
+            ...     max_seq_len=2048,
+            ...     dtype=torch.float16,
+            ...     device=torch.device("cuda"),
+            ... )
+        """
+        for layer in self.layers:
+            layer.attention.setup_caches(max_batch_size, max_seq_len, dtype, device)
+        for layer in self.extra_heads:
+            layer.attention.setup_caches(max_batch_size, max_seq_len, dtype, device)
+
+    def reset_caches(self) -> None:
+        """모든 Attention layer의 KV cache 값 초기화 (새 시퀀스 생성 전 호출)"""
+        for layer in self.layers:
+            layer.attention.reset_caches()
+        for layer in self.extra_heads:
+            layer.attention.reset_caches()
 
     def forward(
         self,

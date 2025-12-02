@@ -3,6 +3,7 @@
 Checkpoint를 로드하여 벤치마크 데이터셋에서 Pass@K 평가 수행
 """
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -19,10 +20,31 @@ from weighted_mtp.utils import (
     evaluate_gsm8k_answer,
     evaluate_pass_at_k,
     execute_code_with_tests,
+    execute_codecontests_tests,
     execute_mbpp_tests,
     generate_with_mtp,
     load_checkpoint_for_evaluation,
 )
+
+
+def _load_codecontests_tests(split: str = "test") -> dict[str, dict]:
+    """CodeContests 테스트 케이스 로드
+
+    Args:
+        split: 데이터 split (train, valid, test)
+
+    Returns:
+        {task_name: {"public_tests": {...}, "private_tests": {...}, ...}}
+    """
+    tests_path = Path(f"storage/datasets/codecontests/tests/{split}_tests.json")
+    if not tests_path.exists():
+        raise FileNotFoundError(
+            f"CodeContests 테스트 케이스 파일이 없습니다: {tests_path}\n"
+            f"먼저 실행: uv run python scripts/create_storage/extract_codecontests_tests.py"
+        )
+
+    with open(tests_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def run_evaluation(
@@ -32,6 +54,7 @@ def run_evaluation(
     temperature: float = 0.2,
     max_new_tokens: int = 512,
     device: str = "auto",
+    dtype: str | None = None,
     mlflow_enabled: bool = True,
     max_tasks: int | None = None,
 ) -> dict[str, Any]:
@@ -39,11 +62,12 @@ def run_evaluation(
 
     Args:
         checkpoint_path: Checkpoint 경로
-        dataset_name: "humaneval", "mbpp", "gsm8k"
+        dataset_name: "humaneval", "mbpp", "gsm8k", "codecontests"
         num_samples_per_task: 각 문제당 생성 개수 (Pass@K 계산용)
         temperature: Sampling temperature
         max_new_tokens: 최대 생성 토큰 수
-        device: 디바이스
+        device: 디바이스 ("auto", "cuda", "cpu", "mps")
+        dtype: 모델 dtype ("float16", "bfloat16", None=원본유지). MPS는 bfloat16 미지원으로 float16 권장
         mlflow_enabled: MLflow 로깅 여부
         max_tasks: 최대 평가 태스크 수 (테스트용, None=전체)
 
@@ -66,20 +90,39 @@ def run_evaluation(
     """
     # 1. Setup
     logger = setup_logging("EVALUATION")
-    device_obj = torch.device(
-        device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+
+    # Device 설정 (auto: cuda > mps > cpu)
+    if device == "auto":
+        if torch.cuda.is_available():
+            device_obj = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device_obj = torch.device("mps")
+        else:
+            device_obj = torch.device("cpu")
+    else:
+        device_obj = torch.device(device)
+
+    # dtype 변환 (문자열 → torch.dtype)
+    dtype_obj = None
+    if dtype == "float16":
+        dtype_obj = torch.float16
+    elif dtype == "bfloat16":
+        dtype_obj = torch.bfloat16
 
     logger.info(f"Checkpoint: {checkpoint_path}")
     logger.info(f"Dataset: {dataset_name}")
     logger.info(f"Samples per task: {num_samples_per_task}")
     logger.info(f"Device: {device_obj}")
+    if dtype_obj is not None:
+        logger.info(f"dtype: {dtype_obj}")
 
-    # 2. Load checkpoint
+    # 2. Load checkpoint (inference_only=True: extra_heads 스킵으로 ~1.2GB 절약)
     logger.info("Loading checkpoint...")
     model, checkpoint_metadata = load_checkpoint_for_evaluation(
         checkpoint_path=Path(checkpoint_path),
         device=device_obj,
+        inference_only=True,
+        dtype=dtype_obj,
     )
     logger.info(f"Checkpoint epoch: {checkpoint_metadata['epoch']}")
     logger.info(f"Validation loss: {checkpoint_metadata['val_metrics']['val_loss']:.4f}")
@@ -114,7 +157,14 @@ def run_evaluation(
             logger.warning("MLflow enabled but MLFLOW_TRACKING_URI not set. Skipping MLflow.")
             mlflow_enabled = False
 
-    # 6. Evaluation loop
+    # 6. CodeContests 테스트 케이스 로드 (필요 시)
+    codecontests_tests = None
+    if dataset_name == "codecontests":
+        logger.info("Loading CodeContests test cases...")
+        codecontests_tests = _load_codecontests_tests(split="test")
+        logger.info(f"Loaded test cases for {len(codecontests_tests)} problems")
+
+    # 7. Evaluation loop
     logger.info("Starting evaluation...")
     all_results = []
     generated_samples = []  # 생성 샘플 저장 (처음 10개)
@@ -168,6 +218,29 @@ def run_evaluation(
                     generated_text=code,
                     ground_truth=ground_truth,
                 )
+            elif dataset_name == "codecontests":
+                # CodeContests: stdin/stdout 형식
+                # task_id에서 problem name 추출 (예: "problem_name_correct_0" → "problem_name")
+                parts = task_id.rsplit("_", 2)
+                if len(parts) >= 3 and parts[-2] in ("correct", "incorrect"):
+                    problem_name = "_".join(parts[:-2])
+                else:
+                    problem_name = task_id
+
+                test_data = codecontests_tests.get(problem_name, {})
+                public_tests = test_data.get("public_tests", {"input": [], "output": []})
+
+                if public_tests["input"]:
+                    result = execute_codecontests_tests(
+                        code=code,
+                        tests=public_tests,
+                        timeout=10,
+                    )
+                    # 모든 public 테스트 통과 시 pass
+                    passed = result["pass_rate"] >= 1.0
+                else:
+                    # 테스트 케이스가 없으면 fail 처리
+                    passed = False
             else:
                 raise ValueError(f"지원하지 않는 데이터셋: {dataset_name}")
             task_results.append(passed)
@@ -189,7 +262,7 @@ def run_evaluation(
                 "results": task_results,
             })
 
-    # 7. Compute Pass@K (Chen et al. 2021 방식: 문제별 Pass@K 평균)
+    # 8. Compute Pass@K (Chen et al. 2021 방식: 문제별 Pass@K 평균)
     logger.info("Computing Pass@K metrics...")
 
     k_values = [1, 5, 10, 20] if num_samples_per_task >= 20 else [1, 5, 10]
@@ -214,7 +287,7 @@ def run_evaluation(
         if values:
             pass_at_k_metrics[key] = sum(values) / len(values)
 
-    # 8. Log results
+    # 9. Log results
     logger.info("=== Evaluation Results ===")
     for k, v in pass_at_k_metrics.items():
         logger.info(f"{k}: {v:.2%}")
@@ -239,7 +312,7 @@ def run_evaluation(
 
         mlflow.end_run()
 
-    # 9. Return results
+    # 10. Return results
     return {
         "pass_at_k": pass_at_k_metrics,
         "per_task": per_task_pass_at_k,
