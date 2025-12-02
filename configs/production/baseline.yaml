@@ -58,7 +58,7 @@ data_sampling:
 training:
   n_epochs: 2.0
   batch_size: 24  # Per GPU
-  gradient_accumulation_steps: 1  # Effective batch size = 12 × 4 × 2 = 96 (GPU 2장 환경)
+  gradient_accumulation_steps: 1  # Effective batch size = 24 × 1 × 4 = 96 (GPU 4장 환경)
   learning_rate: 1.0e-4  # LoRA 사용 시 Full FT 대비 LR 높여야 함
   max_grad_norm: 1.0
   log_interval: 5
@@ -91,7 +91,7 @@ checkpoint:
   save_best: true
   save_final: true
   save_total_limit: 5
-  s3_upload: true
+  s3_upload: false  # EC2 서버 없음, 로컬 저장만
   save_lora_only: true  # LoRA 사용 시 LoRA 파라미터만 저장 (메모리 효율)
 
 # 런타임 설정

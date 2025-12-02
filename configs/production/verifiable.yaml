@@ -65,8 +65,8 @@ data_sampling:
 # 학습 설정 (H200 3-GPU 최적화)
 training:
   n_epochs: 2.0
-  batch_size: 32
-  gradient_accumulation_steps: 1  # Effective batch size = 18 x 2 x 3 = 108
+  batch_size: 24  # Per GPU
+  gradient_accumulation_steps: 1  # Effective batch size = 24 × 1 × 4 = 96 (GPU 4장 환경)
 
   # 학습률 (Policy Model LoRA)
   learning_rate: 1.0e-4
