@@ -124,6 +124,8 @@ def validate_critic(
     lambda_gamma: float = 1.0,
     lambda_lam: float = 0.95,
     lambda_coef: float = 1.0,
+    value_loss_fn: str = "huber",
+    huber_delta: float = 0.5,
     return_raw_counts: bool = False,
 ) -> dict[str, float]:
     """Critic Validation 수행
@@ -136,6 +138,8 @@ def validate_critic(
         lambda_gamma: λ-return gamma (discount factor, loss_type=lambda_return일 때 사용)
         lambda_lam: λ-return lambda (GAE smoothing, loss_type=lambda_return일 때 사용)
         lambda_coef: Loss 계수
+        value_loss_fn: Value loss 함수 ("huber" | "mse")
+        huber_delta: Huber loss delta (value_loss_fn=huber일 때 사용)
         return_raw_counts: True이면 raw counts 반환 (분산학습용 aggregation)
 
     Returns:
@@ -189,11 +193,13 @@ def validate_critic(
                 pos_lambda_loss = compute_lambda_value_loss(
                     pos_value_logits, pos_rewards, pos_attention_mask, pos_loss_mask.float(),
                     gamma=lambda_gamma, lam=lambda_lam,
+                    loss_type=value_loss_fn, huber_delta=huber_delta,
                 )
                 neg_rewards = torch.zeros(neg_input_ids.size(0), device=device, dtype=model_dtype)
                 neg_lambda_loss = compute_lambda_value_loss(
                     neg_value_logits, neg_rewards, neg_attention_mask, neg_loss_mask.float(),
                     gamma=lambda_gamma, lam=lambda_lam,
+                    loss_type=value_loss_fn, huber_delta=huber_delta,
                 )
                 value_loss = lambda_coef * (pos_lambda_loss + neg_lambda_loss) / 2
             else:
@@ -603,22 +609,35 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
     loss_type = value_loss_config.get("type", "lambda_return")
     lambda_gamma = value_loss_config.get("gamma", 1.0)
     lambda_coef = value_loss_config.get("coef", 1.0)
+    value_loss_fn = value_loss_config.get("loss_fn", "huber")  # "huber" | "mse"
+    huber_delta = value_loss_config.get("huber_delta", 0.5)
 
     # Lambda scheduling 설정 (loss_type=lambda_return일 때만 사용)
     lambda_schedule_config = value_loss_config.get("lambda_schedule", {})
-    lam_start = lambda_schedule_config.get("start", 1.0)
-    lam_end = lambda_schedule_config.get("end", 0.95)
-    lam_warmup_steps = lambda_schedule_config.get("warmup_steps", 250)
-    lam_decay_steps = lambda_schedule_config.get("decay_steps", 500)
     lam_schedule_type = lambda_schedule_config.get("type", "linear")
+
+    # constant 타입: value 키에서 단일 λ 값 사용
+    if lam_schedule_type == "constant":
+        lam_start = lambda_schedule_config.get("value", 0.995)
+        lam_end = lam_start
+        lam_warmup_steps = 0
+        lam_decay_steps = 0
+    else:
+        lam_start = lambda_schedule_config.get("start", 1.0)
+        lam_end = lambda_schedule_config.get("end", 0.95)
+        lam_warmup_steps = lambda_schedule_config.get("warmup_steps", 250)
+        lam_decay_steps = lambda_schedule_config.get("decay_steps", 500)
 
     # Validation용 λ (Pure MC로 일관된 평가 기준 유지)
     val_lambda_lam = 1.0
 
     logger.info(f"Value loss type: {loss_type}")
     if loss_type == "lambda_return":
-        logger.info(f"λ-return: gamma={lambda_gamma}, coef={lambda_coef}")
-        logger.info(f"λ-schedule: type={lam_schedule_type}, start={lam_start}, end={lam_end}, warmup={lam_warmup_steps}, decay={lam_decay_steps}")
+        logger.info(f"λ-return: gamma={lambda_gamma}, coef={lambda_coef}, loss_fn={value_loss_fn}, huber_delta={huber_delta}")
+        if lam_schedule_type == "constant":
+            logger.info(f"λ-schedule: type=constant, value={lam_start}")
+        else:
+            logger.info(f"λ-schedule: type={lam_schedule_type}, start={lam_start}, end={lam_end}, warmup={lam_warmup_steps}, decay={lam_decay_steps}")
         logger.info(f"λ-validation: lam={val_lambda_lam} (Pure MC)")
     elif loss_type == "pairwise_ranking":
         logger.info(f"Pairwise ranking: coef={lambda_coef}")
@@ -712,11 +731,13 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
                 pos_lambda_loss = compute_lambda_value_loss(
                     pos_value_logits, pos_rewards, pos_attention_mask, pos_loss_mask.float(),
                     gamma=lambda_gamma, lam=current_lam,
+                    loss_type=value_loss_fn, huber_delta=huber_delta,
                 )
                 neg_rewards = torch.zeros(neg_input_ids.size(0), device=device, dtype=model_dtype)
                 neg_lambda_loss = compute_lambda_value_loss(
                     neg_value_logits, neg_rewards, neg_attention_mask, neg_loss_mask.float(),
                     gamma=lambda_gamma, lam=current_lam,
+                    loss_type=value_loss_fn, huber_delta=huber_delta,
                 )
                 value_loss = lambda_coef * (pos_lambda_loss + neg_lambda_loss) / 2
             else:
@@ -888,6 +909,8 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             lambda_gamma=lambda_gamma,
             lambda_lam=val_lambda_lam,
             lambda_coef=lambda_coef,
+            value_loss_fn=value_loss_fn,
+            huber_delta=huber_delta,
             return_raw_counts=True,
         )
 
@@ -1002,6 +1025,8 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             lambda_gamma=lambda_gamma,
             lambda_lam=val_lambda_lam,
             lambda_coef=lambda_coef,
+            value_loss_fn=value_loss_fn,
+            huber_delta=huber_delta,
             return_raw_counts=True,
         )
 

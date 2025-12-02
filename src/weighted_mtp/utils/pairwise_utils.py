@@ -145,6 +145,10 @@ def get_scheduled_lambda(
     """
     import math
 
+    # constant 타입: 학습 전체에 걸쳐 동일한 λ 사용
+    if schedule_type == "constant":
+        return lam_start
+
     if current_step < warmup_steps:
         return lam_start
     elif current_step < warmup_steps + decay_steps:

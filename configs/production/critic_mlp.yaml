@@ -39,6 +39,7 @@ dataset:
 data_sampling:
   seed: 84
   val_n_samples: 500
+  holdout_n_samples: 2000    # 별도 hold-out (과적합 감지)
   use_pairwise: true
 
   n_samples: 60000
@@ -76,37 +77,35 @@ training:
       - gate_proj
       - up_proj
       - down_proj
-    learning_rate: 1.0e-4
-    weight_decay: 0.01     # 0.01 (가중치 규제 강화)
+    learning_rate: 5.0e-5  # Head LR의 1/4
+    weight_decay: 0.01
 
-  # Value Head 설정 (강화된 Dropout으로 Head Overfitting 방지)
+  # Value Head 설정
   value_head:
     type: mlp
-    dropout: 0.3          # 0.2 → 0.3 (Head 규제 강화)
-    learning_rate: 5.0e-4
-    weight_decay: 0.01     # 0.01 (가중치 규제 강화)
+    dropout: 0.2
+    learning_rate: 2.0e-4
+    weight_decay: 0.01
 
   # Value loss 설정
   value_loss:
     type: "lambda_return"   # "lambda_return" | "pairwise_ranking"
+    loss_fn: "huber"        # "mse" | "huber" (0/1 terminal reward에 robust)
+    huber_delta: 0.5        # Huber loss delta (reward 범위 0~1에 맞춤)
     gamma: 1.0              # Discount factor (lambda_return 전용)
     coef: 1.0               # Loss coefficient
     bias_init: 0.5          # Value head bias 초기값 (기대값 일치)
 
-    # Lambda scheduling (Hold & Decay)
-    # 초기 Pure MC로 방향성 확립 후 아주 천천히 미세 부트스트랩 도입
+    # Lambda 설정 (constant 0.995 = 약 200 토큰 effective propagation)
     lambda_schedule:
-      type: linear          # "linear" 또는 "cosine"
-      start: 1.0            # 초기 λ (Pure MC, 모든 토큰 타겟=R)
-      end: 0.995            # 최종 λ (거의 Pure MC, 0.5% 부트스트랩)
-      warmup_steps: 500     # Hold 기간 (λ=1.0 유지)
-      decay_steps: 1200      # Decay 기간 (cosine으로 천천히)
+      type: constant        # 학습 전체에 걸쳐 일정한 λ 사용
+      value: 0.995          # λ=0.995: MC에 가깝지만 TD 안정성 확보
 
   # Learning rate scheduler (공유)
   lr_scheduler:
     type: cosine
-    warmup_ratio: 0.01
-    min_lr_ratio: 0.05
+    warmup_ratio: 0.05      # 5% warmup (안정적 학습 시작)
+    min_lr_ratio: 0.0       # 완전 decay (마지막까지 학습 활용)
 
 # 체크포인트
 checkpoint:
