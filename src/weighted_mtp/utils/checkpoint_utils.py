@@ -490,6 +490,7 @@ def save_value_model_checkpoint(
             "checkpoint_type": "hf_lora",
             "lora_state_dict": dict,
             "value_head_state_dict": dict,
+            "optimizer_state_dict": dict,  # Resume 학습 지원
             "lora_config": dict,
             "base_model_path": str,
             "epoch": float,
@@ -599,6 +600,7 @@ def save_value_model_checkpoint(
             "checkpoint_type": "hf_lora",
             "lora_state_dict": lora_state_dict,
             "value_head_state_dict": value_head_state_dict,
+            "optimizer_state_dict": optimizer.state_dict(),
             "lora_config": lora_config,
             "base_model_path": base_model_path,
             "epoch": epoch,
@@ -868,6 +870,7 @@ def save_hf_checkpoint(
 
 def save_hf_lora_checkpoint(
     model,
+    optimizer: torch.optim.Optimizer,
     checkpoint_path: Path | str,
     config: dict,
     epoch: float,
@@ -881,6 +884,7 @@ def save_hf_lora_checkpoint(
 
     Args:
         model: LoRA가 적용된 HuggingFace 모델 (FSDP-wrapped 가능)
+        optimizer: torch.optim.Optimizer (Resume 학습용)
         checkpoint_path: 저장 경로 (.pt 파일)
         config: 학습 설정 (base_model_path, lora config 등)
         epoch: 현재 epoch
@@ -892,6 +896,7 @@ def save_hf_lora_checkpoint(
             "checkpoint_type": "hf_lora",
             "lora_state_dict": dict,
             "value_head_state_dict": dict,
+            "optimizer_state_dict": dict,  # Resume 학습 지원
             "lora_config": dict,
             "base_model_path": str,
             "epoch": float,
@@ -950,6 +955,7 @@ def save_hf_lora_checkpoint(
         "checkpoint_type": "hf_lora",
         "lora_state_dict": lora_state_dict,
         "value_head_state_dict": value_head_state_dict or {},
+        "optimizer_state_dict": optimizer.state_dict(),
         "lora_config": lora_config,
         "base_model_path": base_model_path,
         "epoch": epoch,

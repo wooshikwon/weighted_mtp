@@ -397,8 +397,8 @@ tail -f logs/baseline_*.log
 ```bash
 # 특정 디렉토리 다운로드
 rsync -avz --progress -e "ssh -p 10507" \
-  work@proxy1.nipa2025.ktcloud.com:~/grad_school/wooshikwon/weighted_mtp/storage/checkpoints/critic/lora-critic-lambda-0.995-final/checkpoint_epoch_0.20.pt \
-  ./storage/critic/
+  work@proxy1.nipa2025.ktcloud.com:~/grad_school/wooshikwon/weighted_mtp/storage/checkpoints/verifiable/lora-verifiable/checkpoint_epoch_0.20.pt \
+  ./storage/verifiable/
 
 # mlruns 전체 다운로드
 rsync -avz --progress -e "ssh -p 10507" \

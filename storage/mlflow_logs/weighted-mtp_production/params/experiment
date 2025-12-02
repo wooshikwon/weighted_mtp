@@ -1,1 +1,0 @@
-{'name': 'verifiable-pairwise', 'description': 'WMTP with TD weighting + Pairwise auxiliary loss', 'stage': 'verifiable', 'tags': ['verifiable', 'pairwise-auxiliary', 'td-weighting', 'production']}

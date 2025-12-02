@@ -62,17 +62,21 @@ def pairwise_test_config():
             "n_epochs": 0.1,  # 빠른 테스트
             "batch_size": 1,
             "gradient_accumulation_steps": 1,
-            "learning_rate": 1e-4,
             "backbone_frozen": True,  # value head만 학습
-            "value_head_type": "mlp",
-            "dropout": 0.1,
+            "use_lora": False,
             "max_grad_norm": 1.0,
             "log_interval": 1,
+            "value_head": {
+                "type": "mlp",
+                "dropout": 0.1,
+                "learning_rate": 1e-4,
+                "weight_decay": 0.01,
+            },
             "value_loss": {
-                "use_pairwise": False,
-                "use_mc_mse": True,
-                "pairwise_coef": 0,
-                "mc_mse_coef": 1.0,
+                "type": "lambda_return",
+                "gamma": 1.0,
+                "coef": 1.0,
+                "bias_init": 0.5,
             },
             "lr_scheduler": {
                 "type": "constant",

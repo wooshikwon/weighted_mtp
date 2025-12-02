@@ -306,6 +306,8 @@ def compute_lambda_value_loss(
     loss_mask: torch.Tensor,
     gamma: float = 1.0,
     lam: float = 0.95,
+    loss_type: str = "huber",
+    huber_delta: float = 0.5,
 ) -> torch.Tensor:
     """λ-Return 기반 Value Loss
 
@@ -319,6 +321,8 @@ def compute_lambda_value_loss(
         loss_mask: [batch, seq] Output 토큰 마스크 (labels != -100)
         gamma: Discount factor (기본값 1.0)
         lam: GAE smoothing factor (기본값 0.95)
+        loss_type: "huber" 또는 "mse" (기본값 huber)
+        huber_delta: Huber loss delta (기본값 0.5, 0/1 종단 보상에 최적)
 
     Returns:
         loss: Scalar tensor
@@ -331,9 +335,18 @@ def compute_lambda_value_loss(
             values.detach(), rewards, loss_mask, gamma, lam
         )
 
-    # MSE loss (masked)
     combined_mask = attention_mask * loss_mask
-    mse = (values - lambda_targets) ** 2
-    masked_mse = (mse * combined_mask).sum() / (combined_mask.sum() + 1e-8)
 
-    return masked_mse
+    if loss_type == "huber":
+        # Huber loss: outlier에 강건 (delta 이내 MSE, 초과 시 선형)
+        loss = F.smooth_l1_loss(
+            values, lambda_targets,
+            reduction='none',
+            beta=huber_delta
+        )
+    else:
+        # MSE loss (기존 동작)
+        loss = (values - lambda_targets) ** 2
+
+    masked_loss = (loss * combined_mask).sum() / (combined_mask.sum() + 1e-8)
+    return masked_loss

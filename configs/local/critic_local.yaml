@@ -61,13 +61,18 @@ training:
     learning_rate: 1.0e-4
     weight_decay: 0.01
 
-  # Value loss: λ-Return
+  # Value loss 설정
   value_loss:
+    type: "lambda_return"   # "lambda_return" | "pairwise_ranking"
     gamma: 1.0
-    lam: 0.95
     coef: 1.0
-    warmup_steps: 10       # 로컬 테스트용 짧은 warmup
     bias_init: 0.5
+    lambda_schedule:
+      type: linear
+      start: 1.0
+      end: 0.95
+      warmup_steps: 10      # 로컬 테스트용 짧은 warmup
+      decay_steps: 50
 
   lr_scheduler:
     type: cosine

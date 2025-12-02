@@ -1,126 +1,109 @@
-# Vast.ai GPU 렌탈 가이드: Weighted MTP 학습 환경 설정
+# Vast.ai GPU 렌탈 가이드: Weighted MTP 학습
 
-Vast.ai에서 A100 80GB x4 환경으로 Weighted MTP 학습을 실행하기 위한 가이드입니다.
+Vast.ai에서 A100 80GB x4 환경으로 Weighted MTP 학습을 실행하기 위한 실전 가이드입니다.
 
-## 목차
+## 현재 환경 상태
 
-1. [사전 요구사항](#1-사전-요구사항)
-2. [Vast.ai CLI 설치 및 설정](#2-vastai-cli-설치-및-설정)
-3. [인스턴스 검색 및 대여](#3-인스턴스-검색-및-대여)
-4. [데이터 준비 및 전송](#4-데이터-준비-및-전송)
-5. [인스턴스 환경 설정](#5-인스턴스-환경-설정)
-6. [학습 파이프라인 실행](#6-학습-파이프라인-실행)
-7. [Checkpoint 관리](#7-checkpoint-관리)
-8. [비용 최적화](#8-비용-최적화)
-9. [문제 해결](#9-문제-해결)
+| 항목 | 상태 | 비고 |
+|------|------|------|
+| Vast.ai 계정 | 설정 완료 | $25 충전, 자동 충전 활성화 |
+| API 키 | 등록 완료 | `vastai set api-key` |
+| SSH 키 | 등록 완료 | `~/.ssh/for_personal.pub` |
+| S3 버킷 | 데이터 업로드 완료 | `s3://wmtp/weighted-mtp/` |
+| MLflow 서버 | 없음 | 인스턴스 내 로컬 실행 |
 
 ---
 
-## 1. 사전 요구사항
-
-### 1.1 필요 리소스
-
-| 항목 | 요구사항 |
-|------|----------|
-| GPU | A100 80GB x4 (SXM4 권장) |
-| VRAM | 320GB 총합 |
-| 시스템 RAM | 256GB+ 권장 |
-| 스토리지 | 200GB+ (모델 + 데이터 + 체크포인트) |
-| 네트워크 | 1Gbps+ (데이터 전송용) |
-
-### 1.2 데이터 크기
+## 전체 워크플로우
 
 ```
-storage/
-├── models/
-│   ├── meta-llama-mtp/           # 25GB (7B MTP 모델)
-│   └── ref-sheared-llama-2.7b/   # 10GB (Value Model 베이스)
-├── datasets/
-│   └── codecontests/             # ~5GB (학습 데이터)
-└── checkpoints/
-    └── critic/                   # ~500MB (Critic 체크포인트)
-
-총 필요 용량: ~50GB (초기) + 체크포인트 저장 공간
+[로컬] S3 업로드 (1회)
+    ↓
+[Vast.ai] 인스턴스 대여 ($4.32/hr)
+    ↓
+[Vast.ai] S3에서 데이터 다운로드
+    ↓
+[Vast.ai] 학습 실행 + MLflow 로컬 모니터링
+    ↓
+[Vast.ai] 학습 완료 → stop (GPU 해제, 디스크 유지)
+    ↓
+[로컬] 결과 다운로드 (SCP)
+    ↓
+[Vast.ai] destroy (완전 삭제)
 ```
 
-### 1.3 로컬 환경 준비
+---
+
+## 1. 사전 준비 (로컬)
+
+### 1.1 필요 도구 설치
 
 ```bash
-# Vast.ai CLI 설치
+# Vast.ai CLI
 pip install vastai
 
-# AWS CLI 설치 (S3 데이터 전송용)
+# AWS CLI (S3 데이터 전송용)
 pip install awscli
-aws configure  # AWS credentials 설정
 ```
 
----
-
-## 2. Vast.ai CLI 설치 및 설정
-
-### 2.1 CLI 설치
+### 1.2 Vast.ai API 키 설정
 
 ```bash
-# PyPI에서 설치 (권장)
-pip install vastai
+# API 키 등록 (https://cloud.vast.ai/cli/ 에서 확인)
+vastai set api-key YOUR_API_KEY
 
-# 또는 최신 버전 직접 다운로드
-wget https://raw.githubusercontent.com/vast-ai/vast-python/master/vast.py -O vast
-chmod +x vast
-```
-
-### 2.2 API 키 설정
-
-1. [Vast.ai Console](https://cloud.vast.ai/cli/)에서 API 키 확인
-2. API 키 등록:
-
-```bash
-vastai set api-key YOUR_API_KEY_HERE
-```
-
-### 2.3 CLI 동작 확인
-
-```bash
-# 계정 정보 확인
+# 확인
 vastai show user
+```
 
-# 사용 가능한 GPU 목록 확인
-vastai search offers 'gpu_name=A100' --limit 5
+### 1.3 SSH 키 등록
+
+1. Vast.ai 웹 콘솔 접속: https://cloud.vast.ai/account/
+2. "SSH Keys" 섹션에서 공개키 등록
+3. 로컬 공개키 확인: `cat ~/.ssh/for_personal.pub`
+
+---
+
+## 2. S3 데이터 업로드 (최초 1회)
+
+### 2.1 업로드 스크립트 실행
+
+```bash
+cd /Users/wesley/Desktop/wooshikwon/weighted_mtp
+./scripts/vastai/upload_to_s3.sh
+```
+
+### 2.2 업로드 내용
+
+| 디렉터리 | 크기 | 용도 |
+|----------|------|------|
+| `models/meta-llama-mtp/` | ~50GB | 7B MTP 모델 |
+| `models/ref-sheared-llama-2.7b/raw/` | ~10GB | Reference 모델 |
+| `datasets/` | ~8GB | CodeContests 데이터셋 |
+| `checkpoints/critic/` | ~99MB | Critic 사전학습 체크포인트 |
+
+### 2.3 업로드 확인
+
+```bash
+aws s3 ls s3://wmtp/weighted-mtp/ --recursive --summarize
 ```
 
 ---
 
-## 3. 인스턴스 검색 및 대여
+## 3. 인스턴스 대여
 
-### 3.1 A100 80GB x4 인스턴스 검색
+### 3.1 A100 80GB x4 검색
 
 ```bash
-# 기본 검색: A100 SXM4 80GB x4
 vastai search offers \
     'gpu_name=A100_SXM4 num_gpus=4 gpu_ram>=80 reliability>0.95 inet_down>=500' \
     -o 'dph+'
-
-# 또는 PCIE 버전 (약간 저렴)
-vastai search offers \
-    'gpu_name=A100_PCIE num_gpus=4 gpu_ram>=80 reliability>0.95' \
-    -o 'dph+'
 ```
 
-### 3.2 검색 결과 필터 옵션
-
-| 필터 | 설명 | 예시 |
-|------|------|------|
-| `gpu_name` | GPU 모델명 | `A100_SXM4`, `A100_PCIE` |
-| `num_gpus` | GPU 개수 | `4` |
-| `gpu_ram` | GPU 메모리 (GB) | `>=80` |
-| `reliability` | 안정성 점수 | `>0.95` |
-| `inet_down` | 다운로드 속도 (Mbps) | `>=500` |
-| `disk_space` | 디스크 용량 (GB) | `>=200` |
-
-### 3.3 인스턴스 대여
+### 3.2 인스턴스 생성
 
 ```bash
-# 검색 결과에서 offer_id 확인 후 대여
+# OFFER_ID는 검색 결과에서 확인
 vastai create instance OFFER_ID \
     --image pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel \
     --disk 250 \
@@ -128,389 +111,251 @@ vastai create instance OFFER_ID \
     --direct
 ```
 
-**주요 옵션:**
-- `--image`: Docker 이미지 (PyTorch 2.5.1 + CUDA 12.4 권장)
-- `--disk`: 디스크 용량 (GB)
-- `--ssh`: SSH 접속 활성화
-- `--direct`: 직접 SSH 연결 (프록시 우회, 빠른 전송)
-
-### 3.4 인스턴스 상태 확인
+### 3.3 인스턴스 상태 확인
 
 ```bash
-# 내 인스턴스 목록
+# 인스턴스 목록
 vastai show instances
 
-# 특정 인스턴스 상세 정보
-vastai show instance INSTANCE_ID
-```
-
-### 3.5 SSH 접속
-
-```bash
-# SSH 접속 정보 확인
+# SSH 접속 정보
 vastai ssh-url INSTANCE_ID
-
-# 접속 (출력된 명령어 실행)
-ssh -p PORT root@HOST -L 8080:localhost:8080
 ```
 
 ---
 
-## 4. 데이터 준비 및 전송
+## 4. 인스턴스 환경 설정
 
-### 4.1 S3에 데이터 업로드 (로컬에서)
-
-먼저 로컬의 데이터를 S3에 업로드합니다:
+### 4.1 SSH 접속
 
 ```bash
-# 프로젝트 루트에서 실행
-cd /path/to/weighted_mtp
-
-# 모델 업로드
-aws s3 sync storage/models/ s3://YOUR_BUCKET/weighted-mtp/models/ \
-    --exclude "*.DS_Store"
-
-# 데이터셋 업로드
-aws s3 sync storage/datasets/ s3://YOUR_BUCKET/weighted-mtp/datasets/ \
-    --exclude "*.DS_Store"
-
-# Critic 체크포인트 업로드 (verifiable 학습 시 필요)
-aws s3 sync storage/checkpoints/critic/ s3://YOUR_BUCKET/weighted-mtp/checkpoints/critic/
+# vastai ssh-url 출력 결과 사용
+ssh -i ~/.ssh/for_personal root@<IP> -p <PORT>
 ```
 
-### 4.2 인스턴스에서 S3 데이터 다운로드
+### 4.2 자동 설정 스크립트 실행
 
-SSH로 인스턴스에 접속한 후:
-
-```bash
-# AWS CLI 설치 및 설정
-pip install awscli
-aws configure  # credentials 입력
-
-# 작업 디렉터리 생성
-mkdir -p /workspace/storage/{models,datasets,checkpoints}
-
-# 모델 다운로드 (병렬 전송으로 속도 향상)
-aws s3 sync s3://YOUR_BUCKET/weighted-mtp/models/ /workspace/storage/models/ \
-    --cli-read-timeout 300
-
-# 데이터셋 다운로드
-aws s3 sync s3://YOUR_BUCKET/weighted-mtp/datasets/ /workspace/storage/datasets/
-
-# Critic 체크포인트 다운로드
-aws s3 sync s3://YOUR_BUCKET/weighted-mtp/checkpoints/ /workspace/storage/checkpoints/
-```
-
-### 4.3 Vast.ai Cloud Sync 사용 (대안)
-
-Vast.ai의 내장 S3 동기화 기능:
+인스턴스 접속 후:
 
 ```bash
-# S3 연결 설정 (웹 콘솔에서 먼저 인증 필요)
-vastai cloud copy s3://YOUR_BUCKET/weighted-mtp/ C.INSTANCE_ID:/workspace/storage/
-```
+# 시스템 패키지 설치
+apt-get update && apt-get install -y curl git vim htop tmux
 
-### 4.4 데이터 무결성 확인
-
-```bash
-# 모델 파일 확인
-ls -lh /workspace/storage/models/meta-llama-mtp/
-ls -lh /workspace/storage/models/ref-sheared-llama-2.7b/
-
-# 데이터셋 확인
-wc -l /workspace/storage/datasets/codecontests/processed/*.jsonl
-```
-
----
-
-## 5. 인스턴스 환경 설정
-
-### 5.1 시스템 패키지 설치
-
-```bash
-# 기본 패키지
-apt-get update && apt-get install -y \
-    curl \
-    git \
-    vim \
-    htop \
-    tmux
-```
-
-### 5.2 UV 패키지 매니저 설치
-
-```bash
-# UV 설치
+# UV 패키지 매니저 설치
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
-# 설치 확인
-uv --version
+# AWS CLI 설치
+pip install awscli -q
 ```
 
-### 5.3 프로젝트 클론 및 의존성 설치
+### 4.3 AWS Credentials 설정
 
 ```bash
-# 프로젝트 클론
+export AWS_ACCESS_KEY_ID="YOUR_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="YOUR_SECRET_KEY"
+export AWS_DEFAULT_REGION="eu-north-1"
+```
+
+### 4.4 S3에서 데이터 다운로드
+
+```bash
+mkdir -p /workspace/storage/{models,datasets,checkpoints}
+
+# 모델 다운로드 (~60GB, 약 10-15분)
+aws s3 sync s3://wmtp/weighted-mtp/models/ /workspace/storage/models/ --cli-read-timeout 300
+aws s3 sync s3://wmtp/weighted-mtp/datasets/ /workspace/storage/datasets/
+aws s3 sync s3://wmtp/weighted-mtp/checkpoints/ /workspace/storage/checkpoints/
+```
+
+### 4.5 프로젝트 클론 및 설정
+
+```bash
 cd /workspace
 git clone https://github.com/wooshikwon/weighted_mtp.git
 cd weighted_mtp
 
-# 의존성 설치 (lock 파일 사용)
-uv sync --frozen
-
-# 또는 fresh install
-uv sync
-```
-
-### 5.4 Storage 심볼릭 링크 설정
-
-```bash
-# 프로젝트 내 storage 디렉터리 연결
-cd /workspace/weighted_mtp
+# Storage 심볼릭 링크
+rm -rf storage 2>/dev/null || true
 mkdir -p storage
 ln -sf /workspace/storage/models storage/models
 ln -sf /workspace/storage/datasets storage/datasets
 ln -sf /workspace/storage/checkpoints storage/checkpoints
 
-# 확인
-ls -la storage/
+# 의존성 설치
+uv sync --frozen
 ```
 
-### 5.5 환경변수 설정
+### 4.6 환경변수 설정
 
 ```bash
-# .env 파일 생성
 cat > .env << 'EOF'
-# HuggingFace (optional)
-HF_TOKEN=your_hf_token_here
-
-# AWS S3 (체크포인트 업로드용)
-AWS_ACCESS_KEY_ID=your_access_key
-AWS_SECRET_ACCESS_KEY=your_secret_key
-AWS_DEFAULT_REGION=eu-north-1
-
-# MLflow (optional)
-MLFLOW_TRACKING_URI=http://your-mlflow-server:5000
-MLFLOW_TRACKING_USERNAME=your_username
-MLFLOW_TRACKING_PASSWORD=your_password
-
 # NCCL 설정 (Multi-GPU)
 NCCL_DEBUG=WARN
 NCCL_TIMEOUT=3600
 NCCL_IB_DISABLE=1
 EOF
-
-# 환경변수 로드
-source .env
-export $(grep -v '^#' .env | xargs)
 ```
 
-### 5.6 GPU 상태 확인
+### 4.7 GPU 상태 확인
 
 ```bash
-# GPU 확인
 nvidia-smi
-
-# PyTorch CUDA 확인
 uv run python -c "
 import torch
 print(f'PyTorch: {torch.__version__}')
-print(f'CUDA available: {torch.cuda.is_available()}')
+print(f'CUDA: {torch.cuda.is_available()}')
 print(f'GPU count: {torch.cuda.device_count()}')
-for i in range(torch.cuda.device_count()):
-    print(f'  GPU {i}: {torch.cuda.get_device_name(i)}')
 "
 ```
 
 ---
 
-## 6. 학습 파이프라인 실행
+## 5. 학습 실행
 
-### 6.1 Single GPU 실행
+### 5.1 tmux 세션 생성
 
 ```bash
-# Baseline MTP
-uv run python -m weighted_mtp.pipelines.run_baseline \
-    --config configs/production/baseline.yaml
-
-# Critic Pre-training
-uv run python -m weighted_mtp.pipelines.run_critic \
-    --config configs/production/critic_mlp.yaml
-
-# Verifiable WMTP
-uv run python -m weighted_mtp.pipelines.run_verifiable \
-    --config configs/production/verifiable.yaml
+tmux new -s training
 ```
 
-### 6.2 Multi-GPU 실행 (4-GPU)
+### 5.2 학습 파이프라인 실행
 
 ```bash
-# tmux 세션에서 실행 권장
-tmux new -s training
+cd /workspace/weighted_mtp
+source .env
 
-# Baseline MTP (4-GPU)
-uv run torchrun \
-    --nproc_per_node=4 \
-    --nnodes=1 \
-    --node_rank=0 \
+# Baseline MTP (A100 x4)
+torchrun --nproc_per_node=4 \
     -m weighted_mtp.pipelines.run_baseline \
     --config configs/production/baseline.yaml
 
-# Verifiable WMTP (4-GPU)
-uv run torchrun \
-    --nproc_per_node=4 \
-    --nnodes=1 \
-    --node_rank=0 \
+# Critic Pre-training
+torchrun --nproc_per_node=4 \
+    -m weighted_mtp.pipelines.run_critic \
+    --config configs/production/critic_mlp.yaml
+
+# Verifiable WMTP
+torchrun --nproc_per_node=4 \
     -m weighted_mtp.pipelines.run_verifiable \
     --config configs/production/verifiable.yaml
+
+# Rho-1 WMTP
+torchrun --nproc_per_node=4 \
+    -m weighted_mtp.pipelines.run_rho1 \
+    --config configs/production/rho1.yaml
 ```
 
-### 6.3 Config Override
+### 5.3 tmux 사용법
+
+- **Detach** (세션 유지하며 나가기): `Ctrl+B`, `D`
+- **Re-attach** (세션 복귀): `tmux attach -t training`
+- **세션 목록**: `tmux ls`
+
+---
+
+## 6. MLflow 모니터링
+
+### 6.1 인스턴스에서 MLflow 서버 실행
 
 ```bash
-# Batch size, gradient accumulation 조정
-uv run torchrun \
-    --nproc_per_node=4 \
-    --nnodes=1 \
-    --node_rank=0 \
-    -m weighted_mtp.pipelines.run_verifiable \
-    --config configs/production/verifiable.yaml \
-    --override training.batch_size=24 \
-    --override training.gradient_accumulation_steps=2
+# 새 tmux 세션 또는 새 터미널에서
+cd /workspace/weighted_mtp
+mlflow ui --host 0.0.0.0 --port 5000 &
 ```
 
-### 6.4 백그라운드 실행
+### 6.2 로컬에서 포트 포워딩
+
+로컬 터미널에서:
 
 ```bash
-# nohup으로 백그라운드 실행
-nohup uv run torchrun \
-    --nproc_per_node=4 \
-    --nnodes=1 \
-    --node_rank=0 \
-    -m weighted_mtp.pipelines.run_verifiable \
-    --config configs/production/verifiable.yaml \
-    > training.log 2>&1 &
-
-# 로그 모니터링
-tail -f training.log
-
-# 또는 tmux에서 실행 후 detach (Ctrl+B, D)
+ssh -i ~/.ssh/for_personal -L 5000:localhost:5000 root@<IP> -p <PORT>
 ```
 
-### 6.5 학습 모니터링
+### 6.3 브라우저에서 접속
+
+```
+http://localhost:5000
+```
+
+### 6.4 모니터링 가능 메트릭
+
+| 메트릭 | 설명 |
+|--------|------|
+| `train/loss` | 학습 손실 |
+| `train/mtp_loss` | MTP 손실 |
+| `train/ntp_loss` | NTP 손실 |
+| `train/learning_rate` | 학습률 |
+| `eval/*` | 검증 메트릭 |
+
+---
+
+## 7. 학습 완료 후 처리
+
+### 7.1 인스턴스 Stop (GPU 해제)
 
 ```bash
-# GPU 사용량 실시간 모니터링
-watch -n 1 nvidia-smi
+# 로컬에서 실행
+vastai stop instance INSTANCE_ID
+```
 
-# 메모리 사용량
-htop
+**Stop 상태:**
+- GPU 해제 (과금 중지)
+- 디스크 유지 (~$0.05/GB/월)
+- 데이터 보존됨
 
-# 학습 로그 확인
-tail -f training.log
+### 7.2 결과 다운로드 (로컬에서)
+
+인스턴스 재시작 후 결과 다운로드:
+
+```bash
+# 인스턴스 재시작 (다운로드용)
+vastai start instance INSTANCE_ID
+
+# SSH 접속 후 또는 직접 SCP
+scp -r -i ~/.ssh/for_personal -P <PORT> \
+    root@<IP>:/workspace/weighted_mtp/outputs ./local_outputs/
+
+scp -r -i ~/.ssh/for_personal -P <PORT> \
+    root@<IP>:/workspace/weighted_mtp/mlruns ./local_mlruns/
+```
+
+### 7.3 인스턴스 완전 삭제
+
+```bash
+vastai destroy instance INSTANCE_ID
 ```
 
 ---
 
-## 7. Checkpoint 관리
-
-### 7.1 로컬 체크포인트 위치
-
-```bash
-# 체크포인트 디렉터리 구조
-storage/checkpoints/
-├── baseline/
-│   └── {experiment_name}/
-│       ├── checkpoint_epoch_0.20.pt
-│       ├── checkpoint_best.pt
-│       └── checkpoint_final.pt
-├── critic/
-│   └── {experiment_name}/
-└── verifiable/
-    └── {experiment_name}/
-```
-
-### 7.2 체크포인트 S3 자동 업로드
-
-Config에서 S3 업로드 활성화:
-
-```yaml
-# configs/production/verifiable.yaml
-checkpoint:
-  save_dir: storage/checkpoints/verifiable/${experiment.name}
-  s3_upload: true  # S3 자동 업로드 활성화
-```
-
-### 7.3 수동 체크포인트 백업
-
-```bash
-# S3로 체크포인트 업로드
-aws s3 sync storage/checkpoints/ s3://YOUR_BUCKET/weighted-mtp/checkpoints/ \
-    --exclude "*.tmp"
-
-# 특정 실험만 업로드
-aws s3 sync storage/checkpoints/verifiable/lora-verifiable/ \
-    s3://YOUR_BUCKET/weighted-mtp/checkpoints/verifiable/lora-verifiable/
-```
-
-### 7.4 인스턴스 종료 전 체크포인트 저장
-
-```bash
-#!/bin/bash
-# save_and_shutdown.sh
-
-echo "=== Syncing checkpoints to S3 ==="
-aws s3 sync storage/checkpoints/ s3://YOUR_BUCKET/weighted-mtp/checkpoints/
-
-echo "=== Syncing MLflow logs ==="
-aws s3 sync mlruns/ s3://YOUR_BUCKET/weighted-mtp/mlruns/
-
-echo "=== Done! Safe to shutdown ==="
-```
-
----
-
-## 8. 비용 최적화
+## 8. 비용 관리
 
 ### 8.1 예상 비용
 
-| GPU 타입 | 개수 | 시간당 비용 (P25) | 24시간 |
-|----------|------|------------------|--------|
-| A100 SXM4 80GB | 4 | ~$3.5-5.0 | ~$85-120 |
-| A100 PCIE 80GB | 4 | ~$2.5-4.0 | ~$60-95 |
-| H100 SXM5 80GB | 4 | ~$8.0-12.0 | ~$190-290 |
+| 상태 | 비용 |
+|------|------|
+| 학습 중 (A100x4) | ~$4.32/hr |
+| Stop 상태 (250GB 디스크) | ~$0.40/일 |
+| S3 저장 (68GB) | ~$1.56/월 |
 
-### 8.2 비용 절감 팁
+### 8.2 비용 최적화 전략
 
-1. **On-Demand vs Reserved**
-   - 단기 (< 24시간): On-Demand
-   - 장기 (> 3일): Reserved 고려
+1. **학습 완료 즉시 Stop** - GPU 비용 절감
+2. **결과 다운로드 후 Destroy** - 디스크 비용 절감
+3. **S3는 초기 데이터 전송용으로만 사용** - 체크포인트는 인스턴스 로컬 저장
 
-2. **인스턴스 선택**
-   - `reliability > 0.98`: 안정성 높은 호스트
-   - `dph+` 정렬: 가격순 정렬
-
-3. **효율적인 작업 흐름**
-   ```bash
-   # 1. 데이터 전송 완료 후 학습 시작
-   # 2. tmux로 학습 실행
-   # 3. 주기적 체크포인트 S3 동기화
-   # 4. 학습 완료 후 즉시 인스턴스 종료
-   ```
-
-4. **Interruptible 인스턴스**
-   - 최대 50% 저렴
-   - 언제든 중단 가능
-   - 체크포인트 자주 저장 필수
-
-### 8.3 인스턴스 종료
+### 8.3 인스턴스 관리 명령어
 
 ```bash
-# 인스턴스 중지 (데이터 유지, 요금 감소)
+# 목록 확인
+vastai show instances
+
+# 중지 (디스크 유지)
 vastai stop instance INSTANCE_ID
 
-# 인스턴스 완전 삭제 (데이터 삭제됨!)
+# 재시작
+vastai start instance INSTANCE_ID
+
+# 완전 삭제
 vastai destroy instance INSTANCE_ID
 ```
 
@@ -521,101 +366,70 @@ vastai destroy instance INSTANCE_ID
 ### 9.1 SSH 연결 실패
 
 ```bash
-# 직접 연결 포트 확인
-vastai show instance INSTANCE_ID | grep -i port
-
 # SSH 키 권한 확인
-chmod 600 ~/.ssh/id_rsa
+chmod 600 ~/.ssh/for_personal
 
-# Proxy 연결 (직접 연결 실패 시)
-vastai ssh INSTANCE_ID
+# 포트 확인
+vastai show instance INSTANCE_ID | grep -i port
 ```
 
 ### 9.2 NCCL 타임아웃
 
 ```bash
-# 환경변수 설정
 export NCCL_TIMEOUT=3600
 export NCCL_DEBUG=WARN
 export NCCL_IB_DISABLE=1
-export NCCL_SOCKET_IFNAME=eth0
-
-# 또는 학습 명령어에 직접 추가
-NCCL_TIMEOUT=3600 NCCL_IB_DISABLE=1 uv run torchrun ...
 ```
 
-### 9.3 GPU 메모리 부족 (OOM)
+### 9.3 GPU OOM
 
 ```bash
-# Batch size 줄이기
+# Config에서 batch_size 줄이기
 --override training.batch_size=16
-
-# Gradient accumulation 늘리기
 --override training.gradient_accumulation_steps=4
-
-# Effective batch size = batch_size × grad_accum × num_gpus
-# 예: 16 × 4 × 4 = 256
 ```
 
 ### 9.4 데이터 전송 느림
 
 ```bash
-# 병렬 전송 활성화
-aws s3 sync ... --cli-read-timeout 300 --cli-connect-timeout 300
-
-# 또는 다운로드 속도 빠른 인스턴스 선택
+# 다운로드 속도 빠른 인스턴스 선택
 vastai search offers '... inet_down>=1000'
-```
-
-### 9.5 학습 중단 후 재개
-
-```bash
-# 체크포인트에서 재개 (config에서 설정)
-# TODO: resume 기능 구현 시 추가
 ```
 
 ---
 
-## 부록: 빠른 시작 스크립트
+## 빠른 참조
 
-### setup_vastai.sh
+### 인스턴스 대여부터 학습까지
 
 ```bash
-#!/bin/bash
-# Vast.ai 인스턴스 초기 설정 스크립트
+# 1. 인스턴스 검색 및 대여
+vastai search offers 'gpu_name=A100_SXM4 num_gpus=4 gpu_ram>=80' -o 'dph+'
+vastai create instance OFFER_ID --image pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel --disk 250 --ssh --direct
 
-set -e
+# 2. SSH 접속
+vastai ssh-url INSTANCE_ID
 
-echo "=== 시스템 패키지 설치 ==="
-apt-get update && apt-get install -y curl git vim htop tmux
+# 3. 환경 설정 (인스턴스 내)
+bash /workspace/weighted_mtp/scripts/vastai/setup_instance.sh
 
-echo "=== UV 설치 ==="
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
+# 4. 학습 실행
+tmux new -s training
+torchrun --nproc_per_node=4 -m weighted_mtp.pipelines.run_baseline --config configs/production/baseline.yaml
+```
 
-echo "=== AWS CLI 설치 ==="
-pip install awscli
+### 학습 완료 후
 
-echo "=== 프로젝트 클론 ==="
-cd /workspace
-git clone https://github.com/wooshikwon/weighted_mtp.git
-cd weighted_mtp
+```bash
+# 1. Stop (GPU 해제)
+vastai stop instance INSTANCE_ID
 
-echo "=== 의존성 설치 ==="
-uv sync --frozen
+# 2. 결과 다운로드
+vastai start instance INSTANCE_ID
+scp -r -i ~/.ssh/for_personal -P <PORT> root@<IP>:/workspace/weighted_mtp/outputs ./
 
-echo "=== Storage 심볼릭 링크 ==="
-mkdir -p storage /workspace/storage/{models,datasets,checkpoints}
-ln -sf /workspace/storage/models storage/models
-ln -sf /workspace/storage/datasets storage/datasets
-ln -sf /workspace/storage/checkpoints storage/checkpoints
-
-echo "=== 완료! ==="
-echo "다음 단계:"
-echo "1. aws configure로 AWS credentials 설정"
-echo "2. S3에서 데이터 다운로드"
-echo "3. .env 파일 생성"
-echo "4. 학습 시작"
+# 3. 완전 삭제
+vastai destroy instance INSTANCE_ID
 ```
 
 ---
@@ -623,11 +437,8 @@ echo "4. 학습 시작"
 ## 참고 자료
 
 - [Vast.ai Documentation](https://docs.vast.ai/)
-- [Vast.ai PyTorch Guide](https://docs.vast.ai/pytorch)
-- [Vast.ai Data Movement](https://docs.vast.ai/instances/data-movement)
 - [Vast.ai CLI Reference](https://vast.ai/docs/cli/quickstart)
 - [Vast.ai Pricing](https://vast.ai/pricing/gpu/A100-SXM4)
-- [vastai-client PyPI](https://pypi.org/project/vastai/)
 
 ---
 

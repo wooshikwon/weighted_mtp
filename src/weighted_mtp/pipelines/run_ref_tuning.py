@@ -554,6 +554,7 @@ def run_ref_tuning_training(config: DictConfig) -> tuple[dict[str, float], str]:
                 checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}.pt"
                 save_hf_lora_checkpoint(
                     model=model,
+                    optimizer=optimizer,
                     checkpoint_path=checkpoint_path,
                     config=config,
                     epoch=current_epoch,
@@ -593,6 +594,7 @@ def run_ref_tuning_training(config: DictConfig) -> tuple[dict[str, float], str]:
             final_path = checkpoint_dir / "checkpoint_final.pt"
             save_hf_lora_checkpoint(
                 model=model,
+                optimizer=optimizer,
                 checkpoint_path=final_path,
                 config=config,
                 epoch=current_epoch,

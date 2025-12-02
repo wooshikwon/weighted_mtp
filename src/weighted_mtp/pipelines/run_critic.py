@@ -35,6 +35,7 @@ from weighted_mtp.utils import (
     get_scheduled_lambda,
     get_model_size,
     get_system_info,
+    pairwise_ranking_loss,
     save_value_model_checkpoint,
     shutdown_s3_executor,
     sync_mlruns_to_s3,
@@ -119,20 +120,22 @@ def validate_critic(
     value_model: ValueModel,
     dataloader: DataLoader,
     device: torch.device,
+    loss_type: str = "lambda_return",
     lambda_gamma: float = 1.0,
     lambda_lam: float = 0.95,
     lambda_coef: float = 1.0,
     return_raw_counts: bool = False,
 ) -> dict[str, float]:
-    """λ-return 기반 Validation 수행
+    """Critic Validation 수행
 
     Args:
         value_model: ValueModel 인스턴스
         dataloader: Validation DataLoader (pairwise format)
         device: 디바이스
-        lambda_gamma: λ-return gamma (discount factor)
-        lambda_lam: λ-return lambda (GAE smoothing)
-        lambda_coef: λ-return loss 계수
+        loss_type: Loss 타입 ("lambda_return" | "pairwise_ranking")
+        lambda_gamma: λ-return gamma (discount factor, loss_type=lambda_return일 때 사용)
+        lambda_lam: λ-return lambda (GAE smoothing, loss_type=lambda_return일 때 사용)
+        lambda_coef: Loss 계수
         return_raw_counts: True이면 raw counts 반환 (분산학습용 aggregation)
 
     Returns:
@@ -176,18 +179,25 @@ def validate_critic(
             pos_loss_mask = (pos_labels != -100)
             neg_loss_mask = (neg_labels != -100)
 
-            # λ-return Value Loss 계산
-            pos_rewards = torch.ones(pos_input_ids.size(0), device=device, dtype=model_dtype)
-            pos_lambda_loss = compute_lambda_value_loss(
-                pos_value_logits, pos_rewards, pos_attention_mask, pos_loss_mask.float(),
-                gamma=lambda_gamma, lam=lambda_lam,
-            )
-            neg_rewards = torch.zeros(neg_input_ids.size(0), device=device, dtype=model_dtype)
-            neg_lambda_loss = compute_lambda_value_loss(
-                neg_value_logits, neg_rewards, neg_attention_mask, neg_loss_mask.float(),
-                gamma=lambda_gamma, lam=lambda_lam,
-            )
-            value_loss = lambda_coef * (pos_lambda_loss + neg_lambda_loss) / 2
+            # Loss 계산 (loss_type에 따른 분기)
+            if loss_type == "pairwise_ranking":
+                value_loss = lambda_coef * pairwise_ranking_loss(
+                    pos_value_logits, neg_value_logits, pos_loss_mask, neg_loss_mask
+                )
+            elif loss_type == "lambda_return":
+                pos_rewards = torch.ones(pos_input_ids.size(0), device=device, dtype=model_dtype)
+                pos_lambda_loss = compute_lambda_value_loss(
+                    pos_value_logits, pos_rewards, pos_attention_mask, pos_loss_mask.float(),
+                    gamma=lambda_gamma, lam=lambda_lam,
+                )
+                neg_rewards = torch.zeros(neg_input_ids.size(0), device=device, dtype=model_dtype)
+                neg_lambda_loss = compute_lambda_value_loss(
+                    neg_value_logits, neg_rewards, neg_attention_mask, neg_loss_mask.float(),
+                    gamma=lambda_gamma, lam=lambda_lam,
+                )
+                value_loss = lambda_coef * (pos_lambda_loss + neg_lambda_loss) / 2
+            else:
+                raise ValueError(f"Unknown loss_type: {loss_type}")
 
             # Pairwise accuracy 계산 (메트릭용)
             pairwise_metrics = compute_pairwise_accuracy(
@@ -588,12 +598,13 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
     # 모델 dtype 감지
     model_dtype = next(value_model.parameters()).dtype
 
-    # λ-return value loss 설정
+    # Value loss 설정
     value_loss_config = config.training.get("value_loss", {})
+    loss_type = value_loss_config.get("type", "lambda_return")
     lambda_gamma = value_loss_config.get("gamma", 1.0)
     lambda_coef = value_loss_config.get("coef", 1.0)
 
-    # Lambda scheduling 설정 (EOS-only warmup 대체)
+    # Lambda scheduling 설정 (loss_type=lambda_return일 때만 사용)
     lambda_schedule_config = value_loss_config.get("lambda_schedule", {})
     lam_start = lambda_schedule_config.get("start", 1.0)
     lam_end = lambda_schedule_config.get("end", 0.95)
@@ -604,9 +615,13 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
     # Validation용 λ (Pure MC로 일관된 평가 기준 유지)
     val_lambda_lam = 1.0
 
-    logger.info(f"λ-return: gamma={lambda_gamma}, coef={lambda_coef}")
-    logger.info(f"λ-schedule: type={lam_schedule_type}, start={lam_start}, end={lam_end}, warmup={lam_warmup_steps}, decay={lam_decay_steps}")
-    logger.info(f"λ-validation: lam={val_lambda_lam} (Pure MC)")
+    logger.info(f"Value loss type: {loss_type}")
+    if loss_type == "lambda_return":
+        logger.info(f"λ-return: gamma={lambda_gamma}, coef={lambda_coef}")
+        logger.info(f"λ-schedule: type={lam_schedule_type}, start={lam_start}, end={lam_end}, warmup={lam_warmup_steps}, decay={lam_decay_steps}")
+        logger.info(f"λ-validation: lam={val_lambda_lam} (Pure MC)")
+    elif loss_type == "pairwise_ranking":
+        logger.info(f"Pairwise ranking: coef={lambda_coef}")
 
     # Gradient clipping
     max_grad_norm = config.training.get("max_grad_norm", 1.0)
@@ -682,24 +697,30 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             pos_loss_mask = (pos_labels != -100)
             neg_loss_mask = (neg_labels != -100)
 
-            # Lambda scheduling: step에 따라 λ 동적 조절
-            current_lam = get_scheduled_lambda(
-                global_step, lam_warmup_steps, lam_decay_steps, lam_start, lam_end,
-                schedule_type=lam_schedule_type,
-            )
-
-            # λ-return Value Loss 계산
-            pos_rewards = torch.ones(pos_input_ids.size(0), device=device, dtype=model_dtype)
-            pos_lambda_loss = compute_lambda_value_loss(
-                pos_value_logits, pos_rewards, pos_attention_mask, pos_loss_mask.float(),
-                gamma=lambda_gamma, lam=current_lam,
-            )
-            neg_rewards = torch.zeros(neg_input_ids.size(0), device=device, dtype=model_dtype)
-            neg_lambda_loss = compute_lambda_value_loss(
-                neg_value_logits, neg_rewards, neg_attention_mask, neg_loss_mask.float(),
-                gamma=lambda_gamma, lam=current_lam,
-            )
-            value_loss = lambda_coef * (pos_lambda_loss + neg_lambda_loss) / 2
+            # Loss 계산 (loss_type에 따른 분기)
+            if loss_type == "pairwise_ranking":
+                value_loss = lambda_coef * pairwise_ranking_loss(
+                    pos_value_logits, neg_value_logits, pos_loss_mask, neg_loss_mask
+                )
+                current_lam = None
+            elif loss_type == "lambda_return":
+                current_lam = get_scheduled_lambda(
+                    global_step, lam_warmup_steps, lam_decay_steps, lam_start, lam_end,
+                    schedule_type=lam_schedule_type,
+                )
+                pos_rewards = torch.ones(pos_input_ids.size(0), device=device, dtype=model_dtype)
+                pos_lambda_loss = compute_lambda_value_loss(
+                    pos_value_logits, pos_rewards, pos_attention_mask, pos_loss_mask.float(),
+                    gamma=lambda_gamma, lam=current_lam,
+                )
+                neg_rewards = torch.zeros(neg_input_ids.size(0), device=device, dtype=model_dtype)
+                neg_lambda_loss = compute_lambda_value_loss(
+                    neg_value_logits, neg_rewards, neg_attention_mask, neg_loss_mask.float(),
+                    gamma=lambda_gamma, lam=current_lam,
+                )
+                value_loss = lambda_coef * (pos_lambda_loss + neg_lambda_loss) / 2
+            else:
+                raise ValueError(f"Unknown loss_type: {loss_type}")
 
             # Pairwise 메트릭 누적 (accuracy 측정용)
             pairwise_metrics = compute_pairwise_accuracy(
@@ -776,26 +797,39 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
 
                     if is_main_process():
                         if use_mlflow:
-                            mlflow.log_metrics({
+                            metrics_to_log = {
                                 "train/loss": reduced["loss"],
                                 "train/grad_norm": grad_clip_stats["grad_norm_post_clip"],
                                 "train/lora_lr": lora_current_lr,
                                 "train/value_head_lr": value_head_current_lr,
                                 "train/pairwise_accuracy": reduced["pairwise_accuracy"],
-                                "train/lambda": current_lam,
                                 "value/mean_pos": reduced["mean_pos"],
                                 "value/mean_neg": reduced["mean_neg"],
                                 "value/margin": reduced["mean_pos"] - reduced["mean_neg"],
                                 "value/pos_token_variance": reduced["pos_token_var"],
                                 "value/neg_token_variance": reduced["neg_token_var"],
                                 "system/gpu_memory_allocated_gb": gpu_metrics["gpu_memory_allocated_gb"],
-                            }, step=global_step)
+                            }
+                            if current_lam is not None:
+                                metrics_to_log["train/lambda"] = current_lam
+                            mlflow.log_metrics(metrics_to_log, step=global_step)
 
-                    logger.info(
-                        f"Step {global_step}/{total_optimization_steps}, "
-                        f"Loss: {reduced['loss']:.4f} [λ={current_lam:.4f}], "
-                        f"Acc: {reduced['pairwise_accuracy']:.3f}, "
-                        f"Margin: {reduced['mean_pos'] - reduced['mean_neg']:.4f}, "
+                    # 로그 메시지 (loss_type에 따라 다른 형식)
+                    if loss_type == "lambda_return":
+                        log_msg = (
+                            f"Step {global_step}/{total_optimization_steps}, "
+                            f"Loss: {reduced['loss']:.4f} [λ={current_lam:.4f}], "
+                            f"Acc: {reduced['pairwise_accuracy']:.3f}, "
+                            f"Margin: {reduced['mean_pos'] - reduced['mean_neg']:.4f}, "
+                        )
+                    else:
+                        log_msg = (
+                            f"Step {global_step}/{total_optimization_steps}, "
+                            f"Loss: {reduced['loss']:.4f}, "
+                            f"Acc: {reduced['pairwise_accuracy']:.3f}, "
+                            f"Margin: {reduced['mean_pos'] - reduced['mean_neg']:.4f}, "
+                        )
+                    logger.info(log_msg +
                         f"LR: {value_head_current_lr:.2e}"
                     )
 
@@ -850,6 +884,7 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             value_model=value_model,
             dataloader=val_loader,
             device=device,
+            loss_type=loss_type,
             lambda_gamma=lambda_gamma,
             lambda_lam=val_lambda_lam,
             lambda_coef=lambda_coef,
@@ -963,6 +998,7 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             value_model=value_model,
             dataloader=val_loader,
             device=device,
+            loss_type=loss_type,
             lambda_gamma=lambda_gamma,
             lambda_lam=val_lambda_lam,
             lambda_coef=lambda_coef,
