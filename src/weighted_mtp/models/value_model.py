@@ -228,14 +228,20 @@ class ValueModel(nn.Module):
             lora_config=lora_config,
         )
 
-        # LoRA weights 로드 (backbone. prefix 제거)
+        # LoRA weights 로드 (backbone. prefix 및 activation checkpointing wrapper 제거)
         lora_state_dict = checkpoint.get("lora_state_dict", {})
         if lora_state_dict:
-            # 체크포인트 키: backbone.layers.0... → 모델 키: layers.0...
-            remapped_lora = {
-                k.replace("backbone.", "", 1) if k.startswith("backbone.") else k: v
-                for k, v in lora_state_dict.items()
-            }
+            # 체크포인트 키 정규화:
+            # - backbone.layers.0... → layers.0...
+            # - layers.0._checkpoint_wrapped_module.self_attn... → layers.0.self_attn...
+            remapped_lora = {}
+            for k, v in lora_state_dict.items():
+                new_key = k
+                if new_key.startswith("backbone."):
+                    new_key = new_key.replace("backbone.", "", 1)
+                # activation checkpointing wrapper 제거
+                new_key = new_key.replace("._checkpoint_wrapped_module", "")
+                remapped_lora[new_key] = v
             load_hf_lora_state_dict(model.backbone, remapped_lora)
 
         # Value head 로드
