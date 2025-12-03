@@ -167,8 +167,9 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        # Training mode: Flash Attention (KV cache 미사용)
-        if self.training:
+        # Training 또는 Full sequence forward (prefill): Flash Attention 직접 사용
+        # KV cache는 autoregressive decode (start_pos > 0) 시에만 필요
+        if self.training or (start_pos == 0 and seqlen > 1):
             keys = repeat_kv(xk, self.n_rep)
             values = repeat_kv(xv, self.n_rep)
 
@@ -184,13 +185,13 @@ class Attention(nn.Module):
             )
             output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
-        # Inference mode: KV cache 사용 (prefill + decode 모두)
+        # Inference decode (start_pos > 0 또는 seqlen = 1): KV cache 사용
         else:
-            # KV cache가 setup되지 않은 경우 동적 생성 (fallback)
+            # KV cache가 setup되지 않은 경우 동적 생성
             if self.cache_k is None:
                 self.setup_caches(
                     max_batch_size=bsz,
-                    max_seq_len=2048,  # 기본값
+                    max_seq_len=2048,
                     dtype=x.dtype,
                     device=x.device,
                 )
@@ -210,22 +211,11 @@ class Attention(nn.Module):
             keys = keys.transpose(1, 2)
             values = values.transpose(1, 2)
 
-            # Prefill (seqlen > 1): Flash Attention 사용 가능
-            if seqlen > 1 and start_pos == 0:
-                # Prefill 시 Flash Attention으로 속도 향상
-                output = F.scaled_dot_product_attention(
-                    xq, keys, values,
-                    attn_mask=None,
-                    dropout_p=0.0,
-                    is_causal=True,
-                )
-            else:
-                # Decode (seqlen=1) 또는 continuation: 수동 attention
-                scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-                if mask is not None:
-                    scores = scores + mask
-                scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-                output = torch.matmul(scores, values)
+            scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if mask is not None:
+                scores = scores + mask
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            output = torch.matmul(scores, values)
 
             output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 

@@ -444,9 +444,9 @@ def run_verifiable_training(
     max_grad_norm = config.training.get("max_grad_norm", 1.0)
     logger.info(f"Gradient clipping: max_grad_norm={max_grad_norm}")
 
-    # FSDP 워밍업
+    # FSDP 워밍업 (training 모드로 실행하여 KV cache 초기화 방지)
     logger.info("FSDP warmup forward pass...")
-    policy_model.eval()
+    policy_model.train()
     with torch.no_grad():
         dummy_input = torch.ones(1, 16, dtype=torch.long, device=device)
         try:
