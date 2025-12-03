@@ -38,7 +38,7 @@ models:
 
   # Value Model (Critic checkpoint에서 로드, eval only)
   value_model:
-    checkpoint_path: storage/checkpoints/critic/lora-critic-lambda-0.995-final/checkpoint_final.pt
+    checkpoint_path: storage/checkpoints/critic/ultimate-value-model/checkpoint_final.pt
     base_model_path: storage/models/ref-sheared-llama-2.7b/raw
 
 # 데이터셋 설정
@@ -54,8 +54,8 @@ data_sampling:
   val_n_samples: 500
   use_pairwise: false
 
-  n_samples: 400000
-  max_pairs_per_problem: 60  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
+  n_samples: 250000
+  max_pairs_per_problem: 50  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
 
   difficulty_bins:
     zero: [0, 25]
@@ -75,7 +75,7 @@ training:
   max_grad_norm: 1.0
 
   # TD error weighting (Terminal-only binary reward이므로 MC 방식 사용)
-  beta: 1.2
+  beta: 1.0
   weight_clip_min: 0.1
   weight_clip_max: 3
 

@@ -179,7 +179,7 @@ uv run mlflow ui --host 0.0.0.0 --port 5000 &
 
 로컬에서 포트 포워딩:
 ```bash
-ssh -i ~/.ssh/for_personal -L 5000:localhost:5000 root@<IP> -p <PORT>
+ssh -i ~/.ssh/for_personal -L 5000:localhost:5000 root@ssh4.vast.ai -p 18954
 ```
 
 브라우저에서 `http://localhost:5000` 접속

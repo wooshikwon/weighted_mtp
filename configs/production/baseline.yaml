@@ -46,8 +46,8 @@ data_sampling:
   val_n_samples: 500
   use_pairwise: false
 
-  n_samples: 400000
-  max_pairs_per_problem: 60  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
+  n_samples: 250000
+  max_pairs_per_problem: 50  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
 
   difficulty_bins:
     zero: [0, 25]
