@@ -329,17 +329,9 @@ def run_verifiable_training(
         activation_checkpointing=config.distributed.fsdp.get("activation_checkpointing", False),
     )
     
-    # Value Model도 FSDP로 sharding (메모리 절약: 각 GPU에 1/world_size만 로드)
-    # eval only이므로 activation_checkpointing 불필요
-    # eval_mode()는 load_value_model에서 이미 호출됨 (frozen + eval 상태)
-    value_model = wrap_model_fsdp(
-        value_model,
-        device,
-        sharding_strategy=config.distributed.fsdp.sharding_strategy,
-        mixed_precision=config.distributed.fsdp.mixed_precision,
-        cpu_offload=False,
-        activation_checkpointing=False,
-    )
+    # Value Model은 FSDP 불필요 (eval only, gradient 없음)
+    # FSDP는 forward 시 all-gather 오버헤드가 있어 오히려 비효율적
+    value_model = value_model.to(device)
 
     # 8. Optimizer (Policy Model만)
     learning_rate = config.training.get("learning_rate", 1e-4)
@@ -430,6 +422,10 @@ def run_verifiable_training(
     batch_count = 0
     next_checkpoint_epoch = save_checkpoint_every
     accumulation_counter = 0
+
+    # Gradient accumulation용 EMA 누적 버퍼 (Period 경계와 무관하게 유지)
+    accum_td_errors: list[torch.Tensor] = []
+    accum_loss_masks: list[torch.Tensor] = []
 
     # 모델 dtype 감지
     model_dtype = next(policy_model.parameters()).dtype
@@ -542,8 +538,9 @@ def run_verifiable_training(
             scaled_loss = weighted_ce_loss / gradient_accumulation_steps
             scaled_loss.backward()
 
-            # EMA 통계 업데이트
-            td_ema.update(td_errors, pos_loss_mask, distributed=True)
+            # EMA용 누적 (GPU 유지, detach로 graph 분리)
+            accum_td_errors.append(td_errors.detach())
+            accum_loss_masks.append(pos_loss_mask)  # bool tensor, detach 불필요
 
             accumulation_counter += 1
             batch_count += 1
@@ -570,6 +567,14 @@ def run_verifiable_training(
                 if scheduler is not None:
                     scheduler.step()
                 optimizer.zero_grad()
+
+                # EMA update (effective batch 전체로 업데이트)
+                all_td = torch.cat(accum_td_errors, dim=0)
+                all_mask = torch.cat(accum_loss_masks, dim=0)
+                td_ema.update(all_td, all_mask, distributed=True)
+                del all_td, all_mask
+                accum_td_errors.clear()
+                accum_loss_masks.clear()
 
                 global_step += 1
                 accumulation_counter = 0
@@ -629,6 +634,16 @@ def run_verifiable_training(
             if scheduler is not None:
                 scheduler.step()
             optimizer.zero_grad()
+
+            # EMA update (incomplete batch도 처리)
+            if accum_td_errors:
+                all_td = torch.cat(accum_td_errors, dim=0)
+                all_mask = torch.cat(accum_loss_masks, dim=0)
+                td_ema.update(all_td, all_mask, distributed=True)
+                del all_td, all_mask
+                accum_td_errors.clear()
+                accum_loss_masks.clear()
+
             global_step += 1
             accumulation_counter = 0
 
