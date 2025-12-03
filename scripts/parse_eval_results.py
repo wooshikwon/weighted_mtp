@@ -2,6 +2,7 @@
 """평가 결과 파싱 및 요약
 
 로그 파일에서 Pass@K 결과를 추출하여 테이블로 출력합니다.
+Baseline과 Verifiable 결과를 구분하여 표시합니다.
 
 Usage:
     uv run python scripts/parse_eval_results.py
@@ -50,40 +51,8 @@ def parse_log_file(log_path: Path) -> list[dict]:
     return results
 
 
-def main():
-    parser = argparse.ArgumentParser(description="평가 결과 파싱")
-    parser.add_argument(
-        "--logs-dir",
-        type=str,
-        default="logs",
-        help="로그 디렉토리 경로",
-    )
-    args = parser.parse_args()
-
-    logs_dir = Path(args.logs_dir)
-    datasets = ["humaneval", "mbpp", "gsm8k", "codecontests"]
-
-    print("=" * 80)
-    print("Evaluation Results Summary")
-    print("=" * 80)
-    print()
-
-    all_results = {}
-
-    for dataset in datasets:
-        log_file = logs_dir / f"eval_{dataset}.log"
-        if not log_file.exists():
-            print(f"[SKIP] {dataset}: 로그 파일 없음")
-            continue
-
-        results = parse_log_file(log_file)
-        if not results:
-            print(f"[SKIP] {dataset}: 결과 없음")
-            continue
-
-        all_results[dataset] = results
-
-    # 테이블 출력
+def print_results_table(title: str, all_results: dict, datasets: list[str]):
+    """결과 테이블 출력"""
     print(f"{'Dataset':<15} {'Temp':<6} {'Pass@1':>10} {'Pass@5':>10} {'Pass@10':>10} {'Pass@20':>10}")
     print("-" * 80)
 
@@ -107,9 +76,10 @@ def main():
             print(f"{dataset:<15} {temp:<6} {p1_str:>10} {p5_str:>10} {p10_str:>10} {p20_str:>10}")
 
     print("-" * 80)
-    print()
 
-    # Temperature별 평균
+
+def print_temperature_avg(all_results: dict):
+    """Temperature별 평균 출력"""
     print("Temperature별 평균:")
     for temp in [0.2, 0.8]:
         values = {"pass@1": [], "pass@5": [], "pass@10": [], "pass@20": []}
@@ -126,6 +96,107 @@ def main():
             avg_p10 = sum(values["pass@10"]) / len(values["pass@10"]) if values["pass@10"] else 0
             avg_p20 = sum(values["pass@20"]) / len(values["pass@20"]) if values["pass@20"] else 0
             print(f"  T={temp}: Pass@1={avg_p1:.2f}%, Pass@5={avg_p5:.2f}%, Pass@10={avg_p10:.2f}%, Pass@20={avg_p20:.2f}%")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="평가 결과 파싱")
+    parser.add_argument(
+        "--logs-dir",
+        type=str,
+        default="logs",
+        help="로그 디렉토리 경로",
+    )
+    args = parser.parse_args()
+
+    logs_dir = Path(args.logs_dir)
+    datasets = ["humaneval", "mbpp", "gsm8k", "codecontests"]
+
+    # Baseline 결과 수집
+    baseline_results = {}
+    for dataset in datasets:
+        log_file = logs_dir / f"eval_{dataset}.log"
+        if log_file.exists():
+            results = parse_log_file(log_file)
+            if results:
+                baseline_results[dataset] = results
+
+    # Verifiable 결과 수집
+    verifiable_results = {}
+    for dataset in datasets:
+        log_file = logs_dir / f"eval_verifiable_{dataset}.log"
+        if log_file.exists():
+            results = parse_log_file(log_file)
+            if results:
+                verifiable_results[dataset] = results
+
+    # Baseline 결과 출력
+    print("=" * 80)
+    print("BASELINE Results")
+    print("=" * 80)
+    print()
+
+    if baseline_results:
+        print_results_table("Baseline", baseline_results, datasets)
+        print()
+        print_temperature_avg(baseline_results)
+    else:
+        print("[INFO] Baseline 결과 없음")
+
+    print()
+
+    # Verifiable 결과 출력
+    print("=" * 80)
+    print("VERIFIABLE Results")
+    print("=" * 80)
+    print()
+
+    if verifiable_results:
+        print_results_table("Verifiable", verifiable_results, datasets)
+        print()
+        print_temperature_avg(verifiable_results)
+    else:
+        print("[INFO] Verifiable 결과 없음")
+
+    print()
+
+    # 비교 테이블 (최적 Temperature 기준)
+    if baseline_results and verifiable_results:
+        print("=" * 80)
+        print("COMPARISON (Best Temperature)")
+        print("=" * 80)
+        print()
+        print(f"{'Dataset':<15} {'Baseline':>12} {'Verifiable':>12} {'Diff':>10}")
+        print("-" * 50)
+
+        for dataset in datasets:
+            # Baseline 최고 pass@1
+            baseline_best = "-"
+            if dataset in baseline_results:
+                p1_values = [r.get("pass@1", 0) for r in baseline_results[dataset]]
+                if p1_values:
+                    baseline_best = max(p1_values)
+
+            # Verifiable 최고 pass@1
+            verifiable_best = "-"
+            if dataset in verifiable_results:
+                p1_values = [r.get("pass@1", 0) for r in verifiable_results[dataset]]
+                if p1_values:
+                    verifiable_best = max(p1_values)
+
+            # 차이 계산
+            if isinstance(baseline_best, float) and isinstance(verifiable_best, float):
+                diff = verifiable_best - baseline_best
+                diff_str = f"{diff:+.2f}%"
+                baseline_str = f"{baseline_best:.2f}%"
+                verifiable_str = f"{verifiable_best:.2f}%"
+            else:
+                diff_str = "-"
+                baseline_str = str(baseline_best) if baseline_best != "-" else "-"
+                verifiable_str = str(verifiable_best) if verifiable_best != "-" else "-"
+
+            print(f"{dataset:<15} {baseline_str:>12} {verifiable_str:>12} {diff_str:>10}")
+
+        print("-" * 50)
 
     print()
     print("=" * 80)
