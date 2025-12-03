@@ -174,7 +174,7 @@ torchrun --nproc_per_node=4 \
 인스턴스 내 새 터미널에서:
 ```bash
 cd /workspace/weighted_mtp
-mlflow ui --host 0.0.0.0 --port 5000 &
+uv run mlflow ui --host 0.0.0.0 --port 5000 &
 ```
 
 로컬에서 포트 포워딩:
