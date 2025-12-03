@@ -329,8 +329,17 @@ def run_verifiable_training(
         activation_checkpointing=config.distributed.fsdp.get("activation_checkpointing", False),
     )
     
-    # Value Model은 FSDP 불필요 (eval only, gradient 없음)
-    value_model = value_model.to(device)
+    # Value Model도 FSDP로 sharding (메모리 절약: 각 GPU에 1/world_size만 로드)
+    # eval only이므로 activation_checkpointing 불필요
+    # eval_mode()는 load_value_model에서 이미 호출됨 (frozen + eval 상태)
+    value_model = wrap_model_fsdp(
+        value_model,
+        device,
+        sharding_strategy=config.distributed.fsdp.sharding_strategy,
+        mixed_precision=config.distributed.fsdp.mixed_precision,
+        cpu_offload=False,
+        activation_checkpointing=False,
+    )
 
     # 8. Optimizer (Policy Model만)
     learning_rate = config.training.get("learning_rate", 1e-4)
