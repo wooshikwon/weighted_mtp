@@ -12,6 +12,7 @@ HuggingFace datasets 라이브러리를 사용하여:
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -252,8 +253,16 @@ class DatasetSetup:
             if isinstance(test_list, np.ndarray):
                 test_list = test_list.tolist()
 
+            # test_list에서 함수명 추출 (예: "assert remove_Occ(...)" → "remove_Occ")
+            instruction = example.get("text", "")
+            if test_list:
+                func_match = re.search(r'assert\s+(\w+)\s*\(', test_list[0])
+                if func_match:
+                    func_name = func_match.group(1)
+                    instruction = f"{instruction}\n\nThe function should be named '{func_name}'."
+
             alpaca_sample = {
-                "instruction": example.get("text", ""),
+                "instruction": instruction,
                 "input": "",
                 "output": example.get("code", ""),
                 "task_id": str(example.get("task_id", "")),
