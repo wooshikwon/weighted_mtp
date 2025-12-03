@@ -5,6 +5,7 @@ Checkpoint를 로드하여 벤치마크 데이터셋에서 Pass@K 평가 수행
 
 import json
 import os
+import random
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,59 @@ def _load_codecontests_tests(split: str = "test") -> dict[str, dict]:
 
     with open(tests_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _sample_codecontests_tests(
+    test_data: dict,
+    max_tests: int = 150,
+    seed: int = 42,
+) -> dict:
+    """CodeContests 테스트 케이스 샘플링 (public + private + generated 통합)
+
+    재현성을 위해 고정 seed 사용. public 테스트 우선, 부족 시 private/generated 추가.
+
+    Args:
+        test_data: {"public_tests": {...}, "private_tests": {...}, "generated_tests": {...}}
+        max_tests: 최대 테스트 케이스 수
+        seed: 랜덤 시드 (재현성 보장)
+
+    Returns:
+        {"input": [...], "output": [...]} (최대 max_tests개)
+    """
+    # 각 테스트 타입에서 input/output 추출
+    public = test_data.get("public_tests", {"input": [], "output": []})
+    private = test_data.get("private_tests", {"input": [], "output": []})
+    generated = test_data.get("generated_tests", {"input": [], "output": []})
+
+    # 모든 테스트를 (input, output) 튜플 리스트로 통합
+    all_tests = []
+
+    # public 테스트 우선 추가
+    for inp, out in zip(public.get("input", []), public.get("output", [])):
+        all_tests.append((inp, out))
+
+    # private 테스트 추가
+    for inp, out in zip(private.get("input", []), private.get("output", [])):
+        all_tests.append((inp, out))
+
+    # generated 테스트 추가
+    for inp, out in zip(generated.get("input", []), generated.get("output", [])):
+        all_tests.append((inp, out))
+
+    # 테스트가 없으면 빈 결과 반환
+    if not all_tests:
+        return {"input": [], "output": []}
+
+    # max_tests 초과 시 샘플링 (고정 seed)
+    if len(all_tests) > max_tests:
+        rng = random.Random(seed)
+        all_tests = rng.sample(all_tests, max_tests)
+
+    # 결과 형식으로 변환
+    inputs = [t[0] for t in all_tests]
+    outputs = [t[1] for t in all_tests]
+
+    return {"input": inputs, "output": outputs}
 
 
 def run_evaluation(
@@ -220,23 +274,20 @@ def run_evaluation(
                 )
             elif dataset_name == "codecontests":
                 # CodeContests: stdin/stdout 형식
-                # task_id에서 problem name 추출 (예: "problem_name_correct_0" → "problem_name")
-                parts = task_id.rsplit("_", 2)
-                if len(parts) >= 3 and parts[-2] in ("correct", "incorrect"):
-                    problem_name = "_".join(parts[:-2])
-                else:
-                    problem_name = task_id
-
+                # 평가용 데이터에서 task_id = problem_name (직접 사용)
+                problem_name = task_id
                 test_data = codecontests_tests.get(problem_name, {})
-                public_tests = test_data.get("public_tests", {"input": [], "output": []})
 
-                if public_tests["input"]:
+                # public + private + generated 통합, 최대 150개 샘플링 (seed=42 고정)
+                sampled_tests = _sample_codecontests_tests(test_data, max_tests=150, seed=42)
+
+                if sampled_tests["input"]:
                     result = execute_codecontests_tests(
                         code=code,
-                        tests=public_tests,
+                        tests=sampled_tests,
                         timeout=10,
                     )
-                    # 모든 public 테스트 통과 시 pass
+                    # 모든 테스트 통과 시 pass
                     passed = result["pass_rate"] >= 1.0
                 else:
                     # 테스트 케이스가 없으면 fail 처리

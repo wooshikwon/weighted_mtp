@@ -288,15 +288,23 @@ def _read_jsonl_by_indices(
 def load_evaluation_dataset(
     dataset_name: str,
     split: str = "test",
+    max_tasks: int = 100,
+    seed: int = 42,
 ) -> Dataset:
-    """평가용 데이터셋 로드 (전체 샘플, 샘플링 없음)
+    """평가용 데이터셋 로드 (최대 max_tasks개 샘플링)
 
-    벤치마크 평가를 위해 데이터셋 전체를 로드합니다.
-    학습용 load_dataset()과 달리 샘플링/필터링 없이 전체 데이터를 반환합니다.
+    벤치마크 평가를 위해 데이터셋을 로드합니다.
+    재현성을 위해 고정 seed로 샘플링합니다.
+
+    codecontests의 경우:
+    - 학습용: test.jsonl (14,851개 solution-level 샘플)
+    - 평가용: test_eval.jsonl (165개 problem-level 샘플)
 
     Args:
-        dataset_name: 데이터셋 이름 (humaneval, mbpp, codecontests)
+        dataset_name: 데이터셋 이름 (humaneval, mbpp, codecontests, gsm8k)
         split: 데이터 스플릿 (test, validation)
+        max_tasks: 최대 평가 문제 수 (기본: 100)
+        seed: 랜덤 시드 (재현성 보장, 기본: 42)
 
     Returns:
         Dataset (HuggingFace Dataset 형식)
@@ -304,13 +312,23 @@ def load_evaluation_dataset(
     Examples:
         >>> dataset = load_evaluation_dataset("humaneval", split="test")
         >>> print(len(dataset))
-        164
+        150
         >>> print(dataset[0].keys())
         dict_keys(['instruction', 'input', 'output', 'task_id', 'metadata'])
     """
     # 데이터셋 경로 구성
     dataset_dir = Path("storage/datasets") / dataset_name / "processed"
-    jsonl_path = dataset_dir / f"{split}.jsonl"
+
+    # codecontests는 평가용 전용 파일 사용 (problem-level, 165개)
+    if dataset_name == "codecontests":
+        jsonl_path = dataset_dir / f"{split}_eval.jsonl"
+        if not jsonl_path.exists():
+            raise FileNotFoundError(
+                f"CodeContests 평가용 데이터셋 파일이 없습니다: {jsonl_path}\n"
+                f"먼저 실행: uv run python scripts/create_storage/create_codecontests_eval.py"
+            )
+    else:
+        jsonl_path = dataset_dir / f"{split}.jsonl"
 
     if not jsonl_path.exists():
         raise FileNotFoundError(
@@ -333,7 +351,13 @@ def load_evaluation_dataset(
                 logger.warning(f"라인 {line_idx} 파싱 오류: {e}")
                 continue
 
-    logger.info(f"평가 데이터셋 로드 완료: {dataset_name}/{split} ({len(samples)} 샘플)")
+    # max_tasks 초과 시 샘플링 (고정 seed)
+    if len(samples) > max_tasks:
+        rng = random.Random(seed)
+        samples = rng.sample(samples, max_tasks)
+        logger.info(f"평가 데이터셋 샘플링: {dataset_name}/{split} ({len(samples)}/{max_tasks} 샘플, seed={seed})")
+    else:
+        logger.info(f"평가 데이터셋 로드 완료: {dataset_name}/{split} ({len(samples)} 샘플)")
 
     # HuggingFace Dataset으로 변환
     return Dataset.from_list(samples)
