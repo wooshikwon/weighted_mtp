@@ -555,56 +555,57 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
 
         logger.info(f"Validation - Loss: {val_metrics['val_loss']:.4f}")
 
-        # Checkpoint 저장 (validation loss 개선 시만)
+        # best_val_loss 추적 (로깅용)
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}.pt"
+            logger.info(f"New best validation loss: {best_val_loss:.4f}")
 
-            save_lora_only = config.checkpoint.get("save_lora_only", False) and use_lora
+        # Checkpoint 저장 (save_checkpoint_every 단위로 항상 저장)
+        checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}.pt"
 
-            # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
-            if save_lora_only:
-                save_lora_checkpoint(
-                    adapter=adapter,
-                    optimizer=optimizer,
-                    epoch=current_epoch,
-                    train_metrics={"train_loss": train_loss_avg},
-                    val_metrics=val_metrics,
-                    checkpoint_path=checkpoint_path,
-                    config={"model": {"path": config.models.policy.path}},
-                    s3_upload=use_s3_upload,
-                    experiment_name=config.experiment.name,
+        save_lora_only = config.checkpoint.get("save_lora_only", False) and use_lora
+
+        # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
+        if save_lora_only:
+            save_lora_checkpoint(
+                adapter=adapter,
+                optimizer=optimizer,
+                epoch=current_epoch,
+                train_metrics={"train_loss": train_loss_avg},
+                val_metrics=val_metrics,
+                checkpoint_path=checkpoint_path,
+                config={"model": {"path": config.models.policy.path}},
+                s3_upload=use_s3_upload,
+                experiment_name=config.experiment.name,
+            )
+        else:
+            save_checkpoint(
+                adapter=adapter,
+                optimizer=optimizer,
+                epoch=current_epoch,
+                train_metrics={"train_loss": train_loss_avg},
+                val_metrics=val_metrics,
+                checkpoint_path=checkpoint_path,
+                config={"model": {"path": config.models.policy.path}},
+                s3_upload=use_s3_upload,
+                experiment_name=config.experiment.name,
+            )
+
+        # 로깅 및 cleanup은 rank 0만 수행
+        if is_main_process():
+            logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_loss: {avg_val_loss:.4f})")
+
+            if config.checkpoint.save_total_limit:
+                cleanup_old_checkpoints(
+                    checkpoint_dir=checkpoint_dir,
+                    save_total_limit=config.checkpoint.save_total_limit,
                 )
-            else:
-                save_checkpoint(
-                    adapter=adapter,
-                    optimizer=optimizer,
-                    epoch=current_epoch,
-                    train_metrics={"train_loss": train_loss_avg},
-                    val_metrics=val_metrics,
-                    checkpoint_path=checkpoint_path,
-                    config={"model": {"path": config.models.policy.path}},
-                    s3_upload=use_s3_upload,
-                    experiment_name=config.experiment.name,
-                )
 
-            # 로깅 및 cleanup은 rank 0만 수행
-            if is_main_process():
-                logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_loss: {best_val_loss:.4f})")
-
-                if config.checkpoint.save_total_limit:
-                    cleanup_old_checkpoints(
-                        checkpoint_dir=checkpoint_dir,
+                if use_s3_upload:
+                    cleanup_s3_checkpoints(
+                        experiment_name=config.experiment.name,
                         save_total_limit=config.checkpoint.save_total_limit,
                     )
-
-                    if use_s3_upload:
-                        cleanup_s3_checkpoints(
-                            experiment_name=config.experiment.name,
-                            save_total_limit=config.checkpoint.save_total_limit,
-                        )
-        else:
-            logger.info(f"Validation loss did not improve ({avg_val_loss:.4f} >= {best_val_loss:.4f}), skipping checkpoint save")
 
         # 다음 checkpoint 경계 설정
         next_checkpoint_epoch += save_checkpoint_every
