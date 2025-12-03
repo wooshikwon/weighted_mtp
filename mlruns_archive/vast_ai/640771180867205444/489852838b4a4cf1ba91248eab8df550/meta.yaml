@@ -1,0 +1,14 @@
+artifact_uri: file:///workspace/weighted_mtp/mlruns/640771180867205444/489852838b4a4cf1ba91248eab8df550/artifacts
+end_time: 1764660121823
+entry_point_name: ''
+experiment_id: '640771180867205444'
+lifecycle_stage: active
+run_id: 489852838b4a4cf1ba91248eab8df550
+run_name: lora-mtp-baseline
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764660026206
+status: 3
+tags: []
+user_id: root

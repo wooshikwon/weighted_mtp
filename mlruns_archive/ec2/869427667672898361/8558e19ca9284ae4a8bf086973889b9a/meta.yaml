@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/wesley/Desktop/wooshikwon/weighted_mtp/mlruns/869427667672898361/8558e19ca9284ae4a8bf086973889b9a/artifacts
+end_time: 1764181140080
+entry_point_name: ''
+experiment_id: '869427667672898361'
+lifecycle_stage: active
+run_id: 8558e19ca9284ae4a8bf086973889b9a
+run_name: critic-pretrain-mlp-final
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764179697168
+status: 3
+tags: []
+user_id: wmtp_admin

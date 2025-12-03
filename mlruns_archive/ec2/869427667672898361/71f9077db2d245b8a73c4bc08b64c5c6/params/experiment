@@ -1,0 +1,1 @@
+{'name': 'baseline-mtp-final', 'description': 'Baseline MTP with uniform weights (all tokens weight=1.0)', 'stage': 'baseline', 'tags': ['baseline', 'uniform-weight', 'production']}

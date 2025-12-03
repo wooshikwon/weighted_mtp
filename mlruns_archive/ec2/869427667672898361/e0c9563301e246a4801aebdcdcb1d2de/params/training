@@ -1,0 +1,1 @@
+{'n_epochs': 2.0, 'batch_size': 32, 'gradient_accumulation_steps': 1, 'learning_rate': 0.0001, 'backbone_frozen': True, 'value_head_type': 'mlp', 'dropout': 0.2, 'max_grad_norm': 1.0, 'log_interval': 5, 'value_loss': {'use_pairwise': False, 'use_mc_mse': True, 'pairwise_coef': 0, 'mc_mse_coef': 1.0}, 'lr_scheduler': {'type': 'cosine', 'warmup_ratio': 0.03, 'min_lr_ratio': 0.01}}

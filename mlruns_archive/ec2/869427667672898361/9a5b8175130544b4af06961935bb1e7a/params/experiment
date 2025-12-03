@@ -1,0 +1,1 @@
+{'name': 'ref-tuning-codecontests', 'description': 'Reference model fine-tuning for Rho-1 (HuggingFace LlamaForCausalLM)', 'stage': 'ref-tuning', 'tags': ['ref-tuning', 'huggingface', 'ntp', 'production']}

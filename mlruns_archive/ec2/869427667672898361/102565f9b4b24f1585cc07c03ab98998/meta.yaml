@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/wesley/Desktop/wooshikwon/weighted_mtp/mlruns/869427667672898361/102565f9b4b24f1585cc07c03ab98998/artifacts
+end_time: 1764480774146
+entry_point_name: ''
+experiment_id: '869427667672898361'
+lifecycle_stage: active
+run_id: 102565f9b4b24f1585cc07c03ab98998
+run_name: lora-critic-pretrain
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764467076896
+status: 3
+tags: []
+user_id: wmtp_admin

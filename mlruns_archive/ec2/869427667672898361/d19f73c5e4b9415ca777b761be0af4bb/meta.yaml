@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/wesley/Desktop/wooshikwon/weighted_mtp/mlruns/869427667672898361/d19f73c5e4b9415ca777b761be0af4bb/artifacts
+deleted_time: 1764424008612
+end_time: 1764422516702
+entry_point_name: ''
+experiment_id: '869427667672898361'
+lifecycle_stage: deleted
+run_id: d19f73c5e4b9415ca777b761be0af4bb
+run_name: lora-mtp-baseline
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764421127256
+status: 3
+tags: []
+user_id: wmtp_admin

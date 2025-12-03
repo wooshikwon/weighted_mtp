@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/wesley/Desktop/wooshikwon/weighted_mtp/mlruns/137586531680033591/23664c2953d14280aafcc61ecf8e0544/artifacts
+end_time: 1764080199502
+entry_point_name: ''
+experiment_id: '137586531680033591'
+lifecycle_stage: active
+run_id: 23664c2953d14280aafcc61ecf8e0544
+run_name: test-run
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764080199481
+status: 3
+tags: []
+user_id: wesley

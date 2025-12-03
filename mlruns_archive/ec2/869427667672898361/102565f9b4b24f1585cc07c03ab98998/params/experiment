@@ -1,0 +1,1 @@
+{'name': 'lora-critic-pretrain', 'description': 'Independent Value Model pretraining for TD error calculation', 'stage': 'critic', 'tags': ['critic', 'pairwise-ranking', 'mlp-value-head', 'dropout-0.3', 'independent-value-model']}

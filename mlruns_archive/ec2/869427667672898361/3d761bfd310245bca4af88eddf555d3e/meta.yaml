@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/wesley/Desktop/wooshikwon/weighted_mtp/mlruns/869427667672898361/3d761bfd310245bca4af88eddf555d3e/artifacts
+deleted_time: 1764067796530
+end_time: 1764064963806
+entry_point_name: ''
+experiment_id: '869427667672898361'
+lifecycle_stage: deleted
+run_id: 3d761bfd310245bca4af88eddf555d3e
+run_name: verifiable-wmtp-final
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764062580376
+status: 3
+tags: []
+user_id: wmtp_admin

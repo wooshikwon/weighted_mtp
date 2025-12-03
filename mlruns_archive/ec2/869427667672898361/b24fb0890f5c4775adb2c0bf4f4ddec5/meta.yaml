@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/wesley/Desktop/wooshikwon/weighted_mtp/mlruns/869427667672898361/b24fb0890f5c4775adb2c0bf4f4ddec5/artifacts
+end_time: 1764083156762
+entry_point_name: ''
+experiment_id: '869427667672898361'
+lifecycle_stage: active
+run_id: b24fb0890f5c4775adb2c0bf4f4ddec5
+run_name: rho1-wmtp-absolute
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764069693596
+status: 3
+tags: []
+user_id: wmtp_admin

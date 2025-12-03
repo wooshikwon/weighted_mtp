@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/wesley/Desktop/wooshikwon/weighted_mtp/mlruns/869427667672898361/3226753a590d42e48dc50fd4cbdf1785/artifacts
+end_time: 1764572849770
+entry_point_name: ''
+experiment_id: '869427667672898361'
+lifecycle_stage: active
+run_id: 3226753a590d42e48dc50fd4cbdf1785
+run_name: lora-critic-lambda-0.995-final
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764557019370
+status: 3
+tags: []
+user_id: wmtp_admin

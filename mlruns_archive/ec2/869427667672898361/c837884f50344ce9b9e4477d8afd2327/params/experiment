@@ -1,0 +1,1 @@
+{'name': 'lora-verifiable', 'description': 'WMTP with TD weighting using independent Value Model', 'stage': 'verifiable', 'tags': ['verifiable', 'td-weighting', 'independent-value-model', 'production']}

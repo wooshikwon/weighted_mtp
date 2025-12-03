@@ -195,6 +195,7 @@ def run_evaluation(
         tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
         if tracking_uri:
             mlflow.set_tracking_uri(tracking_uri)
+            mlflow.set_experiment("Default")
             mlflow.start_run(run_name=f"eval_{dataset_name}_{Path(checkpoint_path).stem}")
             mlflow.log_params({
                 "checkpoint": checkpoint_path,

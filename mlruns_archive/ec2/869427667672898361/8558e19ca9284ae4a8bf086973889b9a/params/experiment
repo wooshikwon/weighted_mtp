@@ -1,0 +1,1 @@
+{'name': 'critic-pretrain-mlp-final', 'description': 'MLP value head pretraining for TD error calculation', 'stage': 'critic', 'tags': ['critic', 'pairwise-ranking', 'mlp-value-head', 'dropout-0.3']}

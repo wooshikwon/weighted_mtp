@@ -1,0 +1,1 @@
+{'save_dir': 'storage/checkpoints/critic/critic-pretrain-pairwise', 'save_checkpoint_every': 0.25, 'save_best': True, 'save_final': True, 'save_total_limit': 3, 's3_upload': True}

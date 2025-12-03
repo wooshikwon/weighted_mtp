@@ -1,0 +1,1 @@
+{'name': 'critic-pretrain-pairwise-mlp', 'description': 'Pairwise ranking loss for relative comparison within same instruction', 'stage': 'critic', 'tags': ['critic', 'pairwise-ranking', 'mlp-value-head', 'dropout-0.3']}

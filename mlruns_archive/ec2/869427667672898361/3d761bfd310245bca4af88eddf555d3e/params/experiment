@@ -1,0 +1,1 @@
+{'name': 'verifiable-wmtp-final', 'description': 'WMTP with TD error-based token weighting', 'stage': 'verifiable', 'tags': ['verifiable', 'wmtp', 'production']}

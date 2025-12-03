@@ -1,0 +1,1 @@
+{'seed': 42, 'val_n_samples': 500, 'use_pairwise': True, 'n_samples': 55000, 'max_pairs_per_problem': 15, 'difficulty_bins': {'diff_7': [7, 7], 'else': [8, 25]}, 'difficulty_weights': {'diff_7': 0.35, 'else': 0.65}}

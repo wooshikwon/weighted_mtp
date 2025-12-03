@@ -1,0 +1,14 @@
+artifact_uri: file:///workspace/weighted_mtp/mlruns/0/e45e5e4320a14e648401b7f8ff2e354c/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: e45e5e4320a14e648401b7f8ff2e354c
+run_name: eval_gsm8k_checkpoint_epoch_1.80
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764738578654
+status: 1
+tags: []
+user_id: root
