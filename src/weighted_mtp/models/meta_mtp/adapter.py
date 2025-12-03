@@ -161,10 +161,11 @@ class MetaLlamaMTPAdapter(nn.Module):
         return adapter
 
     def apply_lora(self, lora_config: Optional[dict] = None) -> None:
-        """Trunk layers에 LoRA 적용
+        """모든 Transformer layers에 LoRA 적용 (trunk + extra_heads)
 
-        FSDP wrapping 전에 호출해야 함
-        Trunk layers의 attention 및 feed_forward에 적용 (extra_heads 제외)
+        FSDP wrapping 전에 호출해야 함.
+        trunk layers와 extra_heads 모두에 동일하게 LoRA 적용하여
+        학습 방식의 일관성 유지 및 과적합 방지.
 
         Args:
             lora_config: LoRA 설정 (rank, alpha, dropout, target_modules)
@@ -188,9 +189,9 @@ class MetaLlamaMTPAdapter(nn.Module):
         # Feed-forward 모듈: w1, w2, w3
         ffn_targets = [t for t in target_modules if t in ["w1", "w2", "w3"]]
 
-        # Trunk layers에 LoRA 적용
-        for layer in self.transformer.layers:
-            # Attention에 LoRA 적용
+        # 모든 layers에 LoRA 적용 (trunk + extra_heads)
+        all_layers = list(self.transformer.layers) + list(self.transformer.extra_heads)
+        for layer in all_layers:
             if attention_targets:
                 apply_lora_to_linear(
                     module=layer.attention,
@@ -199,7 +200,6 @@ class MetaLlamaMTPAdapter(nn.Module):
                     alpha=alpha,
                     dropout=lora_dropout,
                 )
-            # Feed-forward에 LoRA 적용
             if ffn_targets:
                 apply_lora_to_linear(
                     module=layer.feed_forward,
@@ -209,10 +209,9 @@ class MetaLlamaMTPAdapter(nn.Module):
                     dropout=lora_dropout,
                 )
 
-        # 원본 trunk 파라미터 frozen (LoRA 파라미터만 학습)
-        for layer in self.transformer.layers:
+        # 모든 layers 원본 파라미터 frozen (LoRA 파라미터만 학습)
+        for layer in all_layers:
             for name, param in layer.named_parameters():
-                # LoRA 파라미터는 이미 requires_grad=True
                 if "lora_A" not in name and "lora_B" not in name:
                     param.requires_grad = False
 
@@ -223,9 +222,6 @@ class MetaLlamaMTPAdapter(nn.Module):
             param.requires_grad = False
         for param in self.transformer.norm.parameters():
             param.requires_grad = False
-
-        # extra_heads는 full fine-tuning 유지 (requires_grad=True)
-        # MTP heads는 효율적 학습을 위해 frozen하지 않음
 
         self.lora_enabled = True
 
@@ -255,8 +251,9 @@ class MetaLlamaMTPAdapter(nn.Module):
 
         from weighted_mtp.models.lora import LoRALinear
 
-        # Trunk layers의 LoRA 병합
-        for layer in self.transformer.layers:
+        # 모든 layers의 LoRA 병합 (trunk + extra_heads)
+        all_layers = list(self.transformer.layers) + list(self.transformer.extra_heads)
+        for layer in all_layers:
             # Attention 모듈
             for name in ["wq", "wk", "wv", "wo"]:
                 if hasattr(layer.attention, name):
@@ -438,12 +435,16 @@ class MetaLlamaMTPAdapter(nn.Module):
             for key, value in filtered_state_dict.items():
                 new_key = key
                 
-                # transformer.layers.X만 변환 (extra_heads는 LoRA 미적용이므로 변환 안함)
-                if not key.startswith("transformer.layers."):
+                # transformer.layers와 transformer.extra_heads 모두 LoRA 적용 대상
+                is_lora_target = (
+                    key.startswith("transformer.layers.") or 
+                    key.startswith("transformer.extra_heads.")
+                )
+                if not is_lora_target:
                     converted_state_dict[key] = value
                     continue
                 
-                # Attention 모듈 변환 (layers만)
+                # Attention 모듈 변환
                 for target in attention_targets:
                     old_pattern = f".attention.{target}.weight"
                     new_pattern = f".attention.{target}.linear.weight"
@@ -456,7 +457,7 @@ class MetaLlamaMTPAdapter(nn.Module):
                         new_key = key.replace(old_bias, new_bias)
                         break
                 
-                # Feed-forward 모듈 변환 (layers만)
+                # Feed-forward 모듈 변환
                 for target in ffn_targets:
                     old_pattern = f".feed_forward.{target}.weight"
                     new_pattern = f".feed_forward.{target}.linear.weight"

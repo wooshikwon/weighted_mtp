@@ -297,11 +297,10 @@ def save_lora_checkpoint(
     save_value_head: bool = True,
     td_ema_state: dict | None = None,
 ) -> None:
-    """LoRA checkpoint 저장 (LoRA + extra_heads + value_head)
+    """LoRA checkpoint 저장
 
     학습 가능한 파라미터만 저장하여 checkpoint 크기를 대폭 줄임.
-    - LoRA 파라미터 (trunk layers)
-    - extra_heads 파라미터 (MTP heads, full fine-tuning)
+    - LoRA 파라미터 (trunk layers + extra_heads 모두 포함)
     - value_head 파라미터 (선택적)
 
     FSDP 환경에서 메모리 효율적 저장:
@@ -324,8 +323,8 @@ def save_lora_checkpoint(
     Saved checkpoint format:
         {
             "epoch": float,
-            "lora_state_dict": dict,  # LoRA 파라미터
-            "extra_heads_state_dict": dict,  # MTP extra_heads 파라미터
+            "lora_state_dict": dict,  # LoRA 파라미터 (trunk + extra_heads)
+            "extra_heads_state_dict": dict,  # 빈 dict (하위 호환성)
             "value_head_state_dict": dict,  # Value head (선택적)
             "optimizer_state_dict": dict,
             "train_metrics": dict,
@@ -355,17 +354,15 @@ def save_lora_checkpoint(
         full_state_dict = adapter.state_dict()
         unwrapped = adapter
 
-        # LoRA 파라미터 추출
+        # LoRA 파라미터 추출 (trunk + extra_heads 모두 포함)
         lora_state_dict = {
             k: v for k, v in full_state_dict.items()
             if "lora_A" in k or "lora_B" in k
         }
 
-        # extra_heads 파라미터 추출
-        extra_heads_state_dict = {
-            k: v for k, v in full_state_dict.items()
-            if "transformer.extra_heads." in k
-        }
+        # extra_heads는 LoRA가 적용되어 있으므로 별도 저장 불필요
+        # 하위 호환성을 위해 빈 dict 유지
+        extra_heads_state_dict = {}
 
         # Value head 파라미터 추출
         value_head_state_dict = {}
@@ -442,12 +439,13 @@ def _extract_trainable_params_fsdp(
 
     Returns:
         (lora_state_dict, extra_heads_state_dict, value_head_state_dict, lora_config)
+        extra_heads_state_dict는 빈 dict (LoRA가 적용되어 lora_state_dict에 포함됨)
     """
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
     unwrapped = adapter.module
     lora_state_dict = {}
-    extra_heads_state_dict = {}
+    extra_heads_state_dict = {}  # 빈 dict (하위 호환성)
     value_head_state_dict = {}
     lora_config = None
 
@@ -461,12 +459,9 @@ def _extract_trainable_params_fsdp(
             # CPU로 복사 (rank 0에서만 유효)
             param_cpu = param.detach().cpu().clone()
 
-            # LoRA 파라미터
+            # LoRA 파라미터 (trunk + extra_heads 모두 포함)
             if "lora_A" in name or "lora_B" in name:
                 lora_state_dict[name] = param_cpu
-            # extra_heads 파라미터
-            elif "transformer.extra_heads." in name:
-                extra_heads_state_dict[name] = param_cpu
             # Value head 파라미터
             elif save_value_head and "value_head" in name:
                 value_head_state_dict[name] = param_cpu

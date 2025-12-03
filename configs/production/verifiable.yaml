@@ -10,7 +10,7 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: lora-verifiable
+  name: ultimate-verifiable
   description: "WMTP with TD weighting using independent Value Model"
   stage: verifiable
   tags:
@@ -54,17 +54,17 @@ data_sampling:
   val_n_samples: 500
   use_pairwise: false
 
-  n_samples: 120000
-  max_pairs_per_problem: 25  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
+  n_samples: 400000
+  max_pairs_per_problem: 60  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
 
   difficulty_bins:
     zero: [0, 25]
   difficulty_weights:
     zero: 1.0
 
-# 학습 설정 (H200 3-GPU 최적화)
+# 학습 설정 (H100 4-GPU 최적화)
 training:
-  n_epochs: 2.0
+  n_epochs: 1.0
   batch_size: 24  # Per GPU
   gradient_accumulation_steps: 1  # Effective batch size = 24 × 1 × 4 = 96 (GPU 4장 환경)
 

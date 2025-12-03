@@ -9,7 +9,7 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: lora-ref-tuning
+  name: ultimate-ref-tuning
   description: "Reference model fine-tuning for Rho-1 (HuggingFace LlamaForCausalLM)"
   stage: ref-tuning
   tags:
@@ -38,8 +38,8 @@ data_sampling:
   val_n_samples: 500
   use_pairwise: false
 
-  n_samples: 60000
-  max_pairs_per_problem: 20  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
+  n_samples: 80000
+  max_pairs_per_problem: 15  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
 
   difficulty_bins:
     zero: [0, 25]
