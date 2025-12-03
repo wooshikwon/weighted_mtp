@@ -25,7 +25,7 @@ models:
   value_model:
     name: ref-sheared-llama-2.7b
     path: storage/models/ref-sheared-llama-2.7b/raw
-    tokenizer_path: storage/models/ref-sheared-llama-2.7b/tokenizer
+    tokenizer_path: storage/models/ref-sheared-llama-2.7b/raw
     dtype: bfloat16
 
 # 데이터셋 설정
