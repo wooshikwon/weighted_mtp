@@ -181,6 +181,11 @@ def run_evaluation(
     logger.info(f"Checkpoint epoch: {checkpoint_metadata['epoch']}")
     logger.info(f"Validation loss: {checkpoint_metadata['val_metrics']['val_loss']:.4f}")
 
+    # LoRA 병합 (inference 최적화)
+    if hasattr(model, "merge_lora"):
+        model.merge_lora()
+        logger.info("LoRA weights merged for inference optimization")
+
     # 3. Load tokenizer
     tokenizer_path = resolve_tokenizer_path(checkpoint_metadata['config']['model']['path'])
     tokenizer = load_tokenizer(tokenizer_path)

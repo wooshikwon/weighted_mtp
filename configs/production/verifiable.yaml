@@ -65,8 +65,8 @@ data_sampling:
 # 학습 설정 (H100 4-GPU 최적화)
 training:
   n_epochs: 1.0
-  batch_size: 12  # Per GPU
-  gradient_accumulation_steps: 2  # Effective batch size = 24 × 1 × 4 = 96 (GPU 4장 환경)
+  batch_size: 12  # Per GPU (OOM 방지를 위해 24→12로 축소)
+  gradient_accumulation_steps: 2  # Effective batch size = 12 × 2 × 4 = 96 (GPU 4장 환경)
 
   # 학습률 (Policy Model LoRA)
   learning_rate: 1.0e-4
