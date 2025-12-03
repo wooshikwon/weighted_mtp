@@ -345,7 +345,9 @@ def run_evaluation(
         logger.info(f"{k}: {v:.2%}")
 
     if mlflow_enabled:
-        mlflow.log_metrics(pass_at_k_metrics)
+        # MLflow metric 이름에 @가 허용되지 않으므로 pass_at_k 형식으로 변환
+        mlflow_metrics = {k.replace("@", "_at_"): v for k, v in pass_at_k_metrics.items()}
+        mlflow.log_metrics(mlflow_metrics)
 
         # Save per-task results
         results_df = pd.DataFrame(per_task_pass_at_k)
