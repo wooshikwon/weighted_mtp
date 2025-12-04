@@ -905,6 +905,10 @@ def save_hf_lora_checkpoint(
     LlamaForCausalLM 또는 LlamaModel에 적용된 LoRA 파라미터를 저장합니다.
     ref_tuning, critic 등 HuggingFace 기반 파이프라인에서 사용.
 
+    FSDP 환경에서 메모리 효율적 저장:
+    - summon_full_params()를 사용해 학습 가능 파라미터만 gather
+    - 전체 모델을 rank 0에 모으지 않아 OOM 방지
+
     Args:
         model: LoRA가 적용된 HuggingFace 모델 (FSDP-wrapped 가능)
         optimizer: torch.optim.Optimizer (Resume 학습용)
@@ -929,32 +933,22 @@ def save_hf_lora_checkpoint(
     """
     import torch.distributed as dist
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from torch.distributed.fsdp.fully_sharded_data_parallel import (
-        StateDictType,
-        FullStateDictConfig,
-    )
 
     checkpoint_path = Path(checkpoint_path)
 
-    # FSDP Full state dict gathering
+    # FSDP 환경: 학습 가능 파라미터만 메모리 효율적으로 추출
     if isinstance(model, FSDP):
-        with FSDP.state_dict_type(
-            model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        ):
-            full_state_dict = model.state_dict()
+        lora_state_dict = _extract_hf_lora_params_fsdp(model)
 
         if dist.is_initialized() and dist.get_rank() != 0:
             return
     else:
         full_state_dict = model.state_dict()
-
-    # LoRA 파라미터 추출
-    lora_state_dict = {
-        k: v for k, v in full_state_dict.items()
-        if "lora_A" in k or "lora_B" in k
-    }
+        # LoRA 파라미터 추출
+        lora_state_dict = {
+            k: v for k, v in full_state_dict.items()
+            if "lora_A" in k or "lora_B" in k
+        }
 
     # LoRA config 추출
     lora_config = None
@@ -989,13 +983,41 @@ def save_hf_lora_checkpoint(
     torch.save(checkpoint, checkpoint_path)
 
     # 크기 로깅
-    full_size = sum(v.numel() for v in full_state_dict.values())
     lora_size = sum(v.numel() for v in lora_state_dict.values())
     vh_size = sum(v.numel() for v in (value_head_state_dict or {}).values())
 
     logger.info(f"HF LoRA checkpoint 저장 완료: {checkpoint_path}")
     logger.info(f"  Epoch: {epoch}")
     logger.info(f"  Val loss: {val_metrics.get('val_loss', 'N/A')}")
-    logger.info(f"  LoRA: {lora_size:,} params ({lora_size/full_size*100:.2f}%)")
+    logger.info(f"  LoRA: {lora_size:,} params")
     if vh_size > 0:
         logger.info(f"  Value head: {vh_size:,} params")
+
+
+def _extract_hf_lora_params_fsdp(model) -> dict:
+    """FSDP 환경에서 HuggingFace 모델의 LoRA 파라미터만 메모리 효율적으로 추출
+
+    summon_full_params()를 사용해 trainable=True인 파라미터만 gather.
+    전체 모델을 rank 0에 모으지 않아 OOM 방지.
+
+    Args:
+        model: FSDP-wrapped HuggingFace 모델 (LoRA 적용됨)
+
+    Returns:
+        lora_state_dict: LoRA 파라미터 (lora_A, lora_B)
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    lora_state_dict = {}
+
+    with FSDP.summon_full_params(model, writeback=False, offload_to_cpu=True, rank0_only=True):
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # LoRA 파라미터만 추출
+            if "lora_A" in name or "lora_B" in name:
+                param_cpu = param.detach().cpu().clone()
+                lora_state_dict[name] = param_cpu
+
+    return lora_state_dict

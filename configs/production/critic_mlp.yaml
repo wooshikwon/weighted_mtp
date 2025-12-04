@@ -73,6 +73,9 @@ training:
       - k_proj
       - v_proj
       - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
     learning_rate: 5.0e-5  # Head LR의 1/4
     weight_decay: 0.01
 
