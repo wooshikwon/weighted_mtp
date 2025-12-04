@@ -9,7 +9,7 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: ultimate-value-model-400k
+  name: ultimate-value-model-400k-32rank
   description: "Independent Value Model pretraining for TD error calculation"
   stage: critic
   tags:
@@ -65,8 +65,8 @@ training:
   # LoRA 설정 (과적합 방지를 위해 축소된 용량)
   use_lora: true
   lora:
-    rank: 16              # 64 → 16 (암기 용량 축소)
-    alpha: 32.0           # 128 → 32 (rank × 2)
+    rank: 32              # 64 → 32 (암기 용량 축소)
+    alpha: 64.0           # 128 → 64 (rank × 2)
     dropout: 0.1          # 0.05 → 0.1 (규제 강화)
     target_modules:
       - q_proj
