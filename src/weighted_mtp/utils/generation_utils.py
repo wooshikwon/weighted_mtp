@@ -169,7 +169,7 @@ def generate_with_mtp(
             if len(eos_after_prompt) > 0:
                 tokens = tokens[:eos_after_prompt[0] + 1]
 
-        generated_text = tokenizer.decode(tokens, skip_special_tokens=True)
+        generated_text = tokenizer.decode(tokens[prompt_len:], skip_special_tokens=True)
         generated_texts.append(generated_text)
 
     return generated_texts
