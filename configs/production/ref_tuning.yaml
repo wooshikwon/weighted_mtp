@@ -9,7 +9,7 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: ultimate-ref-tuning
+  name: ultimate-ref-tuning-400k
   description: "Reference model fine-tuning for Rho-1 (HuggingFace LlamaForCausalLM)"
   stage: ref-tuning
   tags:
