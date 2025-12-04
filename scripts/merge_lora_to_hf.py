@@ -81,12 +81,12 @@ def main():
     }
     torch_dtype = dtype_map[args.dtype]
 
-    # 1. Base model 로드
+    # 1. Base model 로드 (CPU에서 merge)
     logger.info(f"Loading base model: {base_model_path}")
     model = AutoModelForCausalLM.from_pretrained(
         base_model_path,
-        torch_dtype=torch_dtype,
-        device_map="cpu",  # CPU에서 merge (메모리 효율)
+        dtype=torch_dtype,
+        low_cpu_mem_usage=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(base_model_path)
     logger.info(f"Base model loaded: {model.config.hidden_size}d, {model.config.num_hidden_layers}L")
