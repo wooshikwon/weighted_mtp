@@ -12,6 +12,32 @@ from pathlib import Path
 from scipy.special import comb
 
 
+def strip_markdown_code_block(code: str) -> str:
+    """마크다운 코드 블록 제거
+
+    LLM이 생성한 코드에서 ```python 또는 ``` 블록을 제거.
+
+    Args:
+        code: 생성된 코드 문자열
+
+    Returns:
+        마크다운 블록이 제거된 순수 코드
+    """
+    code = code.strip()
+
+    # ``` 로 시작하는 경우
+    if code.startswith("```"):
+        lines = code.split("\n")
+        # 첫 줄 제거 (```python, ```py, ``` 등)
+        lines = lines[1:]
+        # 마지막 줄이 ``` 면 제거
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        code = "\n".join(lines)
+
+    return code
+
+
 def execute_code_with_tests(
     code: str,
     test_code: str,
@@ -41,6 +67,9 @@ def execute_code_with_tests(
         >>> execute_code_with_tests(code, test, "add", timeout=5)
         True
     """
+    # 마크다운 코드 블록 제거
+    code = strip_markdown_code_block(code)
+
     # 전체 코드 조합
     full_code = f"{code}\n\n{test_code}\n\ncheck({entry_point})\n"
 
@@ -91,6 +120,9 @@ def execute_mbpp_tests(
     Returns:
         정답 여부 (True=pass, False=fail)
     """
+    # 마크다운 코드 블록 제거
+    code = strip_markdown_code_block(code)
+
     # 테스트 코드 조합
     test_code = "\n".join(test_list)
     full_code = f"{test_setup_code}\n{code}\n\n{test_code}\n"
@@ -141,6 +173,9 @@ def execute_codecontests_tests(
             "details": [{"input": str, "expected": str, "actual": str, "passed": bool}, ...]
         }
     """
+    # 마크다운 코드 블록 제거
+    code = strip_markdown_code_block(code)
+
     inputs = tests.get("input", [])
     expected_outputs = tests.get("output", [])
 
