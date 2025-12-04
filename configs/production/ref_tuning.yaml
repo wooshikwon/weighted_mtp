@@ -48,7 +48,7 @@ data_sampling:
 
 # 학습 설정 (2.7B 모델, H200 3-GPU 최적화)
 training:
-  n_epochs: 1.0
+  n_epochs: 2.0
   batch_size: 24  # Per GPU (2.7B 경량 모델)
   gradient_accumulation_steps: 1  # Effective batch size = 36 × 1 × 3 = 108
   learning_rate: 5.0e-5
