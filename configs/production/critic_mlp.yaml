@@ -41,7 +41,7 @@ data_sampling:
   use_pairwise: true
   val_n_samples: 500        # Validation 샘플 수
 
-  n_samples: 250000
+  n_samples: 200000
   max_pairs_per_problem: 50  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
 
   difficulty_bins:
