@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from weighted_mtp.core.logging import setup_logging
 from weighted_mtp.data import load_evaluation_dataset
+from weighted_mtp.data.collators import apply_alpaca_template
 from weighted_mtp.models.tokenizer_utils import load_tokenizer, resolve_tokenizer_path
 from weighted_mtp.utils import (
     evaluate_gsm8k_answer,
@@ -235,7 +236,19 @@ def run_evaluation(
 
     for idx, sample in enumerate(tqdm(eval_dataset, desc="Evaluating")):
         task_id = sample["task_id"]
-        prompt = sample["instruction"]
+
+        # 데이터셋별 프롬프트 구성
+        if dataset_name == "humaneval":
+            # HumanEval: 이미 function signature + docstring 형식
+            prompt = sample["instruction"]
+        else:
+            # MBPP, CodeContests, GSM8K: Alpaca 템플릿 (학습 형식과 동일)
+            prompt = apply_alpaca_template(
+                instruction=sample["instruction"],
+                input_text=sample.get("input", ""),
+                output="",
+                include_response_header=True,
+            )
 
         # Generate N samples
         generated_codes = generate_with_mtp(
@@ -284,8 +297,8 @@ def run_evaluation(
                 problem_name = task_id
                 test_data = codecontests_tests.get(problem_name, {})
 
-                # public + private + generated 통합, 최대 150개 샘플링 (seed=42 고정)
-                sampled_tests = _sample_codecontests_tests(test_data, max_tests=150, seed=42)
+                # public + private + generated 통합, 최대 50개 샘플링 (seed=42 고정)
+                sampled_tests = _sample_codecontests_tests(test_data, max_tests=50, seed=42)
 
                 if sampled_tests["input"]:
                     result = execute_codecontests_tests(

@@ -215,24 +215,50 @@ def execute_codecontests_tests(
 def extract_gsm8k_answer(text: str) -> str | None:
     """GSM8K 형식의 텍스트에서 최종 답 추출
 
+    Alpaca 템플릿 사용 시 '### Response:' 이후 부분만 분석.
+    여러 패턴을 우선순위대로 시도하여 최종 답 추출.
+
     Args:
         text: 생성된 텍스트 (풀이 과정 포함)
 
     Returns:
         추출된 숫자 문자열 또는 None
     """
-    # 1순위: #### 뒤의 숫자
-    match = re.search(r'####\s*(-?\d+(?:,\d+)*(?:\.\d+)?)', text)
+    # Alpaca 템플릿: '### Response:' 이후 부분만 분석
+    response_marker = "### Response:"
+    if response_marker in text:
+        text = text.split(response_marker, 1)[1]
+
+    # 숫자 패턴 (정수, 소수, 콤마 포함)
+    num_pattern = r'-?\d+(?:,\d+)*(?:\.\d+)?'
+
+    # 1순위: #### 뒤의 숫자 (GSM8K 표준 형식)
+    match = re.search(rf'####\s*({num_pattern})', text)
     if match:
         return match.group(1).replace(',', '')
 
-    # 2순위: "answer is" 뒤의 숫자
-    match = re.search(r'answer\s+is\s*:?\s*(-?\d+(?:,\d+)*(?:\.\d+)?)', text, re.IGNORECASE)
+    # 2순위: "the answer is" 뒤의 숫자
+    match = re.search(rf'the\s+answer\s+is\s*:?\s*({num_pattern})', text, re.IGNORECASE)
     if match:
         return match.group(1).replace(',', '')
 
-    # 3순위: 마지막 숫자
-    numbers = re.findall(r'-?\d+(?:,\d+)*(?:\.\d+)?', text)
+    # 3순위: "answer:" 또는 "answer =" 뒤의 숫자
+    match = re.search(rf'answer\s*[:=]\s*({num_pattern})', text, re.IGNORECASE)
+    if match:
+        return match.group(1).replace(',', '')
+
+    # 4순위: "therefore" 뒤의 숫자
+    match = re.search(rf'therefore[,\s]+.*?({num_pattern})', text, re.IGNORECASE)
+    if match:
+        return match.group(1).replace(',', '')
+
+    # 5순위: "= $숫자" 또는 "=$숫자" 패턴 (수식 결과)
+    match = re.search(rf'=\s*\$?\s*({num_pattern})', text)
+    if match:
+        return match.group(1).replace(',', '')
+
+    # 6순위: Response 부분의 마지막 숫자 (fallback)
+    numbers = re.findall(num_pattern, text)
     if numbers:
         return numbers[-1].replace(',', '')
 
