@@ -77,7 +77,16 @@ def load_hf_model(config: DictConfig, device: torch.device) -> torch.nn.Module:
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
         attn_implementation="sdpa",
-    ).to(device)
+    )
+
+    # 분산학습 감지: FSDP 사용 시 CPU에 유지 (FSDP가 GPU 배치 담당)
+    is_distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+    if not is_distributed and device.type != "cpu":
+        model = model.to(device)
+        logger.info(f"Single GPU mode: model moved to {device}")
+    else:
+        logger.info("Distributed mode: model stays on CPU for FSDP sharding")
 
     logger.info(f"Model loaded with attn_implementation={model_config._attn_implementation}")
 

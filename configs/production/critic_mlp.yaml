@@ -49,7 +49,7 @@ data_sampling:
   difficulty_weights:
     zero: 1.0
 
-# 학습 설정 (H200 3-GPU 최적화)
+# 학습 설정 (H100 80GB 4-GPU 최적화)
 training:
   n_epochs: 1.0
   batch_size: 24
