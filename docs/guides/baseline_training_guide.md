@@ -156,8 +156,8 @@ tmux new -s training
 cd /workspace/weighted_mtp
 
 uv run torchrun --nproc_per_node=4 \
-    -m weighted_mtp.pipelines.run_baseline \
-    --config configs/production/baseline.yaml
+    -m weighted_mtp.pipelines.run_ref_tuning \
+    --config configs/production/ref_tuning.yaml
 ```
 
 ### 5.3 tmux 사용법

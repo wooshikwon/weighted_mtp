@@ -42,6 +42,9 @@ from weighted_mtp.runtime import (
     barrier,
 )
 
+# 모듈 레벨 로거
+logger = logging.getLogger(__name__)
+
 
 def load_hf_model(config: DictConfig, device: torch.device) -> torch.nn.Module:
     """HuggingFace 모델 로드
