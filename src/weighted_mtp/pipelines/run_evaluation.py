@@ -102,48 +102,23 @@ def _sample_codecontests_tests(
     return {"input": inputs, "output": outputs}
 
 
-def run_evaluation(
+def load_model_for_evaluation(
     checkpoint_path: str,
-    dataset_name: str = "humaneval",
-    num_samples_per_task: int = 20,
-    temperature: float = 0.2,
-    max_new_tokens: int = 512,
     device: str = "auto",
     dtype: str | None = None,
-    mlflow_enabled: bool = True,
-    max_tasks: int | None = None,
-) -> dict[str, Any]:
-    """평가 파이프라인 실행
+) -> tuple[Any, Any, dict[str, Any], torch.device]:
+    """평가용 모델과 토크나이저 로드
+
+    Temperature search 등에서 모델을 한 번만 로드하고 재사용할 때 사용.
 
     Args:
         checkpoint_path: Checkpoint 경로
-        dataset_name: "humaneval", "mbpp", "gsm8k", "codecontests"
-        num_samples_per_task: 각 문제당 생성 개수 (Pass@K 계산용)
-        temperature: Sampling temperature
-        max_new_tokens: 최대 생성 토큰 수
         device: 디바이스 ("auto", "cuda", "cpu", "mps")
-        dtype: 모델 dtype ("float16", "bfloat16", None=원본유지). MPS는 bfloat16 미지원으로 float16 권장
-        mlflow_enabled: MLflow 로깅 여부
-        max_tasks: 최대 평가 태스크 수 (테스트용, None=전체)
+        dtype: 모델 dtype ("float16", "bfloat16", None=원본유지)
 
     Returns:
-        {
-            "pass_at_k": {"pass@1": 0.2, "pass@5": 0.65, ...},
-            "per_task": [{"task_id": ..., "pass@1": ..., ...}, ...],
-            "checkpoint_metadata": {...}
-        }
-
-    Examples:
-        >>> results = run_evaluation(
-        ...     checkpoint_path="storage/checkpoints/baseline/checkpoint_best.pt",
-        ...     dataset_name="humaneval",
-        ...     num_samples_per_task=20,
-        ...     temperature=0.2,
-        ... )
-        >>> print(results["pass_at_k"])
-        {'pass@1': 0.24, 'pass@5': 0.68, 'pass@10': 0.85}
+        (model, tokenizer, checkpoint_metadata, device_obj)
     """
-    # 1. Setup
     logger = setup_logging("EVALUATION")
 
     # Device 설정 (auto: cuda > mps > cpu)
@@ -165,13 +140,11 @@ def run_evaluation(
         dtype_obj = torch.bfloat16
 
     logger.info(f"Checkpoint: {checkpoint_path}")
-    logger.info(f"Dataset: {dataset_name}")
-    logger.info(f"Samples per task: {num_samples_per_task}")
     logger.info(f"Device: {device_obj}")
     if dtype_obj is not None:
         logger.info(f"dtype: {dtype_obj}")
 
-    # 2. Load checkpoint (inference_only=True: extra_heads 스킵으로 ~1.2GB 절약)
+    # Load checkpoint (inference_only=True: extra_heads 스킵으로 ~1.2GB 절약)
     logger.info("Loading checkpoint...")
     model, checkpoint_metadata = load_checkpoint_for_evaluation(
         checkpoint_path=Path(checkpoint_path),
@@ -187,9 +160,99 @@ def run_evaluation(
         model.merge_lora()
         logger.info("LoRA weights merged for inference optimization")
 
-    # 3. Load tokenizer
+    # Load tokenizer
     tokenizer_path = resolve_tokenizer_path(checkpoint_metadata['config']['model']['path'])
     tokenizer = load_tokenizer(tokenizer_path)
+
+    return model, tokenizer, checkpoint_metadata, device_obj
+
+
+def run_evaluation(
+    checkpoint_path: str,
+    dataset_name: str = "humaneval",
+    num_samples_per_task: int = 20,
+    temperature: float = 0.2,
+    max_new_tokens: int = 512,
+    device: str = "auto",
+    dtype: str | None = None,
+    mlflow_enabled: bool = True,
+    max_tasks: int | None = None,
+    model: Any | None = None,
+    tokenizer: Any | None = None,
+    checkpoint_metadata: dict | None = None,
+    device_obj: torch.device | None = None,
+) -> dict[str, Any]:
+    """평가 파이프라인 실행
+
+    Args:
+        checkpoint_path: Checkpoint 경로
+        dataset_name: "humaneval", "mbpp", "gsm8k", "codecontests"
+        num_samples_per_task: 각 문제당 생성 개수 (Pass@K 계산용)
+        temperature: Sampling temperature
+        max_new_tokens: 최대 생성 토큰 수
+        device: 디바이스 ("auto", "cuda", "cpu", "mps")
+        dtype: 모델 dtype ("float16", "bfloat16", None=원본유지). MPS는 bfloat16 미지원으로 float16 권장
+        mlflow_enabled: MLflow 로깅 여부
+        max_tasks: 최대 평가 태스크 수 (테스트용, None=전체)
+        model: 외부에서 로드된 모델 (None이면 내부에서 로드)
+        tokenizer: 외부에서 로드된 토크나이저 (None이면 내부에서 로드)
+        checkpoint_metadata: 외부에서 로드된 메타데이터 (None이면 내부에서 로드)
+        device_obj: 외부에서 설정된 device (None이면 내부에서 설정)
+
+    Returns:
+        {
+            "pass_at_k": {"pass@1": 0.2, "pass@5": 0.65, ...},
+            "per_task": [{"task_id": ..., "pass@1": ..., ...}, ...],
+            "checkpoint_metadata": {...}
+        }
+
+    Examples:
+        >>> # 단일 평가
+        >>> results = run_evaluation(
+        ...     checkpoint_path="storage/checkpoints/baseline/checkpoint_best.pt",
+        ...     dataset_name="humaneval",
+        ...     num_samples_per_task=20,
+        ...     temperature=0.2,
+        ... )
+        >>> print(results["pass_at_k"])
+        {'pass@1': 0.24, 'pass@5': 0.68, 'pass@10': 0.85}
+
+        >>> # Temperature search (모델 재사용)
+        >>> model, tokenizer, metadata, dev = load_model_for_evaluation(checkpoint_path)
+        >>> for temp in [0.2, 0.8]:
+        ...     results = run_evaluation(
+        ...         checkpoint_path=checkpoint_path,
+        ...         temperature=temp,
+        ...         model=model,
+        ...         tokenizer=tokenizer,
+        ...         checkpoint_metadata=metadata,
+        ...         device_obj=dev,
+        ...     )
+    """
+    logger = setup_logging("EVALUATION")
+
+    # 모델이 외부에서 주입되지 않은 경우 내부에서 로드
+    if model is None or tokenizer is None or checkpoint_metadata is None:
+        model, tokenizer, checkpoint_metadata, device_obj = load_model_for_evaluation(
+            checkpoint_path=checkpoint_path,
+            device=device,
+            dtype=dtype,
+        )
+    elif device_obj is None:
+        # 모델은 주입되었지만 device_obj가 없는 경우
+        if device == "auto":
+            if torch.cuda.is_available():
+                device_obj = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                device_obj = torch.device("mps")
+            else:
+                device_obj = torch.device("cpu")
+        else:
+            device_obj = torch.device(device)
+
+    logger.info(f"Dataset: {dataset_name}")
+    logger.info(f"Samples per task: {num_samples_per_task}")
+    logger.info(f"Temperature: {temperature}")
 
     # 4. Load evaluation dataset
     logger.info(f"Loading {dataset_name} dataset...")

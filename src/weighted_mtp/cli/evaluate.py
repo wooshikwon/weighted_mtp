@@ -9,7 +9,7 @@ from pathlib import Path
 
 from weighted_mtp.core.env import ensure_env_loaded
 from weighted_mtp.core.logging import setup_logging
-from weighted_mtp.pipelines.run_evaluation import run_evaluation
+from weighted_mtp.pipelines.run_evaluation import load_model_for_evaluation, run_evaluation
 
 # 환경변수 로드 (MLflow credentials 등)
 ensure_env_loaded()
@@ -123,6 +123,13 @@ def main():
     try:
         all_results = []
 
+        # 모델을 한 번만 로드하고 여러 temperature에서 재사용
+        model, tokenizer, checkpoint_metadata, device_obj = load_model_for_evaluation(
+            checkpoint_path=args.checkpoint,
+            device=args.device,
+            dtype=args.dtype,
+        )
+
         for temp in temperatures:
             if len(temperatures) > 1:
                 logger.info(f"\n--- Temperature {temp} 평가 시작 ---")
@@ -137,6 +144,10 @@ def main():
                 dtype=args.dtype,
                 mlflow_enabled=not args.no_mlflow,
                 max_tasks=args.max_tasks,
+                model=model,
+                tokenizer=tokenizer,
+                checkpoint_metadata=checkpoint_metadata,
+                device_obj=device_obj,
             )
             results["temperature"] = temp
             all_results.append(results)
