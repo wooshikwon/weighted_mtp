@@ -356,7 +356,13 @@ def load_hf_lora_state_dict(
     current_state = model.state_dict()
     loaded_keys = []
 
+    # FSDP activation checkpointing wrapper 제거
+    normalized_lora_state = {}
     for k, v in lora_state_dict.items():
+        normalized_key = k.replace("_checkpoint_wrapped_module.", "")
+        normalized_lora_state[normalized_key] = v
+
+    for k, v in normalized_lora_state.items():
         if k in current_state:
             current_state[k] = v
             loaded_keys.append(k)
