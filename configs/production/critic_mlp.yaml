@@ -9,7 +9,7 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: ultimate-value-model
+  name: ultimate-value-model-400k
   description: "Independent Value Model pretraining for TD error calculation"
   stage: critic
   tags:
@@ -21,11 +21,11 @@ experiment:
 
 # 모델 설정
 models:
-  # 독립 Value Model (HuggingFace 기반, 2.7B)
+  # 독립 Value Model (SFT-merged 모델 기반, 2.7B)
   value_model:
-    name: ref-sheared-llama-2.7b
-    path: storage/models/ref-sheared-llama-2.7b/raw
-    tokenizer_path: storage/models/ref-sheared-llama-2.7b/raw
+    name: ref-sheared-llama-2.7b-sft
+    path: storage/models/ref-sheared-llama-2.7b/sft-merged
+    tokenizer_path: storage/models/ref-sheared-llama-2.7b/sft-merged
     dtype: bfloat16
 
 # 데이터셋 설정
