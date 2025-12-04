@@ -53,6 +53,10 @@ def parse_log_file(log_path: Path) -> list[dict]:
 
 def print_results_table(title: str, all_results: dict, datasets: list[str]):
     """결과 테이블 출력"""
+    print("=" * 80)
+    print(f"{title} Results")
+    print("=" * 80)
+    print()
     print(f"{'Dataset':<15} {'Temp':<6} {'Pass@1':>10} {'Pass@5':>10} {'Pass@10':>10} {'Pass@20':>10}")
     print("-" * 80)
 
@@ -130,32 +134,26 @@ def main():
                 verifiable_results[dataset] = results
 
     # Baseline 결과 출력
-    print("=" * 80)
-    print("BASELINE Results")
-    print("=" * 80)
-    print()
-
     if baseline_results:
-        print_results_table("Baseline", baseline_results, datasets)
+        print_results_table("BASELINE", baseline_results, datasets)
         print()
         print_temperature_avg(baseline_results)
     else:
+        print("=" * 80)
         print("[INFO] Baseline 결과 없음")
+        print("=" * 80)
 
     print()
 
     # Verifiable 결과 출력
-    print("=" * 80)
-    print("VERIFIABLE Results")
-    print("=" * 80)
-    print()
-
     if verifiable_results:
-        print_results_table("Verifiable", verifiable_results, datasets)
+        print_results_table("VERIFIABLE", verifiable_results, datasets)
         print()
         print_temperature_avg(verifiable_results)
     else:
+        print("=" * 80)
         print("[INFO] Verifiable 결과 없음")
+        print("=" * 80)
 
     print()
 

@@ -26,6 +26,7 @@ from weighted_mtp.utils import (
     execute_mbpp_tests,
     generate_with_mtp,
     load_checkpoint_for_evaluation,
+    strip_markdown_code_block,
 )
 
 
@@ -328,11 +329,15 @@ def run_evaluation(
         task_results = []
         for code in generated_codes:
             if dataset_name == "humaneval":
-                # HumanEval: check(candidate) 형식
+                # HumanEval: prompt(함수 시그니처) + 생성된 코드(함수 본문) = 완전한 함수
+                # 1. 생성된 코드에서 markdown 먼저 제거 (```python...``` 블록)
+                # 2. prompt와 결합하여 완전한 함수 생성
+                clean_code = strip_markdown_code_block(code)
+                full_code = prompt + clean_code
                 test_code = sample["metadata"]["test"]
                 entry_point = sample["metadata"]["entry_point"]
                 passed = execute_code_with_tests(
-                    code=code,
+                    code=full_code,
                     test_code=test_code,
                     entry_point=entry_point,
                     timeout=5,

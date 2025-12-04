@@ -41,8 +41,8 @@ def main():
     parser.add_argument(
         "--num-samples",
         type=int,
-        default=20,
-        help="문제당 생성 샘플 수 (Pass@K 계산용, 기본: 20)",
+        default=None,
+        help="문제당 생성 샘플 수 (기본: codecontests=20, 나머지=100)",
     )
     parser.add_argument(
         "--temperature",
@@ -92,6 +92,13 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # 데이터셋별 기본 샘플 수 설정
+    if args.num_samples is None:
+        if args.dataset == "codecontests":
+            args.num_samples = 10
+        else:
+            args.num_samples = 100
 
     # Checkpoint 파일 존재 확인
     checkpoint_path = Path(args.checkpoint)

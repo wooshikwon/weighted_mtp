@@ -21,6 +21,7 @@ from weighted_mtp.utils.evaluation_utils import (
     execute_codecontests_tests,
     execute_mbpp_tests,
     extract_gsm8k_answer,
+    strip_markdown_code_block,
 )
 from weighted_mtp.utils.generation_utils import (
     generate_with_mtp,
@@ -89,6 +90,7 @@ __all__ = [
     "execute_codecontests_tests",
     "execute_mbpp_tests",
     "extract_gsm8k_answer",
+    "strip_markdown_code_block",
     # Generation utils
     "generate_with_mtp",
     # Metrics utils

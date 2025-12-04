@@ -1,7 +1,7 @@
 # Verifiable WMTP (TD Weighting with Independent Value Model)
 # Policy Model: MTP 학습 대상 (LoRA)
 # Value Model: Critic checkpoint에서 로드, eval only
-# 프로덕션 설정 (VESSL H200 3-GPU)
+# 프로덕션 설정 (VESSL H200 4-GPU)
 
 # 프로젝트 정보
 project:
@@ -62,11 +62,11 @@ data_sampling:
   difficulty_weights:
     zero: 1.0
 
-# 학습 설정 (H100 4-GPU 최적화)
+# 학습 설정 (H200 4-GPU 최적화)
 training:
   n_epochs: 1.0
-  batch_size: 12  # Per GPU (OOM 방지를 위해 24→12로 축소)
-  gradient_accumulation_steps: 2  # Effective batch size = 12 × 2 × 4 = 96 (GPU 4장 환경)
+  batch_size: 24  # Per GPU
+  gradient_accumulation_steps: 1  # Effective batch size = 24 × 1 × 4 = 96 (GPU 4장 환경)
 
   # 학습률 (Policy Model LoRA)
   learning_rate: 1.0e-4
