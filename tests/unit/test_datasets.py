@@ -4,14 +4,17 @@
 - 데이터셋 로딩 기본 기능
 - Unique pair 샘플링 (correct_idx, incorrect_idx 모두 unique)
 - Difficulty-based sampling (difficulty_weights, difficulty_bins 필수)
+- Length-balanced sampling (같은 length bin 내 매칭)
 - max_pairs_per_problem 적용
 - 재현성 (seed 고정)
 """
 
 import pytest
+from collections import Counter
 from datasets import Dataset
 
 from weighted_mtp.data import load_dataset
+from weighted_mtp.data.datasets import _sample_length_balanced_pairs
 
 
 # 기본 샘플링 설정 (모든 테스트에서 재사용)
@@ -460,3 +463,130 @@ class TestSampleUniquePairs:
         incorrect_indices = [p["incorrect_idx"] for p in pairs]
         assert len(correct_indices) == len(set(correct_indices)), "대규모에서 correct_idx 중복"
         assert len(incorrect_indices) == len(set(incorrect_indices)), "대규모에서 incorrect_idx 중복"
+
+
+class TestLengthBalancedSampling:
+    """Length-Balanced 샘플링 테스트
+
+    검증 항목:
+    - 같은 length bin 내에서만 매칭
+    - 모든 correct_idx unique
+    - 모든 incorrect_idx unique
+    - n_samples 정확히 달성
+    """
+
+    @pytest.fixture
+    def mock_problem_index_map_with_lengths(self):
+        """토큰 길이 정보 포함 problem_index_map"""
+        return {
+            "prob1": {
+                "difficulty": 7,
+                "correct_indices": [0, 1, 2, 3, 4],
+                "incorrect_indices": [100, 101, 102, 103, 104],
+                "correct_token_lengths": [80, 150, 350, 120, 180],
+                "incorrect_token_lengths": [90, 160, 380, 110, 170],
+            },
+            "prob2": {
+                "difficulty": 10,
+                "correct_indices": [10, 11, 12, 13],
+                "incorrect_indices": [110, 111, 112, 113],
+                "correct_token_lengths": [200, 250, 400, 95],
+                "incorrect_token_lengths": [210, 240, 420, 105],
+            },
+        }
+
+    def test_same_bin_matching(self, mock_problem_index_map_with_lengths):
+        """같은 length bin 내에서만 매칭되는지 검증"""
+        length_bins = [0, 100, 200, 500]
+
+        pairs = _sample_length_balanced_pairs(
+            problem_index_map=mock_problem_index_map_with_lengths,
+            n_samples=5,
+            length_bins=length_bins,
+            seed=42,
+        )
+
+        # 각 쌍의 length_bin이 존재하는지 확인
+        for pair in pairs:
+            assert "length_bin" in pair, "length_bin 필드 누락"
+            assert pair["length_bin"] is not None
+
+    def test_all_correct_idx_unique(self, mock_problem_index_map_with_lengths):
+        """모든 correct_idx가 unique한지 검증"""
+        pairs = _sample_length_balanced_pairs(
+            problem_index_map=mock_problem_index_map_with_lengths,
+            n_samples=5,
+            length_bins=[0, 100, 200, 500],
+            seed=42,
+        )
+
+        correct_indices = [p["correct_idx"] for p in pairs]
+        assert len(correct_indices) == len(set(correct_indices)), "correct_idx에 중복 존재"
+
+    def test_all_incorrect_idx_unique(self, mock_problem_index_map_with_lengths):
+        """모든 incorrect_idx가 unique한지 검증"""
+        pairs = _sample_length_balanced_pairs(
+            problem_index_map=mock_problem_index_map_with_lengths,
+            n_samples=5,
+            length_bins=[0, 100, 200, 500],
+            seed=42,
+        )
+
+        incorrect_indices = [p["incorrect_idx"] for p in pairs]
+        assert len(incorrect_indices) == len(set(incorrect_indices)), "incorrect_idx에 중복 존재"
+
+    def test_max_pairs_per_problem_enforced(self, mock_problem_index_map_with_lengths):
+        """max_pairs_per_problem 제한이 적용되는지 검증"""
+        pairs = _sample_length_balanced_pairs(
+            problem_index_map=mock_problem_index_map_with_lengths,
+            n_samples=3,
+            length_bins=[0, 100, 200, 500],
+            seed=42,
+            max_pairs_per_problem=2,
+        )
+
+        problem_counts = Counter(p["problem_id"] for p in pairs)
+        max_count = max(problem_counts.values())
+        assert max_count <= 2, f"max_pairs_per_problem=2인데 {max_count}개 쌍 발생"
+
+    def test_missing_token_lengths_raises_error(self):
+        """토큰 길이 정보 없을 때 에러 발생 검증"""
+        problem_map_no_lengths = {
+            "prob1": {
+                "difficulty": 7,
+                "correct_indices": [0, 1],
+                "incorrect_indices": [100, 101],
+            }
+        }
+
+        with pytest.raises(ValueError, match="토큰 길이 정보가 없습니다"):
+            _sample_length_balanced_pairs(
+                problem_index_map=problem_map_no_lengths,
+                n_samples=2,
+                length_bins=[0, 100, 200],
+                seed=42,
+            )
+
+    def test_reproducibility_with_same_seed(self, mock_problem_index_map_with_lengths):
+        """동일 seed로 동일한 결과 반환 검증"""
+        config = {
+            "problem_index_map": mock_problem_index_map_with_lengths,
+            "n_samples": 5,
+            "length_bins": [0, 100, 200, 500],
+            "seed": 42,
+        }
+
+        pairs1 = _sample_length_balanced_pairs(**config)
+        pairs2 = _sample_length_balanced_pairs(**config)
+
+        assert pairs1 == pairs2, "동일 seed면 동일한 결과여야 함"
+
+    def test_insufficient_data_raises_error(self, mock_problem_index_map_with_lengths):
+        """데이터 부족 시 ValueError 발생 검증"""
+        with pytest.raises(ValueError, match="데이터 부족"):
+            _sample_length_balanced_pairs(
+                problem_index_map=mock_problem_index_map_with_lengths,
+                n_samples=100,  # 가용량보다 큰 값
+                length_bins=[0, 100, 200, 500],
+                seed=42,
+            )

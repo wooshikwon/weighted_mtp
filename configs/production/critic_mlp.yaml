@@ -54,11 +54,6 @@ data_sampling:
   difficulty_weights:
     zero: 1.0
 
-  # Collator 설정
-  collator:
-    use_random_window: false  # length-balanced 시 불필요
-    window_size: 192
-
 # 학습 설정 (H100 80GB 4-GPU 최적화)
 training:
   n_epochs: 1.0

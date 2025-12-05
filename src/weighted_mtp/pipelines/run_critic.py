@@ -518,13 +518,6 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
     sampling_config["use_pairwise"] = True  # value head 학습은 항상 pairwise
     logger.info("Pairwise 모드 (value head 학습)")
 
-    # collator_config 추출 (random window 등)
-    collator_config = OmegaConf.to_container(config.data_sampling.get("collator", {}), resolve=True)
-    if collator_config.get("use_random_window", False):
-        logger.info(
-            f"Random Window 활성화: window_size={collator_config.get('window_size', 192)}"
-        )
-
     train_loader = create_dataloader(
         dataset_path=config.dataset.train,
         tokenizer=tokenizer,
@@ -533,7 +526,6 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
         sampling_config=sampling_config,
         seed=config.data_sampling.seed,
         shuffle=True,
-        collator_config=collator_config,
     )
 
     # Validation용 sampling_config (val_n_samples 적용)
@@ -548,7 +540,6 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
         sampling_config=val_sampling_config,
         seed=config.data_sampling.seed,
         shuffle=False,
-        collator_config=collator_config,
     )
 
     logger.info(f"Train batches: {len(train_loader)}")

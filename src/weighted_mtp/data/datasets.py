@@ -623,7 +623,8 @@ def _sample_length_balanced_pairs(
             bin_label = get_bin_label(length)
             incorrect_by_bin[bin_label].append({"idx": idx, "length": length})
 
-        # 같은 bin 내에서 1:1 매칭
+        # 같은 bin 내에서 1:1 매칭 (problem 전체 기준 max_pairs_per_problem 적용)
+        problem_pairs = []
         for bin_label in set(correct_by_bin.keys()) & set(incorrect_by_bin.keys()):
             c_list = correct_by_bin[bin_label]
             i_list = incorrect_by_bin[bin_label]
@@ -632,16 +633,21 @@ def _sample_length_balanced_pairs(
             random.shuffle(i_list)
 
             n_pairs = min(len(c_list), len(i_list))
-            if max_pairs_per_problem:
-                n_pairs = min(n_pairs, max_pairs_per_problem)
 
             for j in range(n_pairs):
-                all_pairs.append({
+                problem_pairs.append({
                     "correct_idx": c_list[j]["idx"],
                     "incorrect_idx": i_list[j]["idx"],
                     "problem_id": pid,
                     "length_bin": bin_label,
                 })
+
+        # problem 전체에 대해 max_pairs_per_problem 적용
+        if max_pairs_per_problem and len(problem_pairs) > max_pairs_per_problem:
+            random.shuffle(problem_pairs)
+            problem_pairs = problem_pairs[:max_pairs_per_problem]
+
+        all_pairs.extend(problem_pairs)
 
     # 셔플 및 샘플링
     random.shuffle(all_pairs)
