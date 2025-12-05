@@ -21,11 +21,10 @@ experiment:
 
 # 모델 설정
 models:
-  # 독립 Value Model (SFT-merged 모델 기반, 2.7B)
+  # 독립 Value Model (raw 모델 기반, 2.7B)
   value_model:
-    name: ref-sheared-llama-2.7b-sft
-    path: storage/models/ref-sheared-llama-2.7b/sft-merged
-    tokenizer_path: storage/models/ref-sheared-llama-2.7b/sft-merged
+    name: ref-sheared-llama-2.7b
+    path: storage/models/ref-sheared-llama-2.7b/raw
     dtype: bfloat16
 
 # 데이터셋 설정
@@ -98,7 +97,7 @@ training:
     # Lambda 설정 (constant 0.995 = 약 200 토큰 effective propagation)
     lambda_schedule:
       type: constant        # 학습 전체에 걸쳐 일정한 λ 사용
-      value: 0.995          # λ=0.995: MC에 가깝지만 TD 안정성 확보
+      value: 0.995          # λ=0.99: MC에 가깝지만 TD 안정성 확보
 
   # Learning rate scheduler (공유)
   lr_scheduler:

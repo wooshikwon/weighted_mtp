@@ -108,6 +108,101 @@ def compute_token_variance(
     return seq_variance.mean().item()
 
 
+def compute_td_error_stats(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+) -> dict[str, float]:
+    """TD Error 스파이크 분석 (좋은 Variance vs 나쁜 Variance 구분)
+
+    좋은 학습: 특정 토큰에서 TD error 스파이크 발생 (spikiness 높음)
+    나쁜 학습: 모든 토큰에서 밋밋한 TD error (spikiness 낮음, 길이 편향)
+
+    Args:
+        values: [batch, seq, 1] Value head 출력
+        mask: [batch, seq] 유효 토큰 마스크 (labels != -100)
+
+    Returns:
+        dict with:
+            mean_abs_td: 평균 |δ_t| (TD 크기)
+            max_td: 최대 |δ_t| (스파이크 크기)
+            spikiness: max_td / mean_abs_td (클수록 좋음, >3이면 건강)
+    """
+    values = values.squeeze(-1)  # [batch, seq]
+
+    # TD error: δ_t = V_{t+1} - V_t
+    td_errors = values[:, 1:] - values[:, :-1]  # [batch, seq-1]
+    td_mask = mask[:, 1:] * mask[:, :-1]  # 둘 다 valid해야 함
+
+    abs_td = torch.abs(td_errors) * td_mask
+
+    # 시퀀스별 통계
+    seq_lengths = td_mask.sum(dim=1).clamp(min=1)
+    mean_abs_td = abs_td.sum(dim=1) / seq_lengths
+
+    # Masked max: invalid 위치는 -inf로 처리
+    masked_abs_td = abs_td.clone()
+    masked_abs_td[td_mask == 0] = -float('inf')
+    max_td = masked_abs_td.max(dim=1).values
+    max_td = torch.where(max_td == -float('inf'), torch.zeros_like(max_td), max_td)
+
+    spikiness = max_td / (mean_abs_td + 1e-8)
+
+    return {
+        "mean_abs_td": mean_abs_td.mean().item(),
+        "max_td": max_td.mean().item(),
+        "spikiness": spikiness.mean().item(),
+    }
+
+
+def compute_position_correlation(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+) -> float:
+    """V(t)와 position의 Pearson 상관관계 (길이 편향 감지)
+
+    높은 상관관계: "뒤로 갈수록 V 상승" = 길이 편향 (암기)
+    낮은 상관관계: 위치와 무관하게 V 결정 = 논리적 학습
+
+    Args:
+        values: [batch, seq, 1] Value head 출력
+        mask: [batch, seq] 유효 토큰 마스크 (labels != -100)
+
+    Returns:
+        correlation: -1~1 (>0.7이면 길이 편향 의심)
+    """
+    values = values.squeeze(-1)  # [batch, seq]
+    batch_size, seq_len = values.shape
+    device = values.device
+
+    # Position index (0, 1, 2, ...)
+    positions = torch.arange(seq_len, device=device, dtype=values.dtype)
+    positions = positions.unsqueeze(0).expand(batch_size, -1)
+
+    correlations = []
+    for b in range(batch_size):
+        valid_idx = mask[b].bool()
+        n_valid = valid_idx.sum().item()
+        if n_valid < 3:  # 최소 3개 토큰 필요
+            continue
+
+        v = values[b, valid_idx]
+        p = positions[b, valid_idx]
+
+        # Pearson correlation
+        v_mean = v.mean()
+        p_mean = p.mean()
+        v_centered = v - v_mean
+        p_centered = p - p_mean
+
+        numerator = (v_centered * p_centered).sum()
+        denominator = v_centered.norm() * p_centered.norm() + 1e-8
+
+        corr = (numerator / denominator).item()
+        correlations.append(corr)
+
+    return sum(correlations) / len(correlations) if correlations else 0.0
+
+
 def get_scheduled_lambda(
     current_step: int,
     warmup_steps: int = 250,
