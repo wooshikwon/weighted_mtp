@@ -40,13 +40,14 @@ data_sampling:
   use_pairwise: true
   val_n_samples: 500        # Validation 샘플 수
 
-  n_samples: 200000
+  n_samples: 200000 
   max_pairs_per_problem: 60  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
 
   # Length-Balanced 샘플링 (길이 편향 제거)
   # 같은 problem 내 같은 length bin에서 correct/incorrect 매칭
+  # 세분화된 bin으로 평균 |Diff| 42.7 → 18.8 토큰 (56% 감소)
   use_length_balanced: true
-  length_bins: [0, 100, 150, 200, 300, 500, 1000, 2000]
+  length_bins: [0, 50, 100, 125, 150, 175, 200, 250, 300, 350, 400, 500, 600, 800, 1000, 1500, 2000]
 
   # Difficulty 기반 설정 (use_length_balanced=true 시에도 difficulty 필터로 사용)
   difficulty_bins:
