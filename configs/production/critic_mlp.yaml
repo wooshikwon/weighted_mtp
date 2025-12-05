@@ -9,7 +9,7 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: last-final-value-model-stratified-MC
+  name: last-final-value-model-pairwise-ranking
   description: "Independent Value Model pretraining for TD error calculation"
   stage: critic
   tags:
@@ -82,28 +82,28 @@ training:
       - gate_proj
       - up_proj
       - down_proj
-    learning_rate: 1.0e-5  # OREO 기준 조정 (5e-5 → 1e-5)
+    learning_rate: 5.0e-5  # Value head 학습에 맞춰 상향 조정
     weight_decay: 0.01
 
   # Value Head 설정
   value_head:
     type: mlp
     dropout: 0.2
-    learning_rate: 5.0e-5  # OREO 기준 조정 (2e-4 → 5e-5)
+    learning_rate: 1.0e-3  # OVM 기준 상향 (5e-5 → 1e-3, 20배 증가)
     weight_decay: 0.01
 
   # Value loss 설정
   value_loss:
-    type: "lambda_return"   # "lambda_return" | "pairwise_ranking"
-    loss_fn: "huber"        # "mse" | "huber" (0/1 terminal reward에 robust)
-    huber_delta: 0.5        # Huber loss delta (reward 범위 0~1에 맞춤)
+    type: "pairwise_ranking"   # "lambda_return" | "pairwise_ranking"
+    loss_fn: "huber"        # "mse" | "huber" (lambda_return 전용)
+    huber_delta: 0.5        # Huber loss delta (lambda_return 전용)
     gamma: 1.0              # Discount factor (lambda_return 전용)
     coef: 1.0               # Loss coefficient
-    bias_init: 0.5          # Value head bias 초기값 (기대값 일치)
+    bias_init: 0.0          # Pairwise ranking: 0 초기화 (상대적 순서만 학습)
 
     lambda_schedule:
-      type: constant        # 학습 전체에 걸쳐 일정한 λ 사용
-      value: 1.0            # λ=1.0: MC
+      type: constant        # lambda_return 전용
+      value: 1.0            # lambda_return 전용
 
   # Learning rate scheduler (공유)
   lr_scheduler:

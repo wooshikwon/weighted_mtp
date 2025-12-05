@@ -1,0 +1,14 @@
+artifact_uri: file:///workspace/weighted_mtp/mlruns/519782836693531210/de920f04f328428b99e6199735882da2/artifacts
+end_time: 1764755281329
+entry_point_name: ''
+experiment_id: '519782836693531210'
+lifecycle_stage: active
+run_id: de920f04f328428b99e6199735882da2
+run_name: ultimate-value-model
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764755259951
+status: 3
+tags: []
+user_id: root

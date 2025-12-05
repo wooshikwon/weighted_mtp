@@ -1,0 +1,14 @@
+artifact_uri: file:///workspace/weighted_mtp/mlruns/531320661814715863/1a84fbc2a7324f748b95c980f9226546/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '531320661814715863'
+lifecycle_stage: active
+run_id: 1a84fbc2a7324f748b95c980f9226546
+run_name: eval_codecontests_checkpoint_final
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764822575165
+status: 1
+tags: []
+user_id: root

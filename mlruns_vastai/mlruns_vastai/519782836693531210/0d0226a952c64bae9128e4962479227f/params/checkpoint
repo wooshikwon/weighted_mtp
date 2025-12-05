@@ -1,0 +1,1 @@
+{'save_dir': 'storage/checkpoints/critic/last-final-value-model-stratified-MC', 'save_checkpoint_every': 0.1, 'save_best': True, 'save_final': True, 'save_total_limit': 6, 's3_upload': False}

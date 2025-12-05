@@ -1,0 +1,14 @@
+artifact_uri: file:///workspace/weighted_mtp/mlruns/519782836693531210/9e09f82c4bdd4a7ea3051df2186d9ea3/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '519782836693531210'
+lifecycle_stage: active
+run_id: 9e09f82c4bdd4a7ea3051df2186d9ea3
+run_name: ultimate-ref-tuning
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764862489467
+status: 1
+tags: []
+user_id: root

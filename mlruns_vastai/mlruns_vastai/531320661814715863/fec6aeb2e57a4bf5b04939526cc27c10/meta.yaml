@@ -1,0 +1,14 @@
+artifact_uri: file:///workspace/weighted_mtp/mlruns/531320661814715863/fec6aeb2e57a4bf5b04939526cc27c10/artifacts
+end_time: 1764835513424
+entry_point_name: ''
+experiment_id: '531320661814715863'
+lifecycle_stage: active
+run_id: fec6aeb2e57a4bf5b04939526cc27c10
+run_name: eval_humaneval_checkpoint_final
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764835133314
+status: 3
+tags: []
+user_id: root

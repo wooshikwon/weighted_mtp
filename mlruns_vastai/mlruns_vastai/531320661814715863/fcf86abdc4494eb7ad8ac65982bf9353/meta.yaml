@@ -1,0 +1,15 @@
+artifact_uri: file:///workspace/weighted_mtp/mlruns/531320661814715863/fcf86abdc4494eb7ad8ac65982bf9353/artifacts
+deleted_time: 1764817974806
+end_time: 1764744972713
+entry_point_name: ''
+experiment_id: '531320661814715863'
+lifecycle_stage: deleted
+run_id: fcf86abdc4494eb7ad8ac65982bf9353
+run_name: eval_gsm8k_checkpoint_epoch_1.80
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764743716101
+status: 3
+tags: []
+user_id: root

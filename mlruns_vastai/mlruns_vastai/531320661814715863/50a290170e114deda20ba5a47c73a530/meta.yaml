@@ -1,0 +1,15 @@
+artifact_uri: file:///workspace/weighted_mtp/mlruns/531320661814715863/50a290170e114deda20ba5a47c73a530/artifacts
+deleted_time: 1764817974317
+end_time: 1764752612271
+entry_point_name: ''
+experiment_id: '531320661814715863'
+lifecycle_stage: deleted
+run_id: 50a290170e114deda20ba5a47c73a530
+run_name: eval_mbpp_checkpoint_epoch_1.80
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764751262655
+status: 3
+tags: []
+user_id: root

@@ -1,0 +1,14 @@
+artifact_uri: file:///workspace/weighted_mtp/mlruns/519782836693531210/a94a23568fc849d7887fd872f5706d5d/artifacts
+end_time: 1764779026641
+entry_point_name: ''
+experiment_id: '519782836693531210'
+lifecycle_stage: active
+run_id: a94a23568fc849d7887fd872f5706d5d
+run_name: ultimate-verifiable
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1764774690527
+status: 3
+tags: []
+user_id: root

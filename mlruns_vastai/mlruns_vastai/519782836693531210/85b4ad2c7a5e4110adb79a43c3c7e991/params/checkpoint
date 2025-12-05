@@ -1,0 +1,1 @@
+{'save_dir': 'storage/checkpoints/verifiable/ultimate-verifiable', 'save_checkpoint_every': 0.2, 'save_best': True, 'save_final': True, 'save_total_limit': 3, 's3_upload': False, 'save_lora_only': True}
