@@ -158,8 +158,11 @@ def validate_critic(
     total_pos_variance = 0.0
     total_neg_variance = 0.0
     # 좋은 Variance vs 나쁜 Variance 진단용
+    total_pos_spikiness = 0.0
     total_neg_spikiness = 0.0
+    total_pos_mean_abs_td = 0.0
     total_neg_mean_abs_td = 0.0
+    total_pos_pos_corr = 0.0
     total_neg_pos_corr = 0.0
 
     # 모델 dtype 감지
@@ -224,7 +227,9 @@ def validate_critic(
             neg_var = compute_token_variance(neg_value_logits, neg_loss_mask)
 
             # TD Error 스파이크 분석 (좋은 Variance vs 나쁜 Variance 구분)
+            pos_td_stats = compute_td_error_stats(pos_value_logits, pos_loss_mask)
             neg_td_stats = compute_td_error_stats(neg_value_logits, neg_loss_mask)
+            pos_pos_corr = compute_position_correlation(pos_value_logits, pos_loss_mask)
             neg_pos_corr = compute_position_correlation(neg_value_logits, neg_loss_mask)
 
             total_loss += value_loss.item()
@@ -234,8 +239,11 @@ def validate_critic(
             total_mean_neg += pairwise_metrics["mean_neg"]
             total_pos_variance += pos_var
             total_neg_variance += neg_var
+            total_pos_spikiness += pos_td_stats["spikiness"]
             total_neg_spikiness += neg_td_stats["spikiness"]
+            total_pos_mean_abs_td += pos_td_stats["mean_abs_td"]
             total_neg_mean_abs_td += neg_td_stats["mean_abs_td"]
+            total_pos_pos_corr += pos_pos_corr
             total_neg_pos_corr += neg_pos_corr
             n_batches += 1
 
@@ -247,8 +255,11 @@ def validate_critic(
     avg_margin = avg_mean_pos - avg_mean_neg
     avg_pos_variance = total_pos_variance / n_batches if n_batches > 0 else 0.0
     avg_neg_variance = total_neg_variance / n_batches if n_batches > 0 else 0.0
+    avg_pos_spikiness = total_pos_spikiness / n_batches if n_batches > 0 else 0.0
     avg_neg_spikiness = total_neg_spikiness / n_batches if n_batches > 0 else 0.0
+    avg_pos_mean_abs_td = total_pos_mean_abs_td / n_batches if n_batches > 0 else 0.0
     avg_neg_mean_abs_td = total_neg_mean_abs_td / n_batches if n_batches > 0 else 0.0
+    avg_pos_pos_corr = total_pos_pos_corr / n_batches if n_batches > 0 else 0.0
     avg_neg_pos_corr = total_neg_pos_corr / n_batches if n_batches > 0 else 0.0
 
     metrics = {
@@ -259,9 +270,13 @@ def validate_critic(
         "val_margin": avg_margin,
         "val_pos_token_variance": avg_pos_variance,
         "val_neg_token_variance": avg_neg_variance,
-        # 좋은 Variance vs 나쁜 Variance 진단
+        # TD Error 스파이크 진단 (pos: 낮아야 좋음, neg: 높아야 좋음)
+        "val_pos_spikiness": avg_pos_spikiness,
         "val_neg_spikiness": avg_neg_spikiness,
+        "val_pos_mean_abs_td": avg_pos_mean_abs_td,
         "val_neg_mean_abs_td": avg_neg_mean_abs_td,
+        # Position correlation (|값| < 0.3이면 건강)
+        "val_pos_position_corr": avg_pos_pos_corr,
         "val_neg_position_corr": avg_neg_pos_corr,
     }
 
@@ -276,8 +291,11 @@ def validate_critic(
             "mean_neg_sum": total_mean_neg,
             "pos_variance_sum": total_pos_variance,
             "neg_variance_sum": total_neg_variance,
+            "pos_spikiness_sum": total_pos_spikiness,
             "neg_spikiness_sum": total_neg_spikiness,
+            "pos_mean_abs_td_sum": total_pos_mean_abs_td,
             "neg_mean_abs_td_sum": total_neg_mean_abs_td,
+            "pos_pos_corr_sum": total_pos_pos_corr,
             "neg_pos_corr_sum": total_neg_pos_corr,
         }
 
@@ -783,7 +801,9 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             neg_token_var = compute_token_variance(neg_value_logits, neg_loss_mask)
 
             # TD Error 스파이크 분석 (좋은 Variance vs 나쁜 Variance 구분)
+            pos_td_stats = compute_td_error_stats(pos_value_logits, pos_loss_mask)
             neg_td_stats = compute_td_error_stats(neg_value_logits, neg_loss_mask)
+            pos_pos_corr = compute_position_correlation(pos_value_logits, pos_loss_mask)
             neg_pos_corr = compute_position_correlation(neg_value_logits, neg_loss_mask)
 
             # Throughput용 변수
@@ -841,8 +861,11 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
                         "mean_neg": batch_mean_neg,
                         "pos_token_var": pos_token_var,
                         "neg_token_var": neg_token_var,
+                        "pos_spikiness": pos_td_stats["spikiness"],
                         "neg_spikiness": neg_td_stats["spikiness"],
+                        "pos_mean_abs_td": pos_td_stats["mean_abs_td"],
                         "neg_mean_abs_td": neg_td_stats["mean_abs_td"],
+                        "pos_pos_corr": pos_pos_corr,
                         "neg_pos_corr": neg_pos_corr,
                     })
 
@@ -859,9 +882,13 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
                                 "value/margin": reduced["mean_pos"] - reduced["mean_neg"],
                                 "value/pos_token_variance": reduced["pos_token_var"],
                                 "value/neg_token_variance": reduced["neg_token_var"],
-                                # 좋은 Variance vs 나쁜 Variance 진단 메트릭
+                                # TD Error 스파이크 진단 (pos: 낮아야 좋음, neg: 높아야 좋음)
+                                "value/pos_spikiness": reduced["pos_spikiness"],
                                 "value/neg_spikiness": reduced["neg_spikiness"],
+                                "value/pos_mean_abs_td": reduced["pos_mean_abs_td"],
                                 "value/neg_mean_abs_td": reduced["neg_mean_abs_td"],
+                                # Position correlation (|값| < 0.3이면 건강)
+                                "value/pos_position_corr": reduced["pos_pos_corr"],
                                 "value/neg_position_corr": reduced["neg_pos_corr"],
                                 "system/gpu_memory_allocated_gb": gpu_metrics["gpu_memory_allocated_gb"],
                             }
@@ -959,8 +986,11 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             "mean_neg_sum": raw_counts["mean_neg_sum"],
             "pos_variance_sum": raw_counts["pos_variance_sum"],
             "neg_variance_sum": raw_counts["neg_variance_sum"],
+            "pos_spikiness_sum": raw_counts["pos_spikiness_sum"],
             "neg_spikiness_sum": raw_counts["neg_spikiness_sum"],
+            "pos_mean_abs_td_sum": raw_counts["pos_mean_abs_td_sum"],
             "neg_mean_abs_td_sum": raw_counts["neg_mean_abs_td_sum"],
+            "pos_pos_corr_sum": raw_counts["pos_pos_corr_sum"],
             "neg_pos_corr_sum": raw_counts["neg_pos_corr_sum"],
         }, op="sum")
 
@@ -971,8 +1001,11 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
         avg_val_margin = avg_val_mean_pos - avg_val_mean_neg
         avg_val_pos_variance = reduced_val_counts["pos_variance_sum"] / max(1, reduced_val_counts["n_batches"])
         avg_val_neg_variance = reduced_val_counts["neg_variance_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_pos_spikiness = reduced_val_counts["pos_spikiness_sum"] / max(1, reduced_val_counts["n_batches"])
         avg_val_neg_spikiness = reduced_val_counts["neg_spikiness_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_pos_mean_abs_td = reduced_val_counts["pos_mean_abs_td_sum"] / max(1, reduced_val_counts["n_batches"])
         avg_val_neg_mean_abs_td = reduced_val_counts["neg_mean_abs_td_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_pos_pos_corr = reduced_val_counts["pos_pos_corr_sum"] / max(1, reduced_val_counts["n_batches"])
         avg_val_neg_pos_corr = reduced_val_counts["neg_pos_corr_sum"] / max(1, reduced_val_counts["n_batches"])
 
         # Epoch-level 로깅
@@ -988,9 +1021,13 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
                         "val/margin": avg_val_margin,
                         "val/pos_token_variance": avg_val_pos_variance,
                         "val/neg_token_variance": avg_val_neg_variance,
-                        # 좋은 Variance vs 나쁜 Variance 진단 메트릭
+                        # TD Error 스파이크 진단 (pos: 낮아야 좋음, neg: 높아야 좋음)
+                        "val/pos_spikiness": avg_val_pos_spikiness,
                         "val/neg_spikiness": avg_val_neg_spikiness,
+                        "val/pos_mean_abs_td": avg_val_pos_mean_abs_td,
                         "val/neg_mean_abs_td": avg_val_neg_mean_abs_td,
+                        # Position correlation (|값| < 0.3이면 건강)
+                        "val/pos_position_corr": avg_val_pos_pos_corr,
                         "val/neg_position_corr": avg_val_neg_pos_corr,
                         "perf/epoch_time_sec": throughput_metrics["epoch_time_sec"],
                         "perf/samples_per_sec": throughput_metrics["samples_per_sec"],
@@ -1015,8 +1052,11 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             "val_margin": avg_val_margin,
             "val_pos_token_variance": avg_val_pos_variance,
             "val_neg_token_variance": avg_val_neg_variance,
+            "val_pos_spikiness": avg_val_pos_spikiness,
             "val_neg_spikiness": avg_val_neg_spikiness,
+            "val_pos_mean_abs_td": avg_val_pos_mean_abs_td,
             "val_neg_mean_abs_td": avg_val_neg_mean_abs_td,
+            "val_pos_position_corr": avg_val_pos_pos_corr,
             "val_neg_position_corr": avg_val_neg_pos_corr,
         }
 
