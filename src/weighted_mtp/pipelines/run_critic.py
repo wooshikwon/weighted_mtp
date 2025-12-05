@@ -1073,41 +1073,42 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             "val_neg_position_corr": avg_val_neg_pos_corr,
         }
 
-        # Checkpoint 저장 (validation margin 기준)
-        if avg_val_margin > best_val_margin:
+        # Checkpoint 저장 (매 validation마다 저장, cleanup으로 최신 N개만 유지)
+        is_best = avg_val_margin > best_val_margin
+        if is_best:
             best_val_margin = avg_val_margin
-            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}.pt"
 
-            # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
-            save_value_model_checkpoint(
-                value_model=value_model,
-                optimizer=optimizer,
-                epoch=current_epoch,
-                train_metrics={"train_loss": train_loss_avg},
-                val_metrics=aggregated_val_metrics,
-                checkpoint_path=checkpoint_path,
-                config=config,
-                s3_upload=use_s3_upload,
-                experiment_name=config.experiment.name,
-            )
+        checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}.pt"
 
-            # 로깅 및 cleanup은 rank 0만 수행
-            if is_main_process():
-                logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_margin: {best_val_margin:.4f})")
+        # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
+        save_value_model_checkpoint(
+            value_model=value_model,
+            optimizer=optimizer,
+            epoch=current_epoch,
+            train_metrics={"train_loss": train_loss_avg},
+            val_metrics=aggregated_val_metrics,
+            checkpoint_path=checkpoint_path,
+            config=config,
+            s3_upload=use_s3_upload,
+            experiment_name=config.experiment.name,
+        )
 
-                if config.checkpoint.save_total_limit:
-                    cleanup_old_checkpoints(
-                        checkpoint_dir=checkpoint_dir,
+        # 로깅 및 cleanup은 rank 0만 수행
+        if is_main_process():
+            best_marker = " [BEST]" if is_best else ""
+            logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_margin: {avg_val_margin:.4f}){best_marker}")
+
+            if config.checkpoint.save_total_limit:
+                cleanup_old_checkpoints(
+                    checkpoint_dir=checkpoint_dir,
+                    save_total_limit=config.checkpoint.save_total_limit,
+                )
+
+                if use_s3_upload:
+                    cleanup_s3_checkpoints(
+                        experiment_name=config.experiment.name,
                         save_total_limit=config.checkpoint.save_total_limit,
                     )
-
-                    if use_s3_upload:
-                        cleanup_s3_checkpoints(
-                            experiment_name=config.experiment.name,
-                            save_total_limit=config.checkpoint.save_total_limit,
-                        )
-        else:
-            logger.info(f"Validation margin did not improve ({avg_val_margin:.4f} <= {best_val_margin:.4f})")
 
         next_checkpoint_epoch += save_checkpoint_every
 
