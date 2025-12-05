@@ -11,6 +11,7 @@ from weighted_mtp.utils.pairwise_utils import (
     compute_lambda_value_loss,
     compute_mc_value_loss,
     create_eos_only_mask,
+    create_output_end_mask,
     get_scheduled_lambda,
 )
 
@@ -552,3 +553,362 @@ class TestGetScheduledLambda:
             current_lam = get_scheduled_lambda(step, warmup_steps, decay_steps, lam_start, lam_end)
             assert current_lam <= prev_lam, f"Step {step}: {current_lam} > {prev_lam}"
             prev_lam = current_lam
+
+
+class TestCreateOutputEndMask:
+    """create_output_end_mask 함수 테스트"""
+
+    def test_simple_sequence(self):
+        """기본 시퀀스에서 마지막 유효 토큰 위치 반환"""
+        # 5개 유효 토큰, 2개 패딩
+        attention_mask = torch.tensor([[1, 1, 1, 1, 1, 0, 0]], dtype=torch.float32)
+
+        output_end_mask = create_output_end_mask(attention_mask)
+
+        # 마지막 유효 토큰은 인덱스 4
+        expected = torch.tensor([[0, 0, 0, 0, 1, 0, 0]], dtype=torch.float32)
+        assert torch.equal(output_end_mask, expected)
+
+    def test_no_padding(self):
+        """패딩 없는 시퀀스"""
+        attention_mask = torch.tensor([[1, 1, 1, 1]], dtype=torch.float32)
+
+        output_end_mask = create_output_end_mask(attention_mask)
+
+        # 마지막 토큰은 인덱스 3
+        expected = torch.tensor([[0, 0, 0, 1]], dtype=torch.float32)
+        assert torch.equal(output_end_mask, expected)
+
+    def test_all_padding(self):
+        """모두 패딩인 경우 (엣지 케이스)"""
+        attention_mask = torch.tensor([[0, 0, 0, 0]], dtype=torch.float32)
+
+        output_end_mask = create_output_end_mask(attention_mask)
+
+        # 유효 토큰 없으므로 모두 0
+        expected = torch.zeros_like(attention_mask)
+        assert torch.equal(output_end_mask, expected)
+
+    def test_batch_processing(self):
+        """배치 처리 검증"""
+        attention_mask = torch.tensor([
+            [1, 1, 1, 1, 1, 0, 0],  # 마지막 유효: 4
+            [1, 1, 1, 0, 0, 0, 0],  # 마지막 유효: 2
+            [1, 1, 1, 1, 1, 1, 1],  # 마지막 유효: 6
+            [0, 0, 0, 0, 0, 0, 0],  # 유효 토큰 없음
+        ], dtype=torch.float32)
+
+        output_end_mask = create_output_end_mask(attention_mask)
+
+        expected = torch.tensor([
+            [0, 0, 0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 1],
+            [0, 0, 0, 0, 0, 0, 0],
+        ], dtype=torch.float32)
+        assert torch.equal(output_end_mask, expected)
+
+    def test_dtype_is_float32(self):
+        """반환 dtype이 float32인지 확인"""
+        attention_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
+        output_end_mask = create_output_end_mask(attention_mask)
+        assert output_end_mask.dtype == torch.float32
+
+    def test_device_preservation(self):
+        """디바이스가 유지되는지 확인"""
+        attention_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.float32)
+        output_end_mask = create_output_end_mask(attention_mask)
+        assert output_end_mask.device == attention_mask.device
+
+
+class TestComputeLambdaReturnWithOutputEndMask:
+    """output_end_mask 파라미터를 사용하는 compute_lambda_return 테스트"""
+
+    def test_output_end_mask_sets_terminal_position(self):
+        """output_end_mask가 제공되면 해당 위치에 terminal reward 설정"""
+        batch_size, seq_len = 1, 10
+        values = torch.zeros(batch_size, seq_len)
+        rewards = torch.tensor([1.0])
+
+        # loss_mask: 윈도우 [2, 3, 4]만 1
+        loss_mask = torch.tensor([[0, 0, 1, 1, 1, 0, 0, 0, 0, 0]], dtype=torch.float32)
+
+        # output_end_mask: 진짜 EOS는 인덱스 7
+        output_end_mask = torch.tensor([[0, 0, 0, 0, 0, 0, 0, 1, 0, 0]], dtype=torch.float32)
+
+        lambda_returns = compute_lambda_return(
+            values, rewards, loss_mask, gamma=1.0, lam=1.0,
+            output_end_mask=output_end_mask,
+        )
+
+        # Terminal reward는 인덱스 7에 설정되어야 함
+        assert torch.isclose(lambda_returns[0, 7], torch.tensor(1.0), atol=1e-6)
+
+    def test_backward_propagation_from_eos(self):
+        """EOS에서 시작하여 역방향 전파되는지 검증"""
+        batch_size, seq_len = 1, 10
+        values = torch.full((batch_size, seq_len), 0.5)
+        rewards = torch.tensor([1.0])
+
+        # loss_mask: 윈도우 [2, 3, 4]만 학습 대상
+        loss_mask = torch.tensor([[0, 0, 1, 1, 1, 0, 0, 0, 0, 0]], dtype=torch.float32)
+
+        # output_end_mask: 진짜 EOS는 인덱스 7
+        output_end_mask = torch.tensor([[0, 0, 0, 0, 0, 0, 0, 1, 0, 0]], dtype=torch.float32)
+
+        # λ=1.0 (Pure MC): 모든 위치가 terminal reward와 동일
+        lambda_returns = compute_lambda_return(
+            values, rewards, loss_mask, gamma=1.0, lam=1.0,
+            output_end_mask=output_end_mask,
+        )
+
+        # EOS(7)에서 역방향 전파되므로 0~7 모두 1.0이어야 함
+        for t in range(8):
+            assert torch.isclose(lambda_returns[0, t], torch.tensor(1.0), atol=1e-6), \
+                f"Position {t}: expected 1.0, got {lambda_returns[0, t]}"
+
+    def test_without_output_end_mask_uses_loss_mask(self):
+        """output_end_mask 미제공 시 loss_mask 기준 (기존 동작)"""
+        batch_size, seq_len = 1, 10
+        values = torch.zeros(batch_size, seq_len)
+        rewards = torch.tensor([1.0])
+
+        # loss_mask: [2, 3, 4]만 유효
+        loss_mask = torch.tensor([[0, 0, 1, 1, 1, 0, 0, 0, 0, 0]], dtype=torch.float32)
+
+        lambda_returns = compute_lambda_return(
+            values, rewards, loss_mask, gamma=1.0, lam=1.0,
+            output_end_mask=None,  # 미제공
+        )
+
+        # loss_mask 기준 마지막(4)에 terminal
+        assert torch.isclose(lambda_returns[0, 4], torch.tensor(1.0), atol=1e-6)
+        # 인덱스 7은 0 (loss_mask에서 유효하지 않으므로)
+        assert lambda_returns[0, 7] == 0.0
+
+    def test_lambda_095_with_output_end_mask(self):
+        """λ=0.95에서 output_end_mask 사용 시 올바른 타겟 생성"""
+        batch_size, seq_len = 1, 8
+        values = torch.full((batch_size, seq_len), 0.5)
+        rewards = torch.tensor([1.0])
+
+        loss_mask = torch.tensor([[0, 0, 1, 1, 1, 0, 0, 0]], dtype=torch.float32)
+        output_end_mask = torch.tensor([[0, 0, 0, 0, 0, 0, 1, 0]], dtype=torch.float32)  # EOS: 6
+
+        lambda_returns = compute_lambda_return(
+            values, rewards, loss_mask, gamma=1.0, lam=0.95,
+            output_end_mask=output_end_mask,
+        )
+
+        # EOS(6)는 R=1.0
+        assert torch.isclose(lambda_returns[0, 6], torch.tensor(1.0), atol=1e-6)
+
+        # 역방향 전파로 gradient 존재
+        # G_5 = 0.05*V_6 + 0.95*G_6 = 0.05*0.5 + 0.95*1.0 = 0.975
+        assert torch.isclose(lambda_returns[0, 5], torch.tensor(0.975), atol=1e-5)
+
+        # 윈도우 내 토큰들도 역방향 전파된 값을 가짐
+        assert lambda_returns[0, 4] > 0
+        assert lambda_returns[0, 3] > 0
+        assert lambda_returns[0, 2] > 0
+
+
+class TestComputeLambdaValueLossWithOutputEndMask:
+    """output_end_mask 파라미터를 사용하는 compute_lambda_value_loss 테스트"""
+
+    def test_loss_only_on_loss_mask_range(self):
+        """Loss 계산이 loss_mask 범위에서만 수행되는지 검증"""
+        batch_size, seq_len = 1, 10
+        value_logits = torch.zeros(batch_size, seq_len, 1)  # 모든 예측 0
+        rewards = torch.tensor([1.0])
+
+        attention_mask = torch.ones(batch_size, seq_len)
+        # loss_mask: [2, 3, 4]만 학습 대상
+        loss_mask = torch.tensor([[0, 0, 1, 1, 1, 0, 0, 0, 0, 0]], dtype=torch.float32)
+        # output_end_mask: EOS는 7
+        output_end_mask = torch.tensor([[0, 0, 0, 0, 0, 0, 0, 1, 0, 0]], dtype=torch.float32)
+
+        loss = compute_lambda_value_loss(
+            value_logits, rewards, attention_mask, loss_mask,
+            gamma=1.0, lam=1.0, loss_type="mse",
+            output_end_mask=output_end_mask,
+        )
+
+        # Loss가 양수 (예측=0, 타겟=1이므로)
+        assert loss > 0
+
+    def test_gradient_flows_with_output_end_mask(self):
+        """output_end_mask 사용 시 gradient가 정상적으로 흐르는지 확인"""
+        batch_size, seq_len = 2, 8
+        value_logits = torch.rand(batch_size, seq_len, 1, requires_grad=True)
+        rewards = torch.tensor([1.0, 0.0])
+        attention_mask = torch.ones(batch_size, seq_len)
+        loss_mask = torch.tensor([
+            [0, 0, 1, 1, 1, 0, 0, 0],
+            [0, 0, 1, 1, 1, 0, 0, 0],
+        ], dtype=torch.float32)
+        output_end_mask = torch.tensor([
+            [0, 0, 0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 0, 1, 0],
+        ], dtype=torch.float32)
+
+        loss = compute_lambda_value_loss(
+            value_logits, rewards, attention_mask, loss_mask,
+            gamma=1.0, lam=0.95,
+            output_end_mask=output_end_mask,
+        )
+        loss.backward()
+
+        # gradient가 존재하고 유효해야 함
+        assert value_logits.grad is not None
+        assert not torch.isnan(value_logits.grad).any()
+        assert not torch.isinf(value_logits.grad).any()
+
+
+class TestRandomWindowWithEOS:
+    """Random Window + EOS 분리 통합 테스트 (Phase 5)"""
+
+    def test_lambda_return_with_random_window(self):
+        """랜덤 윈도우에서도 terminal reward가 EOS에 설정되는지 검증"""
+        # 시나리오: 전체 시퀀스 10, 윈도우는 [2,3,4], EOS는 7
+        values = torch.zeros(1, 10)
+        rewards = torch.tensor([1.0])
+        loss_mask = torch.zeros(1, 10)
+        loss_mask[0, 2:5] = 1.0  # 윈도우: [2,3,4]
+        output_end_mask = torch.zeros(1, 10)
+        output_end_mask[0, 7] = 1.0  # EOS: 7
+
+        lambda_returns = compute_lambda_return(
+            values, rewards, loss_mask, gamma=1.0, lam=0.95,
+            output_end_mask=output_end_mask,
+        )
+
+        # Terminal reward는 EOS(7)에 설정
+        assert lambda_returns[0, 7] == 1.0, f"EOS 위치 값: {lambda_returns[0, 7]}"
+        # 윈도우 내 토큰도 역방향 전파된 값을 가짐
+        assert lambda_returns[0, 4] > 0, f"윈도우 끝 위치 값: {lambda_returns[0, 4]}"
+        assert lambda_returns[0, 2] > 0, f"윈도우 시작 위치 값: {lambda_returns[0, 2]}"
+
+    def test_loss_only_on_window(self):
+        """Loss 계산이 윈도우 내 토큰에서만 이루어지는지 검증"""
+        # 시나리오: 전체 시퀀스 10, 윈도우는 [2,3,4], EOS는 7
+        value_logits = torch.randn(1, 10, requires_grad=True)
+        rewards = torch.tensor([1.0])
+        attention_mask = torch.ones(1, 10)
+        loss_mask = torch.zeros(1, 10)
+        loss_mask[0, 2:5] = 1.0  # 윈도우: [2,3,4]만 학습
+        output_end_mask = torch.zeros(1, 10)
+        output_end_mask[0, 7] = 1.0  # EOS: 7
+
+        loss = compute_lambda_value_loss(
+            value_logits, rewards, attention_mask, loss_mask,
+            gamma=1.0, lam=0.95,
+            output_end_mask=output_end_mask,
+        )
+
+        # Loss가 유효해야 함
+        assert loss.item() >= 0
+        assert not torch.isnan(loss)
+
+        # Gradient가 윈도우 내에만 존재하는지 확인
+        loss.backward()
+        grad = value_logits.grad[0]
+
+        # 윈도우 내 토큰은 gradient가 있어야 함
+        assert grad[2:5].abs().sum() > 0, "윈도우 내 gradient 없음"
+
+    def test_backward_propagation_distance(self):
+        """lambda=0.95일 때 역방향 전파 거리 검증"""
+        # EOS에서 윈도우까지의 거리에 따른 감쇠 확인
+        seq_len = 20
+        values = torch.zeros(1, seq_len)
+        rewards = torch.tensor([1.0])
+        loss_mask = torch.zeros(1, seq_len)
+        loss_mask[0, 5:10] = 1.0  # 윈도우: [5,6,7,8,9]
+        output_end_mask = torch.zeros(1, seq_len)
+        output_end_mask[0, 15] = 1.0  # EOS: 15 (윈도우에서 6칸 떨어짐)
+
+        lambda_returns = compute_lambda_return(
+            values, rewards, loss_mask, gamma=1.0, lam=0.95,
+            output_end_mask=output_end_mask,
+        )
+
+        # EOS 위치는 1.0
+        assert lambda_returns[0, 15] == 1.0
+
+        # 윈도우 끝(9)은 EOS(15)에서 6칸 떨어짐: 0.95^6 ≈ 0.735
+        expected_at_9 = 0.95 ** 6
+        assert abs(lambda_returns[0, 9] - expected_at_9) < 0.01, \
+            f"윈도우 끝 값 {lambda_returns[0, 9]:.4f} != 예상값 {expected_at_9:.4f}"
+
+
+class TestFSDPCompatibility:
+    """FSDP 분산 환경 호환성 검증 (Phase 5)"""
+
+    def test_mask_shapes_consistent(self):
+        """모든 마스크의 shape이 일관되는지 검증"""
+        batch_size = 4
+        seq_len = 512
+
+        # 실제 사용 시나리오 시뮬레이션
+        attention_mask = torch.ones(batch_size, seq_len)
+        # 각 샘플마다 다른 실제 길이
+        for i in range(batch_size):
+            actual_len = 200 + i * 50  # 200, 250, 300, 350
+            attention_mask[i, actual_len:] = 0
+
+        # labels 생성 (instruction 마스킹 + padding 마스킹)
+        labels = torch.randint(0, 1000, (batch_size, seq_len))
+        labels[:, :50] = -100  # instruction
+        labels[attention_mask == 0] = -100  # padding
+
+        # loss_mask 생성
+        loss_mask = (labels != -100).float()
+
+        # output_end_mask 생성
+        output_end_mask = create_output_end_mask(attention_mask)
+
+        # Shape 일관성 검증
+        assert attention_mask.shape == (batch_size, seq_len)
+        assert loss_mask.shape == (batch_size, seq_len)
+        assert output_end_mask.shape == (batch_size, seq_len)
+
+        # 각 샘플의 output_end_mask가 정확한 EOS 위치를 가리키는지
+        for i in range(batch_size):
+            actual_len = 200 + i * 50
+            eos_pos = actual_len - 1
+            assert output_end_mask[i, eos_pos] == 1.0, f"샘플 {i}: EOS 위치 {eos_pos} 마스크 오류"
+            assert output_end_mask[i].sum() == 1.0, f"샘플 {i}: output_end_mask 합 오류"
+
+    def test_batch_independent_processing(self):
+        """각 배치 샘플이 독립적으로 처리되는지 검증"""
+        batch_size = 2
+        seq_len = 100
+
+        # 두 샘플이 완전히 다른 구조
+        attention_mask = torch.ones(batch_size, seq_len)
+        attention_mask[0, 60:] = 0  # 샘플 0: 길이 60
+        attention_mask[1, 80:] = 0  # 샘플 1: 길이 80
+
+        loss_mask = torch.zeros(batch_size, seq_len)
+        loss_mask[0, 30:50] = 1.0  # 샘플 0: 윈도우 [30,50)
+        loss_mask[1, 40:70] = 1.0  # 샘플 1: 윈도우 [40,70)
+
+        output_end_mask = create_output_end_mask(attention_mask)
+
+        values = torch.zeros(batch_size, seq_len)
+        rewards = torch.tensor([1.0, 0.0])  # 샘플 0: correct, 샘플 1: incorrect
+
+        lambda_returns = compute_lambda_return(
+            values, rewards, loss_mask, gamma=1.0, lam=0.95,
+            output_end_mask=output_end_mask,
+        )
+
+        # 샘플 0: EOS(59)에 reward 1.0
+        assert lambda_returns[0, 59] == 1.0
+        # 샘플 1: EOS(79)에 reward 0.0
+        assert lambda_returns[1, 79] == 0.0
+
+        # 각 샘플의 윈도우 내 값이 독립적
+        assert lambda_returns[0, 49] > 0  # 샘플 0 윈도우 끝
+        assert lambda_returns[1, 69] == 0  # 샘플 1 윈도우 끝 (reward=0이므로)

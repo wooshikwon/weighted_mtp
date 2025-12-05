@@ -33,6 +33,7 @@ from weighted_mtp.utils import (
     compute_position_correlation,
     compute_td_error_stats,
     compute_token_variance,
+    create_output_end_mask,
     create_scheduler,
     get_scheduled_lambda,
     get_model_size,
@@ -192,6 +193,10 @@ def validate_critic(
             pos_loss_mask = (pos_labels != -100)
             neg_loss_mask = (neg_labels != -100)
 
+            # output_end_mask 생성 (진짜 EOS 위치)
+            pos_output_end_mask = create_output_end_mask(pos_attention_mask)
+            neg_output_end_mask = create_output_end_mask(neg_attention_mask)
+
             # Loss 계산 (loss_type에 따른 분기)
             if loss_type == "pairwise_ranking":
                 value_loss = lambda_coef * pairwise_ranking_loss(
@@ -203,12 +208,14 @@ def validate_critic(
                     pos_value_logits, pos_rewards, pos_attention_mask, pos_loss_mask.float(),
                     gamma=lambda_gamma, lam=lambda_lam,
                     loss_type=value_loss_fn, huber_delta=huber_delta,
+                    output_end_mask=pos_output_end_mask,
                 )
                 neg_rewards = torch.zeros(neg_input_ids.size(0), device=device, dtype=model_dtype)
                 neg_lambda_loss = compute_lambda_value_loss(
                     neg_value_logits, neg_rewards, neg_attention_mask, neg_loss_mask.float(),
                     gamma=lambda_gamma, lam=lambda_lam,
                     loss_type=value_loss_fn, huber_delta=huber_delta,
+                    output_end_mask=neg_output_end_mask,
                 )
                 value_loss = lambda_coef * (pos_lambda_loss + neg_lambda_loss) / 2
             else:
@@ -511,6 +518,13 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
     sampling_config["use_pairwise"] = True  # value head 학습은 항상 pairwise
     logger.info("Pairwise 모드 (value head 학습)")
 
+    # collator_config 추출 (random window 등)
+    collator_config = OmegaConf.to_container(config.data_sampling.get("collator", {}), resolve=True)
+    if collator_config.get("use_random_window", False):
+        logger.info(
+            f"Random Window 활성화: window_size={collator_config.get('window_size', 192)}"
+        )
+
     train_loader = create_dataloader(
         dataset_path=config.dataset.train,
         tokenizer=tokenizer,
@@ -519,6 +533,7 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
         sampling_config=sampling_config,
         seed=config.data_sampling.seed,
         shuffle=True,
+        collator_config=collator_config,
     )
 
     # Validation용 sampling_config (val_n_samples 적용)
@@ -533,6 +548,7 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
         sampling_config=val_sampling_config,
         seed=config.data_sampling.seed,
         shuffle=False,
+        collator_config=collator_config,
     )
 
     logger.info(f"Train batches: {len(train_loader)}")
@@ -757,6 +773,10 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             pos_loss_mask = (pos_labels != -100)
             neg_loss_mask = (neg_labels != -100)
 
+            # output_end_mask 생성 (진짜 EOS 위치)
+            pos_output_end_mask = create_output_end_mask(pos_attention_mask)
+            neg_output_end_mask = create_output_end_mask(neg_attention_mask)
+
             # Loss 계산 (loss_type에 따른 분기)
             if loss_type == "pairwise_ranking":
                 value_loss = lambda_coef * pairwise_ranking_loss(
@@ -773,12 +793,14 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
                     pos_value_logits, pos_rewards, pos_attention_mask, pos_loss_mask.float(),
                     gamma=lambda_gamma, lam=current_lam,
                     loss_type=value_loss_fn, huber_delta=huber_delta,
+                    output_end_mask=pos_output_end_mask,
                 )
                 neg_rewards = torch.zeros(neg_input_ids.size(0), device=device, dtype=model_dtype)
                 neg_lambda_loss = compute_lambda_value_loss(
                     neg_value_logits, neg_rewards, neg_attention_mask, neg_loss_mask.float(),
                     gamma=lambda_gamma, lam=current_lam,
                     loss_type=value_loss_fn, huber_delta=huber_delta,
+                    output_end_mask=neg_output_end_mask,
                 )
                 value_loss = lambda_coef * (pos_lambda_loss + neg_lambda_loss) / 2
             else:

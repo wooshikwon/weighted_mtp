@@ -3,10 +3,12 @@
 메타데이터 기반 효율적 로딩:
 - 전체 데이터 로드 없이 메타데이터만으로 샘플 선택
 - Difficulty 기반 가중 샘플링 (bins, weights 필수)
+- Length-balanced 샘플링 (길이 편향 제거, critic_mlp 전용)
 - use_pairwise 옵션으로 Pairwise 포맷 변환 지원
 - Unique pair 보장 (correct_idx, incorrect_idx 모두 고유)
 """
 
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 import logging
@@ -54,9 +56,11 @@ def load_dataset(
 
     # 샘플링 설정 추출
     use_pairwise = sampling_config.get("use_pairwise", False)
+    use_length_balanced = sampling_config.get("use_length_balanced", False)
     n_samples = sampling_config.get("n_samples", 100000)
     difficulty_weights = sampling_config.get("difficulty_weights")
     difficulty_bins = sampling_config.get("difficulty_bins")
+    length_bins = sampling_config.get("length_bins", [0, 100, 150, 200, 300, 500, 1000, 2000])
     max_pairs_per_problem = sampling_config.get("max_pairs_per_problem")  # problem당 cap
 
     # JSONL 경로 확인
@@ -68,8 +72,8 @@ def load_dataset(
         )
     jsonl_path = Path(data_files[split])
 
-    # difficulty_bins + difficulty_weights 필수
-    if not (difficulty_weights and difficulty_bins):
+    # length_balanced 모드가 아닐 때만 difficulty 설정 필수
+    if not use_length_balanced and not (difficulty_weights and difficulty_bins):
         raise ValueError(
             "difficulty_bins와 difficulty_weights는 필수입니다. "
             "sampling_config에 두 값을 모두 설정하세요."
@@ -83,15 +87,24 @@ def load_dataset(
             f"먼저 'python scripts/create_storage/extract_metadata.py' 를 실행하세요."
         )
 
-    # Unique pair 샘플링 (공통 로직)
-    all_pairs = _sample_unique_pairs(
-        problem_index_map=problem_index_map,
-        n_samples=n_samples,
-        difficulty_weights=difficulty_weights,
-        difficulty_bins=difficulty_bins,
-        seed=seed,
-        max_pairs_per_problem=max_pairs_per_problem,
-    )
+    # 샘플링 방식 선택: Length-balanced vs Difficulty-based
+    if use_length_balanced:
+        all_pairs = _sample_length_balanced_pairs(
+            problem_index_map=problem_index_map,
+            n_samples=n_samples,
+            length_bins=length_bins,
+            seed=seed,
+            max_pairs_per_problem=max_pairs_per_problem,
+        )
+    else:
+        all_pairs = _sample_unique_pairs(
+            problem_index_map=problem_index_map,
+            n_samples=n_samples,
+            difficulty_weights=difficulty_weights,
+            difficulty_bins=difficulty_bins,
+            seed=seed,
+            max_pairs_per_problem=max_pairs_per_problem,
+        )
 
     if use_pairwise:
         # Pairwise 모드: correct + incorrect 쌍 그대로 사용
@@ -543,6 +556,123 @@ def _sample_unique_pairs(
         )
 
     return selected_pairs[:n_samples]
+
+
+def _sample_length_balanced_pairs(
+    problem_index_map: dict[str, dict],
+    n_samples: int,
+    length_bins: list[int],
+    seed: int,
+    max_pairs_per_problem: Optional[int] = None,
+) -> list[dict]:
+    """Length-balanced unique pair 샘플링
+
+    같은 problem 내 + 같은 length bin 내에서 1:1 unique 매칭.
+    길이 편향을 제거하여 모델이 attention sequence length로 학습하는 것을 방지.
+
+    Args:
+        problem_index_map: {problem_id: {correct_indices, incorrect_indices,
+                                         correct_token_lengths, incorrect_token_lengths}}
+        n_samples: 목표 쌍 수
+        length_bins: 길이 구간 경계 [0, 100, 150, 200, 300, 500, 1000]
+        seed: 랜덤 시드
+        max_pairs_per_problem: problem당 최대 쌍 수
+
+    Returns:
+        [{correct_idx, incorrect_idx, problem_id, length_bin}, ...]
+
+    Raises:
+        ValueError: correct_token_lengths 또는 incorrect_token_lengths 누락 시
+    """
+    random.seed(seed)
+
+    def get_bin_label(token_len: int) -> str:
+        """토큰 길이를 bin 라벨로 변환"""
+        for i, b in enumerate(length_bins[1:]):
+            if token_len < b:
+                return f"{length_bins[i]}-{b}"
+        return f"{length_bins[-1]}+"
+
+    # 모든 가능한 쌍 수집 (같은 problem + 같은 length bin)
+    all_pairs = []
+
+    for pid, info in problem_index_map.items():
+        correct_indices = info.get("correct_indices", [])
+        incorrect_indices = info.get("incorrect_indices", [])
+        correct_lengths = info.get("correct_token_lengths", [])
+        incorrect_lengths = info.get("incorrect_token_lengths", [])
+
+        # 필수 필드 검증
+        if not correct_indices or not incorrect_indices:
+            continue
+        if not correct_lengths or not incorrect_lengths:
+            raise ValueError(
+                f"Problem {pid}에 토큰 길이 정보가 없습니다. "
+                f"extract_metadata.py를 다시 실행하세요."
+            )
+
+        # bin별 그룹핑
+        correct_by_bin: dict[str, list[dict]] = defaultdict(list)
+        incorrect_by_bin: dict[str, list[dict]] = defaultdict(list)
+
+        for idx, length in zip(correct_indices, correct_lengths):
+            bin_label = get_bin_label(length)
+            correct_by_bin[bin_label].append({"idx": idx, "length": length})
+
+        for idx, length in zip(incorrect_indices, incorrect_lengths):
+            bin_label = get_bin_label(length)
+            incorrect_by_bin[bin_label].append({"idx": idx, "length": length})
+
+        # 같은 bin 내에서 1:1 매칭
+        for bin_label in set(correct_by_bin.keys()) & set(incorrect_by_bin.keys()):
+            c_list = correct_by_bin[bin_label]
+            i_list = incorrect_by_bin[bin_label]
+
+            random.shuffle(c_list)
+            random.shuffle(i_list)
+
+            n_pairs = min(len(c_list), len(i_list))
+            if max_pairs_per_problem:
+                n_pairs = min(n_pairs, max_pairs_per_problem)
+
+            for j in range(n_pairs):
+                all_pairs.append({
+                    "correct_idx": c_list[j]["idx"],
+                    "incorrect_idx": i_list[j]["idx"],
+                    "problem_id": pid,
+                    "length_bin": bin_label,
+                })
+
+    # 셔플 및 샘플링
+    random.shuffle(all_pairs)
+
+    if len(all_pairs) < n_samples:
+        logger.warning(
+            f"Length-balanced 쌍 부족: 요청={n_samples:,}, 가용={len(all_pairs):,}"
+        )
+
+    selected = all_pairs[:n_samples]
+
+    # 통계 로깅
+    logger.info("=== Length-Balanced 샘플링 ===")
+    logger.info(f"전체 가용 쌍: {len(all_pairs):,}")
+    logger.info(f"샘플링된 쌍: {len(selected):,}")
+
+    bin_counts: dict[str, int] = defaultdict(int)
+    for p in selected:
+        bin_counts[p["length_bin"]] += 1
+    for bin_label in sorted(bin_counts.keys()):
+        logger.info(f"  {bin_label}: {bin_counts[bin_label]:,} 쌍")
+
+    # 부족 시 에러
+    if len(selected) < n_samples:
+        raise ValueError(
+            f"데이터 부족: {n_samples - len(selected):,}개 쌍 부족. "
+            f"요청: {n_samples:,}, 가용: {len(all_pairs):,}. "
+            f"n_samples를 {len(all_pairs):,} 이하로 설정하세요."
+        )
+
+    return selected
 
 
 def _read_jsonl_pairwise(

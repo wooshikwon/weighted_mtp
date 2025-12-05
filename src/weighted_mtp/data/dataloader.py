@@ -93,6 +93,7 @@ def create_dataloader(
     sampling_config: dict,
     seed: int = 42,
     shuffle: bool = True,
+    collator_config: Optional[dict] = None,
 ) -> DataLoader:
     """DataLoader 생성 (분산 학습 지원)
 
@@ -112,6 +113,9 @@ def create_dataloader(
             - max_pairs_per_problem: problem당 최대 샘플 수
         seed: 랜덤 시드
         shuffle: 셔플 여부
+        collator_config: Collator 설정 딕셔너리 (옵션)
+            - use_random_window: Random Window 마스킹 적용 여부 (기본: False)
+            - window_size: 학습 대상 윈도우 크기 (기본: 192), 이하면 전체 output 학습
 
     Returns:
         DataLoader
@@ -163,10 +167,14 @@ def create_dataloader(
 
     # Collator 선택 (use_pairwise에 따라 분기)
     use_pairwise = sampling_config.get("use_pairwise", False)
+    collator_config = collator_config or {}
+
     if use_pairwise:
         collator = PairwiseDataCollator(
             tokenizer=tokenizer,
             max_length=max_length,
+            use_random_window=collator_config.get("use_random_window", False),
+            window_size=collator_config.get("window_size", 192),
         )
     else:
         collator = AlpacaDataCollator(

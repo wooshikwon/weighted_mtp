@@ -2,6 +2,7 @@
 
 전체 JSONL을 한 번 스캔하여 각 샘플의 is_correct, difficulty, problem_id 정보를 추출합니다.
 problem_index_map을 생성하여 Problem-level 쌍 샘플링을 지원합니다.
+각 샘플의 output 토큰 길이도 함께 저장하여 length-balanced 샘플링을 지원합니다.
 
 Usage:
     python scripts/create_storage/extract_metadata.py
@@ -15,6 +16,8 @@ import re
 from pathlib import Path
 from typing import Optional
 import argparse
+
+from transformers import AutoTokenizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,12 +52,14 @@ def _extract_problem_id(task_id: str) -> Optional[str]:
 def extract_metadata_from_jsonl(
     jsonl_path: Path,
     output_path: Path,
+    tokenizer: AutoTokenizer,
 ) -> dict:
     """JSONL 파일에서 메타데이터 추출 (problem_index_map 포함)
 
     Args:
         jsonl_path: 입력 JSONL 파일 경로
         output_path: 출력 메타데이터 JSON 파일 경로
+        tokenizer: 토큰 길이 계산용 토크나이저
 
     Returns:
         추출된 메타데이터 (샘플 통계)
@@ -126,12 +131,20 @@ def extract_metadata_from_jsonl(
                             "difficulty": difficulty,
                             "correct_indices": [],
                             "incorrect_indices": [],
+                            "correct_token_lengths": [],
+                            "incorrect_token_lengths": [],
                         }
+
+                    # output 토큰 길이 계산
+                    output_text = item.get("output", "")
+                    token_length = len(tokenizer.encode(output_text, add_special_tokens=False))
 
                     if is_correct is True:
                         problem_index_map[problem_id]["correct_indices"].append(idx)
+                        problem_index_map[problem_id]["correct_token_lengths"].append(token_length)
                     elif is_correct is False:
                         problem_index_map[problem_id]["incorrect_indices"].append(idx)
+                        problem_index_map[problem_id]["incorrect_token_lengths"].append(token_length)
 
             metadata_list.append(meta)
             stats["total"] += 1
@@ -195,6 +208,7 @@ def extract_dataset_metadata(
     dataset_name: str,
     split: Optional[str] = None,
     use_small: bool = False,
+    tokenizer_path: str = "storage/models/ref-sheared-llama-2.7b/raw",
 ):
     """데이터셋의 메타데이터 추출
 
@@ -202,7 +216,12 @@ def extract_dataset_metadata(
         dataset_name: 데이터셋 이름 (codecontests, mbpp, humaneval)
         split: 특정 스플릿만 추출 (None이면 전체)
         use_small: 작은 테스트용 데이터셋 사용 여부
+        tokenizer_path: 토크나이저 경로
     """
+    # 토크나이저 로드
+    logger.info(f"토크나이저 로드: {tokenizer_path}")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
     if use_small:
         base_dir = Path("storage/datasets_local_small")
         dataset_dir = base_dir / f"{dataset_name}_small"
@@ -250,7 +269,7 @@ def extract_dataset_metadata(
 
         # 메타데이터 추출
         try:
-            extract_metadata_from_jsonl(jsonl_path, output_path)
+            extract_metadata_from_jsonl(jsonl_path, output_path, tokenizer)
         except Exception as e:
             logger.error(f"메타데이터 추출 실패 ({split_name}): {e}")
             continue

@@ -7,6 +7,7 @@
 - MTP 지원 (n_future_tokens=4)
 """
 
+import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,6 +53,51 @@ def apply_alpaca_template(
         return prompt + f"### Response:\n{output}"
     else:
         return prompt.rstrip()
+
+
+def apply_random_window_mask(
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor,
+    len_prompt: int,
+    window_size: int = 192,
+) -> torch.Tensor:
+    """Output 토큰 중 랜덤 위치의 고정 길이 윈도우만 학습 대상으로 선택
+
+    긴 시퀀스의 길이 편향을 완화하기 위해 output 토큰에서 랜덤 시작 위치의
+    일정 길이만 학습. Terminal reward는 output_end_mask로 별도 처리.
+
+    Args:
+        labels: [seq_len] 원본 labels (instruction/padding은 이미 -100)
+        attention_mask: [seq_len] 유효 토큰 마스크 (1: 유효, 0: padding)
+        len_prompt: instruction + input 토큰 수 (output 시작 위치)
+        window_size: 학습 대상 윈도우 크기 (이 길이 이하면 전체 학습)
+
+    Returns:
+        윈도우 외 output 토큰이 -100으로 마스킹된 labels
+    """
+    # output 범위 계산: [len_prompt, seq_end)
+    seq_end = int(attention_mask.sum().item())
+    output_start = len_prompt
+    output_end = seq_end
+    output_len = output_end - output_start
+
+    # window_size 이하면 전체 학습
+    if output_len <= window_size:
+        return labels
+
+    # 랜덤 시작 위치 선택
+    max_start = output_end - window_size
+    window_start = random.randint(output_start, max_start)
+    window_end = window_start + window_size
+
+    # 윈도우 외 output 토큰 마스킹
+    new_labels = labels.clone()
+    if window_start > output_start:
+        new_labels[output_start:window_start] = -100
+    if window_end < output_end:
+        new_labels[window_end:output_end] = -100
+
+    return new_labels
 
 
 @dataclass
@@ -177,6 +223,8 @@ class PairwiseDataCollator:
         tokenizer: HuggingFace PreTrainedTokenizer
         max_length: 최대 시퀀스 길이 (기본 2048)
         padding: Padding 전략 ("max_length" 또는 "longest")
+        use_random_window: Random Window 마스킹 적용 여부 (기본 False)
+        window_size: 학습 대상 윈도우 크기 (기본 192), 이하면 전체 output 학습
 
     Examples:
         >>> collator = PairwiseDataCollator(tokenizer, max_length=2048)
@@ -202,6 +250,8 @@ class PairwiseDataCollator:
     tokenizer: PreTrainedTokenizer
     max_length: int = 2048
     padding: str = "max_length"
+    use_random_window: bool = False
+    window_size: int = 192
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         """배치를 토큰화
@@ -296,6 +346,15 @@ class PairwiseDataCollator:
         labels = input_ids.clone()
         labels[:len_prompt] = -100  # Instruction + Input 마스킹
         labels[attention_mask == 0] = -100  # Padding 마스킹
+
+        # 4. Random Window 적용 (길이 편향 완화)
+        if self.use_random_window:
+            labels = apply_random_window_mask(
+                labels=labels,
+                attention_mask=attention_mask,
+                len_prompt=len_prompt,
+                window_size=self.window_size,
+            )
 
         return {
             "input_ids": input_ids,

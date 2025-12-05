@@ -9,7 +9,7 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: ultimate-value-model-400k-32rank
+  name: ultimate-value-model-stratified
   description: "Independent Value Model pretraining for TD error calculation"
   stage: critic
   tags:
@@ -43,10 +43,21 @@ data_sampling:
   n_samples: 200000
   max_pairs_per_problem: 50  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
 
+  # Length-Balanced 샘플링 (길이 편향 제거)
+  # 같은 problem 내 같은 length bin에서 correct/incorrect 매칭
+  use_length_balanced: true
+  length_bins: [0, 100, 150, 200, 300, 500, 1000, 2000]
+
+  # Difficulty 기반 설정 (use_length_balanced=true 시 사용 안함)
   difficulty_bins:
     zero: [0, 25]
   difficulty_weights:
     zero: 1.0
+
+  # Collator 설정
+  collator:
+    use_random_window: false  # length-balanced 시 불필요
+    window_size: 192
 
 # 학습 설정 (H100 80GB 4-GPU 최적화)
 training:

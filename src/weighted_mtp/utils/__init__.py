@@ -66,6 +66,7 @@ from weighted_mtp.utils.pairwise_utils import (
     compute_td_error_stats,
     compute_token_variance,
     create_eos_only_mask,
+    create_output_end_mask,
     get_scheduled_lambda,
     pairwise_ranking_loss,
 )
@@ -133,6 +134,7 @@ __all__ = [
     "compute_td_error_stats",
     "compute_token_variance",
     "create_eos_only_mask",
+    "create_output_end_mask",
     "get_scheduled_lambda",
     "pairwise_ranking_loss",
 ]
