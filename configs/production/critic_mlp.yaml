@@ -9,7 +9,7 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: last-final-value-model-stratified-MC
+  name: last-final-value-model-stratified-MC-mse
   description: "Independent Value Model pretraining for TD error calculation"
   stage: critic
   tags:
@@ -95,10 +95,7 @@ training:
   # Value loss 설정
   value_loss:
     type: "lambda_return"   # "lambda_return" | "pairwise_ranking"
-    loss_fn: "huber"        # "mse" | "huber" (0/1 terminal reward에 robust)
-    huber_delta: 0.5        # Huber loss delta (reward 범위 0~1에 맞춤)
-    gamma: 1.0              # Discount factor (lambda_return 전용)
-    coef: 1.0               # Loss coefficient
+    loss_fn: "mse"        # "mse" | "huber" (0/1 terminal reward에 robust)
     bias_init: 0.5          # Value head bias 초기값 (기대값 일치)
 
     lambda_schedule:
