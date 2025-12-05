@@ -1,1 +1,0 @@
-{'save_dir': 'storage/checkpoints/critic/ultimate-value-model-400k-32rank', 'save_checkpoint_every': 0.2, 'save_best': True, 'save_final': True, 'save_total_limit': 5, 's3_upload': False}

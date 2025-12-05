@@ -1,1 +1,0 @@
-{'seed': 84, 'use_pairwise': True, 'val_n_samples': 500, 'n_samples': 200000, 'max_pairs_per_problem': 60, 'use_length_balanced': True, 'length_bins': [0, 100, 150, 200, 300, 500, 1000, 2000], 'difficulty_bins': {'all': [1, 25]}, 'difficulty_weights': {'all': 1.0}}

@@ -1,1 +1,0 @@
-{'name': 'last-final-value-model-stratified-MC', 'description': 'Independent Value Model pretraining for TD error calculation', 'stage': 'critic', 'tags': ['critic', 'lambda-return', 'mlp-value-head', 'dropout-0.1', 'independent-value-model']}

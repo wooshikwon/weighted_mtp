@@ -35,6 +35,7 @@ results/
 
 # ML artifacts
 mlruns/
+mlruns_vastai/
 mlflow/
 *.ckpt
 *.pt
