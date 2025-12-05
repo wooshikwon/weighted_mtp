@@ -93,6 +93,7 @@ def load_dataset(
             problem_index_map=problem_index_map,
             n_samples=n_samples,
             length_bins=length_bins,
+            difficulty_bins=difficulty_bins,
             seed=seed,
             max_pairs_per_problem=max_pairs_per_problem,
         )
@@ -562,7 +563,8 @@ def _sample_length_balanced_pairs(
     problem_index_map: dict[str, dict],
     n_samples: int,
     length_bins: list[int],
-    seed: int,
+    difficulty_bins: Optional[dict] = None,
+    seed: int = 42,
     max_pairs_per_problem: Optional[int] = None,
 ) -> list[dict]:
     """Length-balanced unique pair 샘플링
@@ -575,6 +577,7 @@ def _sample_length_balanced_pairs(
                                          correct_token_lengths, incorrect_token_lengths}}
         n_samples: 목표 쌍 수
         length_bins: 길이 구간 경계 [0, 100, 150, 200, 300, 500, 1000]
+        difficulty_bins: difficulty 필터링용 (예: {"all": [1, 25]})
         seed: 랜덤 시드
         max_pairs_per_problem: problem당 최대 쌍 수
 
@@ -593,10 +596,23 @@ def _sample_length_balanced_pairs(
                 return f"{length_bins[i]}-{b}"
         return f"{length_bins[-1]}+"
 
+    def is_difficulty_valid(difficulty: Optional[int]) -> bool:
+        """difficulty_bins 범위 내인지 확인"""
+        if difficulty_bins is None:
+            return True
+        if difficulty is None:
+            return False
+        for bin_range in difficulty_bins.values():
+            min_d, max_d = bin_range[0], bin_range[1]
+            if min_d <= difficulty <= max_d:
+                return True
+        return False
+
     # 모든 가능한 쌍 수집 (같은 problem + 같은 length bin)
     all_pairs = []
 
     for pid, info in problem_index_map.items():
+        difficulty = info.get("difficulty")
         correct_indices = info.get("correct_indices", [])
         incorrect_indices = info.get("incorrect_indices", [])
         correct_lengths = info.get("correct_token_lengths", [])
@@ -610,6 +626,10 @@ def _sample_length_balanced_pairs(
                 f"Problem {pid}에 토큰 길이 정보가 없습니다. "
                 f"extract_metadata.py를 다시 실행하세요."
             )
+
+        # difficulty 필터링
+        if not is_difficulty_valid(difficulty):
+            continue
 
         # bin별 그룹핑
         correct_by_bin: dict[str, list[dict]] = defaultdict(list)
