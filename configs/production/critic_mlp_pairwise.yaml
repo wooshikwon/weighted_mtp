@@ -1,4 +1,4 @@
-# Critic Pre-training (독립 Value Model)
+# Critic Pre-training (독립 Value Model) - Pairwise Ranking Loss
 # HuggingFace 기반 2.7B 모델 + MLP Value Head 학습
 # 프로덕션 설정 (VESSL H200 3-GPU)
 
@@ -9,12 +9,12 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: last-final-value-model-stratified-MC
-  description: "Independent Value Model pretraining for TD error calculation"
+  name: last-final-value-model-pairwise-ranking
+  description: "Independent Value Model with Pairwise Ranking Loss"
   stage: critic
   tags:
     - critic
-    - lambda-return
+    - pairwise-ranking
     - mlp-value-head
     - dropout-0.1
     - independent-value-model
@@ -40,8 +40,8 @@ data_sampling:
   use_pairwise: true
   val_n_samples: 500        # Validation 샘플 수
 
-  n_samples: 150000 
-  max_pairs_per_problem: 60  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
+  n_samples: 125000
+  max_pairs_per_problem: 50  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
 
   # Length-Balanced 샘플링 (길이 편향 제거)
   # 같은 problem 내 같은 length bin에서 correct/incorrect 매칭
@@ -58,7 +58,7 @@ data_sampling:
 # 학습 설정 (H100 80GB 4-GPU 최적화)
 training:
   n_epochs: 1.2
-  batch_size: 32
+  batch_size: 24
   gradient_accumulation_steps: 1  # Effective batch size = 32 × 1 × 3 = 96
 
   # Global 설정 (FSDP 제약으로 분리 불가)
@@ -82,34 +82,27 @@ training:
       - gate_proj
       - up_proj
       - down_proj
-    learning_rate: 1.0e-5  # OVM 표준 (7B 기준)
+    learning_rate: 2.0e-5  # Reward model LoRA 표준 (1e-5 ~ 2e-5)
     weight_decay: 0.01
 
   # Value Head 설정
   value_head:
     type: mlp
     dropout: 0.2
-    learning_rate: 5.0e-5  # LoRA의 5배 (균형 잡힌 학습)
+    learning_rate: 1.0e-4  # TRL 권장: new parameters ~1e-3
     weight_decay: 0.01
 
   # Value loss 설정
   value_loss:
-    type: "lambda_return"   # "lambda_return" | "pairwise_ranking"
-    loss_fn: "huber"        # "mse" | "huber" (0/1 terminal reward에 robust)
-    huber_delta: 0.5        # Huber loss delta (reward 범위 0~1에 맞춤)
-    gamma: 1.0              # Discount factor (lambda_return 전용)
-    coef: 1.0               # Loss coefficient
-    bias_init: 0.5          # Value head bias 초기값 (기대값 일치)
-
-    lambda_schedule:
-      type: constant        # 학습 전체에 걸쳐 일정한 λ 사용
-      value: 1.0            # λ=1.0: MC
+    type: "pairwise_ranking"   # Bradley-Terry pairwise ranking
+    coef: 1.0                  # Loss coefficient
+    bias_init: 0.0             # Pairwise ranking: 0 초기화 (상대적 순서만 학습)
 
   # Learning rate scheduler (공유)
   lr_scheduler:
     type: cosine
-    warmup_ratio: 0.03      # 5% warmup (안정적 학습 시작)
-    min_lr_ratio: 0.005      # 완전 decay (마지막까지 학습 활용)
+    warmup_ratio: 0.05      # 5% warmup (안정적 학습 시작)
+    min_lr_ratio: 0.0       # 완전 decay (마지막까지 학습 활용)
 
 # 체크포인트
 checkpoint:
