@@ -329,8 +329,9 @@ def compute_mc_value_loss(
     values = value_logits.squeeze(-1)
     mse = (values - mc_targets) ** 2
 
-    # Masked mean
-    masked_mse = (mse * combined_mask).sum() / (combined_mask.sum() + 1e-8)
+    # 시퀀스별 평균 후 배치 평균 (길이 편향 방지)
+    seq_mse = (mse * combined_mask).sum(dim=1) / (combined_mask.sum(dim=1) + 1e-8)
+    masked_mse = seq_mse.mean()
 
     return masked_mse
 
@@ -447,5 +448,7 @@ def compute_lambda_value_loss(
         # MSE loss (기존 동작)
         loss = (values - lambda_targets) ** 2
 
-    masked_loss = (loss * combined_mask).sum() / (combined_mask.sum() + 1e-8)
+    # 시퀀스별 평균 후 배치 평균 (길이 편향 방지)
+    seq_loss = (loss * combined_mask).sum(dim=1) / (combined_mask.sum(dim=1) + 1e-8)
+    masked_loss = seq_loss.mean()
     return masked_loss
