@@ -9,7 +9,7 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: ultimate-value-model-stratified
+  name: last-final-value-model-stratified
   description: "Independent Value Model pretraining for TD error calculation"
   stage: critic
   tags:
@@ -41,7 +41,7 @@ data_sampling:
   val_n_samples: 500        # Validation 샘플 수
 
   n_samples: 200000
-  max_pairs_per_problem: 50  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
+  max_pairs_per_problem: 60  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
 
   # Length-Balanced 샘플링 (길이 편향 제거)
   # 같은 problem 내 같은 length bin에서 correct/incorrect 매칭

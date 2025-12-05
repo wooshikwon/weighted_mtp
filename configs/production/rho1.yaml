@@ -9,7 +9,7 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: lora-rho1-wmtp
+  name: last-fianl-rho1
   description: "Rho-1 Weighted MTP with Reference Model"
   stage: rho1
   tags:

@@ -10,7 +10,7 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: ultimate-verifiable
+  name: last-final-verifiable
   description: "WMTP with TD weighting using independent Value Model"
   stage: verifiable
   tags:
@@ -38,7 +38,7 @@ models:
 
   # Value Model (Critic checkpoint에서 로드, eval only)
   value_model:
-    checkpoint_path: storage/checkpoints/critic/ultimate-value-model/checkpoint_final.pt
+    checkpoint_path: storage/checkpoints/critic/last-final-value-model-stratified/checkpoint_final.pt
     base_model_path: storage/models/ref-sheared-llama-2.7b/raw
 
 # 데이터셋 설정
