@@ -9,7 +9,7 @@ project:
 
 # 실험 메타정보
 experiment:
-  name: last-final-value-model-pairwise-ranking
+  name: last-final-value-model-pairwise-ranking-ultra
   description: "Independent Value Model with Pairwise Ranking Loss"
   stage: critic
   tags:
@@ -40,8 +40,8 @@ data_sampling:
   use_pairwise: true
   val_n_samples: 500        # Validation 샘플 수
 
-  n_samples: 125000
-  max_pairs_per_problem: 50  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
+  n_samples: 200000
+  max_pairs_per_problem: 60  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
 
   # Length-Balanced 샘플링 (길이 편향 제거)
   # 같은 problem 내 같은 length bin에서 correct/incorrect 매칭
@@ -57,8 +57,8 @@ data_sampling:
 
 # 학습 설정 (H100 80GB 4-GPU 최적화)
 training:
-  n_epochs: 1.5
-  batch_size: 24
+  n_epochs: 2.0
+  batch_size: 32
   gradient_accumulation_steps: 1  # Effective batch size = 32 × 1 × 3 = 96
 
   # Global 설정 (FSDP 제약으로 분리 불가)
