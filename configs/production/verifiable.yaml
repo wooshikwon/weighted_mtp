@@ -74,12 +74,13 @@ training:
   # Gradient clipping
   max_grad_norm: 1.0
 
-  # TD error weighting (Terminal-only binary reward이므로 MC 방식 사용)
+  # GAE Advantage weighting
+  td_lambda: 0.95  # GAE lambda (0=TD(0), 0.95=GAE 권장, 1.0=MC)
   beta: 1.0
   weight_clip_min: 0.1
-  weight_clip_max: 3
+  weight_clip_max: 3.0
 
-  # TD EMA 정규화
+  # Advantage EMA 정규화
   td_ema_momentum: 0.1
   td_ema_warmup_steps: 10
 

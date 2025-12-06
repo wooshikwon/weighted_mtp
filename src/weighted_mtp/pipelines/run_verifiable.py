@@ -50,7 +50,7 @@ from weighted_mtp.runtime import (
 )
 from weighted_mtp.value_weighting.td_weighting import (
     build_weights,
-    compute_td_errors,
+    compute_gae_advantage,
     compute_td_stats,
 )
 from weighted_mtp.value_weighting.td_stats_ema import TDStatsEMA
@@ -134,6 +134,7 @@ def validate_verifiable(
     beta: float,
     weight_clip_min: float,
     weight_clip_max: float,
+    td_lambda: float = 0.95,
 ) -> dict[str, float]:
     """Validation 수행 (TD Weighting only)
 
@@ -145,6 +146,7 @@ def validate_verifiable(
         beta: TD error weighting 계수
         weight_clip_min: Weight 최소값
         weight_clip_max: Weight 최대값
+        td_lambda: GAE lambda (0=TD(0), 0.95=GAE, 1.0=MC)
 
     Returns:
         Validation metrics (weighted_ce_loss, unweighted_ce_loss)
@@ -177,15 +179,16 @@ def validate_verifiable(
             # 학습 대상 토큰 마스크 (labels != -100)
             pos_loss_mask = (pos_labels != -100)
 
-            # TD error 계산
-            td_errors = compute_td_errors(
+            # GAE Advantage 계산
+            advantages = compute_gae_advantage(
                 value_logits=value_logits,
                 rewards=pos_rewards,
                 loss_mask=pos_loss_mask,
                 gamma=1.0,
+                lam=td_lambda,
             )
             weights = build_weights(
-                td_errors=td_errors,
+                td_errors=advantages,
                 loss_mask=pos_loss_mask,
                 beta=beta,
                 min_weight=weight_clip_min,
@@ -433,12 +436,14 @@ def run_verifiable_training(
     # TD EMA 통계 추적기
     td_ema_momentum = config.training.get("td_ema_momentum", 0.1)
     td_ema_warmup_steps = config.training.get("td_ema_warmup_steps", 10)
+    td_lambda = config.training.get("td_lambda", 0.95)
     td_ema = TDStatsEMA(
         device=device,
         momentum=td_ema_momentum,
         warmup_steps=td_ema_warmup_steps,
     )
     logger.info(f"TD EMA: momentum={td_ema_momentum}, warmup_steps={td_ema_warmup_steps}")
+    logger.info(f"GAE lambda: {td_lambda}")
 
     # Gradient clipping
     max_grad_norm = config.training.get("max_grad_norm", 1.0)
@@ -501,18 +506,19 @@ def run_verifiable_training(
             # 학습 대상 토큰 마스크
             pos_loss_mask = (pos_labels != -100)
 
-            # TD error 계산
-            td_errors = compute_td_errors(
+            # GAE Advantage 계산
+            advantages = compute_gae_advantage(
                 value_logits=value_logits,
                 rewards=pos_rewards,
                 loss_mask=pos_loss_mask,
                 gamma=1.0,
+                lam=td_lambda,
             )
 
             # Weight 산출 (EMA 기반)
             ema_mean, ema_std = td_ema.get_stats()
             weights = build_weights(
-                td_errors=td_errors,
+                td_errors=advantages,
                 loss_mask=pos_loss_mask,
                 beta=config.training.beta,
                 min_weight=config.training.weight_clip_min,
@@ -539,7 +545,7 @@ def run_verifiable_training(
             scaled_loss.backward()
 
             # EMA용 누적 (GPU 유지, detach로 graph 분리)
-            accum_td_errors.append(td_errors.detach())
+            accum_td_errors.append(advantages.detach())
             accum_loss_masks.append(pos_loss_mask)  # bool tensor, detach 불필요
 
             accumulation_counter += 1
@@ -581,7 +587,7 @@ def run_verifiable_training(
 
                 # Step-level 로깅
                 if global_step % config.training.log_interval == 0:
-                    td_stats = compute_td_stats(td_errors, pos_loss_mask)
+                    td_stats = compute_td_stats(advantages, pos_loss_mask)
                     gpu_metrics = gpu_monitor.get_metrics()
 
                     # Value function stats (로깅용)
@@ -594,26 +600,51 @@ def run_verifiable_training(
 
                     weight_dist_stats = compute_weight_statistics(weights, pos_loss_mask)
 
+                    # Weight clipping ratio 계산
+                    td_normalized = (advantages - ema_mean) / (ema_std + 1e-8)
+                    raw_weights = torch.exp(td_normalized / config.training.beta)
+                    valid_raw = raw_weights[pos_loss_mask.bool()]
+                    clipping_ratio = (
+                        (valid_raw < config.training.weight_clip_min) |
+                        (valid_raw > config.training.weight_clip_max)
+                    ).float().mean().item() if valid_raw.numel() > 0 else 0.0
+
                     reduced = all_reduce_scalars({
                         "weighted_ce": weighted_ce_loss.item(),
                         "unweighted_ce": unweighted_ce_loss.item(),
                         "td_mean": td_stats["td_mean"],
+                        "td_std": td_stats["td_std"],
                         "value_mse": value_func_stats["value_mse"],
                         "weight_mean": weight_dist_stats["weight_mean"],
+                        "weight_std": weight_dist_stats["weight_std"],
+                        "weight_min": weight_dist_stats["weight_min"],
+                        "weight_max": weight_dist_stats["weight_max"],
+                        "weight_entropy": weight_dist_stats["weight_entropy"],
+                        "weight_clipping_ratio": clipping_ratio,
                     })
+
+                    # Loss ratio 계산 (weighting 효과 지표)
+                    loss_ratio = reduced["weighted_ce"] / (reduced["unweighted_ce"] + 1e-8)
 
                     if is_main_process():
                         if use_mlflow:
                             mlflow.log_metrics({
                                 "train/weighted_ce_loss": reduced["weighted_ce"],
                                 "train/unweighted_ce_loss": reduced["unweighted_ce"],
+                                "train/loss_ratio": loss_ratio,
                                 "train/grad_norm": grad_clip_stats["grad_norm_post_clip"],
                                 "train/learning_rate": optimizer.param_groups[0]["lr"],
                                 "td/mean": reduced["td_mean"],
+                                "td/std": reduced["td_std"],
                                 "td/ema_mean": td_ema.ema_mean.item(),
                                 "td/ema_std": td_ema.ema_std.item(),
                                 "value/mse": reduced["value_mse"],
                                 "weight/mean": reduced["weight_mean"],
+                                "weight/std": reduced["weight_std"],
+                                "weight/min": reduced["weight_min"],
+                                "weight/max": reduced["weight_max"],
+                                "weight/entropy": reduced["weight_entropy"],
+                                "weight/clipping_ratio": reduced["weight_clipping_ratio"],
                                 "system/gpu_memory_allocated_gb": gpu_metrics["gpu_memory_allocated_gb"],
                             }, step=global_step)
 
@@ -672,6 +703,7 @@ def run_verifiable_training(
             beta=config.training.beta,
             weight_clip_min=config.training.weight_clip_min,
             weight_clip_max=config.training.weight_clip_max,
+            td_lambda=td_lambda,
         )
 
         # Validation all_reduce
@@ -774,6 +806,7 @@ def run_verifiable_training(
             beta=config.training.beta,
             weight_clip_min=config.training.weight_clip_min,
             weight_clip_max=config.training.weight_clip_max,
+            td_lambda=td_lambda,
         )
 
         reduced_final = all_reduce_scalars({

@@ -18,44 +18,44 @@ def compute_td_targets(
     loss_mask: torch.Tensor,
     gamma: float = 1.0,
     lam: float = 0.0,
+    initial_value: float = 0.5,
 ) -> torch.Tensor:
-    """GAE 기반 TD targets 계산 (Value 학습용)
+    """GAE 기반 TD targets 계산 (Pairwise Ranking Value Model 호환)
+
+    시점 정렬:
+    - v_t = ValueHead(H_t) = "x_0...x_t까지 본 문맥의 가치"
+    - 토큰 t의 기여 = v_t - v_{t-1} (토큰 t 생성 후 가치 - 토큰 t 생성 전 가치)
+
+    Pairwise Ranking 호환:
+    - 외부 reward(R) 대신 V_T 자체가 "정답 확률"을 반영
+    - 모든 δ_t = γ*v_t - v_{t-1}로 통일 (terminal 포함)
+    - 스케일 일관성 확보 (V의 스케일과 δ의 스케일 일치)
 
     GAE (Generalized Advantage Estimation) 알고리즘:
-    - δ_t = r_t + γV(s_{t+1}) - V(s_t)  (TD error)
+    - δ_t = γ*v_t - v_{t-1}  (토큰 t의 기여)
     - A_t = δ_t + γλ * A_{t+1}  (역방향 계산)
-    - Target_t = V(s_t) + A_t
+    - Target_t = v_t + A_t
 
     Args:
         value_logits: [batch, seq, 1] Value head 출력
-        rewards: [batch] Binary reward (0.0: incorrect, 1.0: correct)
+        rewards: [batch] (미사용, API 호환용으로 유지)
         loss_mask: [batch, seq] 학습 대상 토큰 마스크 (labels != -100)
         gamma: 할인율 (기본 1.0)
         lam: GAE lambda (기본 0.0)
             - 0.0: TD(0) - 한 스텝 bootstrapping
             - 0.95: GAE - 권장값, 빠른 수렴 + 안정성
             - 1.0: Monte Carlo
+        initial_value: v_{-1} 초기값 (기본 0.5, 중립적 사전 확률)
 
     Returns:
         td_targets: [batch, seq, 1] TD targets (gradient 차단됨)
-
-    Examples:
-        >>> value_logits = torch.tensor([[[0.5], [0.7], [0.9]]])  # [1, 3, 1]
-        >>> rewards = torch.tensor([1.0])
-        >>> loss_mask = torch.tensor([[1, 1, 1]])
-        >>> # TD(0): lam=0
-        >>> targets = compute_td_targets(value_logits, rewards, loss_mask, gamma=1.0, lam=0.0)
-        >>> # [0.7, 0.9, 1.0]
-        >>> # GAE: lam=0.95
-        >>> targets = compute_td_targets(value_logits, rewards, loss_mask, gamma=1.0, lam=0.95)
-        >>> # 에러 신호가 더 빠르게 전파됨
     """
     batch_size, seq_len, _ = value_logits.shape
     device = value_logits.device
     dtype = value_logits.dtype  # BFloat16 등 모델 dtype 유지
 
     # Monte Carlo (lam=1.0, gamma=1.0): Target = R (벡터 연산으로 최적화)
-    # 수학적 증명: A_t = R - V(s_t), Target_t = V(s_t) + A_t = R
+    # 수학적 증명: A_t = R - v_t, Target_t = v_t + A_t = R
     if lam == 1.0 and gamma == 1.0:
         # rewards: [batch] → [batch, seq]
         td_targets = rewards.view(-1, 1).expand(-1, seq_len).to(dtype)
@@ -80,23 +80,26 @@ def compute_td_targets(
 
         # 역방향으로 GAE 계산
         for t in range(int(term_idx), -1, -1):
-            if t == term_idx:
-                # Terminal: δ_T = R - V(s_T)
-                next_value = 0.0
-                reward = rewards[b].item()
-            else:
-                # Intermediate: δ_t = γV(s_{t+1}) - V(s_t)
-                next_value = values[b, t + 1].item()
-                reward = 0.0
+            current_value = values[b, t].item()
 
-            # TD error
-            delta = reward + gamma * next_value - values[b, t].item()
+            # 이전 토큰의 value (t=0이면 initial_value 사용)
+            if t == 0:
+                prev_value = initial_value
+            else:
+                prev_value = values[b, t - 1].item()
+
+            # 모든 토큰에 대해 동일한 δ 계산: δ_t = γ*v_t - v_{t-1}
+            # Pairwise ranking value model과 호환:
+            # - 외부 reward 대신 V_T 자체가 "정답 확률"을 반영
+            # - Terminal도 동일: δ_T = γ*V_T - V_{T-1}
+            # - 스케일 일관성 확보
+            delta = gamma * current_value - prev_value
 
             # GAE: A_t = δ_t + γλ * A_{t+1}
             gae = delta + gamma * lam * last_gae
 
-            # Target: V(s_t) + A_t
-            td_targets[b, t] = values[b, t].item() + gae
+            # Target: v_t + A_t
+            td_targets[b, t] = current_value + gae
 
             last_gae = gae
 
@@ -105,6 +108,48 @@ def compute_td_targets(
 
     # [batch, seq] → [batch, seq, 1]
     return td_targets.unsqueeze(-1)
+
+
+def compute_gae_advantage(
+    value_logits: torch.Tensor,
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor,
+    gamma: float = 1.0,
+    lam: float = 0.95,
+    initial_value: float = 0.5,
+) -> torch.Tensor:
+    """GAE 기반 Advantage 계산 (Pairwise Ranking Value Model 호환)
+
+    A_t = Σ (γλ)^k δ_{t+k}
+
+    Pairwise Ranking 호환:
+    - 외부 reward 대신 V 자체가 "정답 확률"을 반영
+    - 모든 δ_t = γ*v_t - v_{t-1}로 통일
+    - GAE가 이 marginal value를 역전파하여 noise 감소
+
+    Args:
+        value_logits: [batch, seq, 1] Value head 출력
+        rewards: [batch] (미사용, API 호환용으로 유지)
+        loss_mask: [batch, seq] 학습 대상 토큰 마스크 (labels != -100)
+        gamma: 할인율 (기본 1.0)
+        lam: GAE lambda (기본 0.95)
+            - 0.0: TD(0) - 1-step bootstrap
+            - 0.95: GAE 권장값
+            - 1.0: Monte Carlo
+        initial_value: v_{-1} 초기값 (기본 0.5, 중립적 사전 확률)
+
+    Returns:
+        advantages: [batch, seq] GAE advantage (토큰 t의 가중치용)
+    """
+    # GAE target 계산 (Target = V + A)
+    targets = compute_td_targets(value_logits, rewards, loss_mask, gamma, lam, initial_value)
+
+    # Advantage = Target - V
+    values = value_logits.squeeze(-1).detach()
+    advantages = targets.squeeze(-1) - values
+
+    # Padding 마스킹
+    return advantages * loss_mask.float()
 
 
 def compute_td_errors(
