@@ -58,7 +58,7 @@ data_sampling:
 # 학습 설정 (H100 80GB 4-GPU 최적화)
 training:
   n_epochs: 1.5
-  batch_size: 32
+  batch_size: 24
   gradient_accumulation_steps: 1  # Effective batch size = 32 × 1 × 3 = 96
 
   # Global 설정 (FSDP 제약으로 분리 불가)
