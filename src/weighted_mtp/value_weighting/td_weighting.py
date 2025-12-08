@@ -1,0 +1,393 @@
+"""TD Error 기반 Weighting (Verifiable WMTP용)
+
+Temporal Difference Learning 기반 토큰별 가중치 계산
+- TD error 계산: Bootstrapping value estimation
+- 절댓값 기반 weighting: TD error 크기 기반 중요도 계산
+- 통계 추적: 학습 모니터링 및 디버깅
+
+References:
+- Sutton & Barto "Reinforcement Learning: An Introduction"
+"""
+
+import torch
+
+
+def compute_td_targets(
+    value_logits: torch.Tensor,
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor,
+    gamma: float = 1.0,
+    lam: float = 0.0,
+    initial_value: float = 0.5,
+) -> torch.Tensor:
+    """GAE 기반 TD targets 계산 (Pairwise Ranking Value Model 호환)
+
+    시점 정렬:
+    - v_t = ValueHead(H_t) = "x_0...x_t까지 본 문맥의 가치"
+    - 토큰 t의 기여 = v_t - v_{t-1} (토큰 t 생성 후 가치 - 토큰 t 생성 전 가치)
+
+    Pairwise Ranking 호환:
+    - 외부 reward(R) 대신 V_T 자체가 "정답 확률"을 반영
+    - 모든 δ_t = γ*v_t - v_{t-1}로 통일 (terminal 포함)
+    - 스케일 일관성 확보 (V의 스케일과 δ의 스케일 일치)
+
+    GAE (Generalized Advantage Estimation) 알고리즘:
+    - δ_t = γ*v_t - v_{t-1}  (토큰 t의 기여)
+    - A_t = δ_t + γλ * A_{t+1}  (역방향 계산)
+    - Target_t = v_t + A_t
+
+    Args:
+        value_logits: [batch, seq, 1] Value head 출력
+        rewards: [batch] (미사용, API 호환용으로 유지)
+        loss_mask: [batch, seq] 학습 대상 토큰 마스크 (labels != -100)
+        gamma: 할인율 (기본 1.0)
+        lam: GAE lambda (기본 0.0)
+            - 0.0: TD(0) - 한 스텝 bootstrapping
+            - 0.95: GAE - 권장값, 빠른 수렴 + 안정성
+            - 1.0: Monte Carlo
+        initial_value: v_{-1} 초기값 (기본 0.5, 중립적 사전 확률)
+
+    Returns:
+        td_targets: [batch, seq, 1] TD targets (gradient 차단됨)
+    """
+    batch_size, seq_len, _ = value_logits.shape
+    device = value_logits.device
+    dtype = value_logits.dtype  # BFloat16 등 모델 dtype 유지
+
+    # Monte Carlo (lam=1.0, gamma=1.0): Target = R (벡터 연산으로 최적화)
+    # 수학적 증명: A_t = R - v_t, Target_t = v_t + A_t = R
+    if lam == 1.0 and gamma == 1.0:
+        # rewards: [batch] → [batch, seq]
+        td_targets = rewards.view(-1, 1).expand(-1, seq_len).to(dtype)
+        td_targets = td_targets * loss_mask.to(dtype)
+        return td_targets.unsqueeze(-1)
+
+    # Value logits squeeze 및 detach: [batch, seq, 1] → [batch, seq]
+    values = value_logits.squeeze(-1).detach()
+
+    # Terminal indices: 각 시퀀스의 마지막 유효 토큰 위치
+    seq_indices = torch.arange(seq_len, device=device).unsqueeze(0)
+    masked_indices = seq_indices * loss_mask
+    terminal_indices = masked_indices.max(dim=1).values.long()
+
+    # TD targets 초기화 (모델 dtype 유지)
+    td_targets = torch.zeros(batch_size, seq_len, device=device, dtype=dtype)
+
+    # GAE 기반 역방향 계산 (lam=0: TD(0), lam=0.95: GAE)
+    for b in range(batch_size):
+        last_gae = 0.0
+        term_idx = terminal_indices[b].item()
+
+        # 역방향으로 GAE 계산
+        for t in range(int(term_idx), -1, -1):
+            current_value = values[b, t].item()
+
+            # 이전 토큰의 value (t=0이면 initial_value 사용)
+            if t == 0:
+                prev_value = initial_value
+            else:
+                prev_value = values[b, t - 1].item()
+
+            # 모든 토큰에 대해 동일한 δ 계산: δ_t = γ*v_t - v_{t-1}
+            # Pairwise ranking value model과 호환:
+            # - 외부 reward 대신 V_T 자체가 "정답 확률"을 반영
+            # - Terminal도 동일: δ_T = γ*V_T - V_{T-1}
+            # - 스케일 일관성 확보
+            delta = gamma * current_value - prev_value
+
+            # GAE: A_t = δ_t + γλ * A_{t+1}
+            gae = delta + gamma * lam * last_gae
+
+            # Target: v_t + A_t
+            td_targets[b, t] = current_value + gae
+
+            last_gae = gae
+
+    # Padding 마스킹 (dtype 유지)
+    td_targets = td_targets * loss_mask.to(dtype)
+
+    # [batch, seq] → [batch, seq, 1]
+    return td_targets.unsqueeze(-1)
+
+
+def compute_gae_advantage(
+    value_logits: torch.Tensor,
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor,
+    gamma: float = 1.0,
+    lam: float = 0.95,
+    initial_value: float = 0.5,
+) -> torch.Tensor:
+    """GAE 기반 Advantage 계산 (Pairwise Ranking Value Model 호환)
+
+    A_t = Σ (γλ)^k δ_{t+k}
+
+    Pairwise Ranking 호환:
+    - 외부 reward 대신 V 자체가 "정답 확률"을 반영
+    - 모든 δ_t = γ*v_t - v_{t-1}로 통일
+    - GAE가 이 marginal value를 역전파하여 noise 감소
+
+    Args:
+        value_logits: [batch, seq, 1] Value head 출력
+        rewards: [batch] (미사용, API 호환용으로 유지)
+        loss_mask: [batch, seq] 학습 대상 토큰 마스크 (labels != -100)
+        gamma: 할인율 (기본 1.0)
+        lam: GAE lambda (기본 0.95)
+            - 0.0: TD(0) - 1-step bootstrap
+            - 0.95: GAE 권장값
+            - 1.0: Monte Carlo
+        initial_value: v_{-1} 초기값 (기본 0.5, 중립적 사전 확률)
+
+    Returns:
+        advantages: [batch, seq] GAE advantage (토큰 t의 가중치용)
+    """
+    # GAE target 계산 (Target = V + A)
+    targets = compute_td_targets(value_logits, rewards, loss_mask, gamma, lam, initial_value)
+
+    # Advantage = Target - V
+    values = value_logits.squeeze(-1).detach()
+    advantages = targets.squeeze(-1) - values
+
+    # Padding 마스킹
+    return advantages * loss_mask.float()
+
+
+def compute_td_errors(
+    value_logits: torch.Tensor,
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor,
+    gamma: float = 1.0,
+    initial_value: float = 0.5,
+) -> torch.Tensor:
+    """TD error 계산 (한계 가치 기반)
+
+    δ_t = V(t) - V(t-1): t시점 토큰을 선택함으로써 얻게 되는 한계 가치(marginal value)
+    Terminal에서는 δ_T = R - V(T): 실제 결과와 예측의 차이
+
+    Args:
+        value_logits: [batch, seq, 1] Value head 출력
+        rewards: [batch] Binary reward (0.0: incorrect, 1.0: correct)
+        loss_mask: [batch, seq] 학습 대상 토큰 마스크 (labels != -100)
+        gamma: 할인율 (기본 1.0, LLM RLHF 표준은 할인 없음)
+        initial_value: V(-1) 초기값 (기본 0.5, 중립적 사전 확률)
+
+    Returns:
+        td_errors: [batch, seq] 토큰별 TD error
+            - First (t=0): γV(0) - initial_value
+            - Intermediate (0 < t < T): γV(t) - V(t-1)
+            - Terminal (t = T): R - V(T)
+            - Padding: 0.0 (masking 적용)
+
+    Examples:
+        >>> value_logits = torch.tensor([[[0.5], [0.7], [0.9]]])  # [1, 3, 1]
+        >>> rewards = torch.tensor([1.0])  # Correct
+        >>> loss_mask = torch.tensor([[1, 1, 1]])  # All valid
+        >>> td_errors = compute_td_errors(value_logits, rewards, loss_mask)
+        >>> # δ_0 = V(0) - V(-1) = 0.5 - 0.5 = 0.0
+        >>> # δ_1 = V(1) - V(0) = 0.7 - 0.5 = 0.2
+        >>> # δ_2 = R - V(2) = 1.0 - 0.9 = 0.1 (terminal)
+        >>> td_errors
+        tensor([[0.0, 0.2, 0.1]])
+    """
+    batch_size, seq_len, _ = value_logits.shape
+
+    # Value logits squeeze: [batch, seq, 1] → [batch, seq]
+    # detach()로 gradient 차단: weight 계산 시 CE loss gradient가 value_head로 흐르는 것 방지
+    values = value_logits.squeeze(-1).detach()
+
+    # Terminal indices 계산: 각 시퀀스의 마지막 유효 토큰 위치
+    seq_indices = torch.arange(seq_len, device=values.device).unsqueeze(0)
+    masked_indices = seq_indices * loss_mask
+    terminal_indices = masked_indices.max(dim=1).values.long()
+
+    # TD errors 초기화
+    td_errors = torch.zeros_like(values)
+
+    # 첫 번째 토큰의 TD error: δ_0 = γV(0) - initial_value
+    td_errors[:, 0] = gamma * values[:, 0] - initial_value
+
+    # Intermediate TD errors: δ_t = γV(t) - V(t-1)
+    # t시점 토큰을 선택함으로써 얻게 되는 한계 가치
+    if seq_len > 1:
+        td_errors[:, 1:] = gamma * values[:, 1:] - values[:, :-1]
+
+    # Terminal TD error: δ_T = R - V(T)
+    # 실제 결과와 예측의 차이
+    batch_indices = torch.arange(batch_size, device=values.device)
+    values_terminal = values[batch_indices, terminal_indices]
+    td_terminal = rewards - values_terminal
+
+    # Terminal 위치에 TD terminal 값 할당
+    td_errors[batch_indices, terminal_indices] = td_terminal
+
+    # Padding 토큰 masking
+    td_errors = td_errors * loss_mask.float()
+
+    return td_errors
+
+
+def build_weights(
+    td_errors: torch.Tensor,
+    loss_mask: torch.Tensor,
+    beta: float = 1.0,
+    min_weight: float = 0.1,
+    max_weight: float = 5.0,
+    external_mean: torch.Tensor = None,
+    external_std: torch.Tensor = None,
+) -> torch.Tensor:
+    """TD error 기반 토큰 가중치 (Advantage Whitening 적용)
+
+    가중치 산정 흐름:
+    1. 표준화 (Whitening): 스케일 불변성 확보
+    2. exp(A_norm / beta): 중요도 변환
+    3. Clipping: 범위 제한으로 안정성 보장
+
+    Args:
+        td_errors: [batch, seq] TD error (compute_td_errors 출력)
+        loss_mask: [batch, seq] 학습 대상 토큰 마스크 (labels != -100)
+        beta: Temperature (낮을수록 상위 토큰 집중, 기본 1.0)
+        min_weight: 최소 가중치 (기본 0.1)
+        max_weight: 최대 가중치 (기본 5.0)
+        external_mean: 외부 제공 평균 (EMA 등). None이면 현재 batch 통계 사용
+        external_std: 외부 제공 표준편차 (EMA 등). None이면 현재 batch 통계 사용
+
+    Returns:
+        weights: [batch, seq] Token-level weights (clipped)
+    """
+    bool_mask = loss_mask.bool()
+
+    # 외부 통계 사용 여부 결정
+    if external_mean is not None and external_std is not None:
+        # EMA 등 외부 통계 사용
+        mean = external_mean
+        std = external_std
+    else:
+        # 현재 batch 통계 사용 (기존 동작)
+        valid_td = td_errors[bool_mask]
+
+        # Edge case: 유효 토큰이 1개 이하면 균등 가중치 반환
+        if valid_td.numel() <= 1:
+            weights = torch.ones_like(td_errors)
+            weights = weights * loss_mask.float()
+            return weights
+
+        mean = valid_td.mean()
+        std = valid_td.std()
+
+    # Advantage Whitening: (A - mean) / (std + eps)
+    td_normalized = (td_errors - mean) / (std + 1e-8)
+
+    # Exponential transformation
+    weights = torch.exp(td_normalized / beta)
+
+    # Clipping
+    weights = torch.clamp(weights, min=min_weight, max=max_weight)
+
+    # Padding 위치는 0으로 마스킹
+    weights = weights * loss_mask.float()
+
+    return weights
+
+
+def compute_td_stats(
+    td_errors: torch.Tensor,
+    loss_mask: torch.Tensor = None,
+) -> dict[str, float]:
+    """TD error 분포 통계 계산
+
+    Args:
+        td_errors: [batch, seq] TD errors
+        loss_mask: 학습 대상 토큰 마스크 [batch, seq] (None이면 전체 사용)
+
+    Returns:
+        {
+            "td_mean": float,
+            "td_std": float,
+            "td_min": float,
+            "td_max": float,
+        }
+
+    Examples:
+        >>> td_errors = torch.tensor([[0.2, -0.5, 0.1], [0.3, -0.3, 0.0]])
+        >>> stats = compute_td_stats(td_errors)
+        >>> stats["td_mean"]  # 평균
+        -0.033
+        >>> stats["td_std"]  # 표준편차
+        0.28
+    """
+    if loss_mask is not None:
+        # 유효한 토큰만 선택 (padding 제외)
+        bool_mask = loss_mask.flatten().bool()
+        td_flat = td_errors.flatten()[bool_mask]
+    else:
+        td_flat = td_errors.flatten()
+
+    return {
+        "td_mean": td_flat.mean().item(),
+        "td_std": td_flat.std().item(),
+        "td_min": td_flat.min().item(),
+        "td_max": td_flat.max().item(),
+    }
+
+
+def compute_weight_stats(
+    weights: torch.Tensor,
+    loss_mask: torch.Tensor = None,
+) -> dict[str, float]:
+    """Weight 분포 통계 계산
+
+    Args:
+        weights: [batch, seq] Token weights
+        loss_mask: 학습 대상 토큰 마스크 [batch, seq] (None이면 전체 사용)
+
+    Returns:
+        {
+            "weight_mean": float,
+            "weight_std": float,
+            "weight_min": float,
+            "weight_max": float,
+            "weight_entropy": float,  # Normalized entropy
+        }
+
+    Examples:
+        >>> weights = torch.tensor([[1.2, 0.8, 1.0], [1.5, 0.5, 1.0]])
+        >>> stats = compute_weight_stats(weights)
+        >>> stats["weight_mean"]  # 평균
+        1.0
+        >>> stats["weight_entropy"]  # 엔트로피 (높을수록 균등 분포)
+        0.95
+    """
+    if loss_mask is not None:
+        # 유효한 토큰만 선택 (padding 제외)
+        bool_mask = loss_mask.flatten().bool()
+        weights_flat = weights.flatten()[bool_mask]
+    else:
+        weights_flat = weights.flatten()
+
+    # Basic statistics
+    weight_mean = weights_flat.mean().item()
+    weight_std = weights_flat.std().item()
+    weight_min = weights_flat.min().item()
+    weight_max = weights_flat.max().item()
+
+    # Entropy calculation
+    # Normalize weights to probability distribution
+    weights_normalized = weights_flat / (weights_flat.sum() + 1e-8)
+
+    # Shannon entropy: -sum(p * log(p))
+    # NaN 방지: log(0) → 0으로 처리
+    entropy_terms = weights_normalized * torch.log(weights_normalized + 1e-10)
+    entropy = -entropy_terms.sum().item()
+
+    # Normalize entropy to [0, 1]
+    # Maximum entropy = log(N), where N is number of elements
+    max_entropy = torch.log(torch.tensor(len(weights_flat), dtype=torch.float32)).item()
+    normalized_entropy = entropy / (max_entropy + 1e-8)
+
+    return {
+        "weight_mean": weight_mean,
+        "weight_std": weight_std,
+        "weight_min": weight_min,
+        "weight_max": weight_max,
+        "weight_entropy": normalized_entropy,
+    }

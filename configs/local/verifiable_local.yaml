@@ -1,0 +1,117 @@
+# Verifiable WMTP Local Test (독립 Value Model)
+# 로컬 테스트용
+
+project:
+  name: weighted-mtp
+  version: "2.0.0"
+
+experiment:
+  name: verifiable-wmtp-local
+  description: "Local test with independent Value Model"
+  stage: verifiable
+  tags:
+    - verifiable
+    - local
+    - independent-value-model
+
+# 모델 설정
+models:
+  # Policy Model (학습 대상)
+  policy:
+    name: micro-mtp
+    path: storage/models/micro-mtp
+    tokenizer_path: storage/models/meta-llama-mtp/tokenizer
+    dtype: float32
+
+  # Value Model (Critic checkpoint에서 로드)
+  value_model:
+    checkpoint_path: storage/checkpoints/critic/critic-pretrain-local/checkpoint_final.pt
+
+dataset:
+  name: codecontests
+  train: storage/datasets/codecontests/processed/train.jsonl
+  validation: storage/datasets/codecontests/processed/valid.jsonl
+  max_length: 512
+
+data_sampling:
+  seed: 42
+  val_n_samples: 50
+  use_pairwise: true
+
+  n_samples: 100
+
+  difficulty_bins:
+    diff_7: [7, 7]
+    else: [8, 25]
+  difficulty_weights:
+    diff_7: 0.35
+    else: 0.65
+
+training:
+  n_epochs: 0.1
+  batch_size: 1
+  gradient_accumulation_steps: 2
+
+  learning_rate: 1.0e-4
+
+  max_grad_norm: 1.0
+  beta: 1.0
+  weight_clip_min: 0
+  weight_clip_max: 3.0
+  
+  td_ema_momentum: 0.1
+  td_ema_warmup_steps: 5
+  
+  log_interval: 5
+
+  use_lora: true
+  lora:
+    rank: 16
+    alpha: 32.0
+    dropout: 0.05
+    target_modules:
+      - wq
+      - wk
+      - wv
+      - wo
+      - w1
+      - w2
+      - w3
+
+  lr_scheduler:
+    type: cosine
+    warmup_ratio: 0.05
+    min_lr_ratio: 0.0
+
+checkpoint:
+  save_dir: storage/checkpoints/verifiable/${experiment.name}
+  save_checkpoint_every: 0.1
+  save_best: true
+  save_final: true
+  save_total_limit: 2
+  save_lora_only: true
+
+runtime:
+  device: mps
+  seed: 42
+  mixed_precision: false
+
+distributed:
+  fsdp:
+    sharding_strategy: NO_SHARD
+    mixed_precision: false
+    cpu_offload: false
+
+storage:
+  root: storage
+  models_dir: storage/models
+  datasets_dir: storage/datasets
+  checkpoints_dir: storage/checkpoints
+
+mlflow:
+  tracking_uri: "sqlite:///mlflow.db"
+  experiment: "weighted_mtp"
+
+logging:
+  level: INFO
+  format: "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"

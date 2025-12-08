@@ -1,0 +1,303 @@
+"""dataloader.py get_difficulty_config 및 sampling 통합 테스트
+
+핵심 검증 항목:
+- get_difficulty_config 함수의 정적/동적 weights 추출
+- get_curriculum_weights 함수의 epoch별 weights 추출
+- 실제 샘플링 결과가 기대값과 일치하는지 검증
+"""
+
+import pytest
+from omegaconf import OmegaConf
+
+from weighted_mtp.data.dataloader import (
+    get_curriculum_weights,
+    get_difficulty_config,
+)
+from weighted_mtp.data import load_dataset
+
+
+class TestGetCurriculumWeights:
+    """get_curriculum_weights 함수 테스트"""
+
+    def test_epoch_in_first_range(self):
+        """첫 번째 epoch_range에 해당하는 경우"""
+        schedule = [
+            {"epoch_range": [0.0, 1.0], "difficulty_weights": {"low": 0.8, "high": 0.2}},
+            {"epoch_range": [1.0, 3.0], "difficulty_weights": {"low": 0.3, "high": 0.7}},
+        ]
+
+        weights = get_curriculum_weights(0.5, schedule)
+        assert weights == {"low": 0.8, "high": 0.2}
+
+    def test_epoch_in_second_range(self):
+        """두 번째 epoch_range에 해당하는 경우"""
+        schedule = [
+            {"epoch_range": [0.0, 1.0], "difficulty_weights": {"low": 0.8, "high": 0.2}},
+            {"epoch_range": [1.0, 3.0], "difficulty_weights": {"low": 0.3, "high": 0.7}},
+        ]
+
+        weights = get_curriculum_weights(1.5, schedule)
+        assert weights == {"low": 0.3, "high": 0.7}
+
+    def test_epoch_at_boundary(self):
+        """epoch이 경계값인 경우 (1.0은 두 번째 range)"""
+        schedule = [
+            {"epoch_range": [0.0, 1.0], "difficulty_weights": {"low": 0.8, "high": 0.2}},
+            {"epoch_range": [1.0, 3.0], "difficulty_weights": {"low": 0.3, "high": 0.7}},
+        ]
+
+        weights = get_curriculum_weights(1.0, schedule)
+        assert weights == {"low": 0.3, "high": 0.7}
+
+    def test_epoch_beyond_range(self):
+        """epoch이 모든 range를 초과한 경우 마지막 반환"""
+        schedule = [
+            {"epoch_range": [0.0, 1.0], "difficulty_weights": {"low": 0.8, "high": 0.2}},
+            {"epoch_range": [1.0, 3.0], "difficulty_weights": {"low": 0.3, "high": 0.7}},
+        ]
+
+        weights = get_curriculum_weights(5.0, schedule)
+        assert weights == {"low": 0.3, "high": 0.7}
+
+
+class TestGetDifficultyConfig:
+    """get_difficulty_config 함수 테스트"""
+
+    def test_static_weights(self):
+        """정적 difficulty_weights 사용"""
+        config = OmegaConf.create({
+            "data_sampling": {
+                "difficulty_bins": {"diff_7": [7, 7], "else": [8, 25]},
+                "difficulty_weights": {"diff_7": 0.35, "else": 0.65},
+            }
+        })
+
+        weights, bins = get_difficulty_config(config)
+
+        assert weights == {"diff_7": 0.35, "else": 0.65}
+        assert bins == {"diff_7": [7, 7], "else": [8, 25]}
+
+    def test_curriculum_schedule(self):
+        """curriculum_schedule 사용 (동적 weights)"""
+        config = OmegaConf.create({
+            "data_sampling": {
+                "difficulty_bins": {"low": [1, 3], "high": [4, 11]},
+                "curriculum_learning": True,
+                "curriculum_schedule": [
+                    {"epoch_range": [0.0, 1.0], "difficulty_weights": {"low": 0.8, "high": 0.2}},
+                    {"epoch_range": [1.0, 3.0], "difficulty_weights": {"low": 0.3, "high": 0.7}},
+                ],
+            }
+        })
+
+        # epoch 0.5
+        weights, bins = get_difficulty_config(config, current_epoch=0.5)
+        assert weights == {"low": 0.8, "high": 0.2}
+
+        # epoch 1.5
+        weights, bins = get_difficulty_config(config, current_epoch=1.5)
+        assert weights == {"low": 0.3, "high": 0.7}
+
+    def test_no_difficulty_config(self):
+        """difficulty 설정이 없는 경우"""
+        config = OmegaConf.create({
+            "data_sampling": {
+                "n_samples": 1000,
+            }
+        })
+
+        weights, bins = get_difficulty_config(config)
+
+        assert weights is None
+        assert bins is None
+
+    def test_curriculum_learning_false(self):
+        """curriculum_learning=false면 정적 weights 사용"""
+        config = OmegaConf.create({
+            "data_sampling": {
+                "difficulty_bins": {"low": [1, 3], "high": [4, 11]},
+                "curriculum_learning": False,
+                "curriculum_schedule": [
+                    {"epoch_range": [0.0, 3.0], "difficulty_weights": {"low": 0.8, "high": 0.2}},
+                ],
+                "difficulty_weights": {"low": 0.5, "high": 0.5},
+            }
+        })
+
+        weights, bins = get_difficulty_config(config)
+
+        # curriculum_learning=false이므로 정적 weights 사용
+        assert weights == {"low": 0.5, "high": 0.5}
+
+    def test_bins_only_no_weights(self):
+        """difficulty_bins만 있고 weights가 없는 경우"""
+        config = OmegaConf.create({
+            "data_sampling": {
+                "difficulty_bins": {"diff_7": [7, 7], "else": [8, 25]},
+            }
+        })
+
+        weights, bins = get_difficulty_config(config)
+
+        assert weights is None
+        assert bins == {"diff_7": [7, 7], "else": [8, 25]}
+
+
+class TestSamplingWithDifficultyConfig:
+    """실제 샘플링 결과 검증 (기대값 vs 실제값)"""
+
+    def test_baseline_config_sampling(self):
+        """Baseline config: diff_7=35%, else=65%, correct_only
+
+        기대값:
+        - 총 1000개 샘플
+        - diff_7: 350개 (35%)
+        - else: 650개 (65%)
+        - 모두 correct
+        """
+        n_samples = 1000
+
+        dataset = load_dataset(
+            "codecontests",
+            split="train",
+            sampling_config={
+                "n_samples": n_samples,
+                "use_pairwise": False,
+                "difficulty_weights": {"diff_7": 0.35, "else": 0.65},
+                "difficulty_bins": {"diff_7": [7, 7], "else": [8, 25]},
+            },
+            seed=42
+        )
+
+        # 샘플링 오차 허용 (±1%)
+        assert abs(len(dataset) - n_samples) <= n_samples * 0.01, \
+            f"Expected ~{n_samples} samples, got {len(dataset)}"
+
+        # difficulty 분포 확인
+        diff_7_count = sum(
+            1 for sample in dataset
+            if sample["metadata"]["difficulty"] == 7
+        )
+        else_count = sum(
+            1 for sample in dataset
+            if 8 <= sample["metadata"]["difficulty"] <= 25
+        )
+
+        # 기대값 검증 (오차 ±5% 허용)
+        expected_diff_7 = int(n_samples * 0.35)
+        expected_else = int(n_samples * 0.65)
+
+        assert abs(diff_7_count - expected_diff_7) <= n_samples * 0.05, \
+            f"diff_7: expected ~{expected_diff_7}, got {diff_7_count}"
+        assert abs(else_count - expected_else) <= n_samples * 0.05, \
+            f"else: expected ~{expected_else}, got {else_count}"
+
+        # 모두 correct 검증
+        all_correct = all(sample["is_correct"] for sample in dataset)
+        assert all_correct, "use_pairwise=False이면 모든 샘플이 correct여야 함"
+
+    def test_critic_config_sampling(self):
+        """Critic config: all difficulty (difficulty_weights 사용 시 correct만 로드)
+
+        주의: difficulty_weights가 설정되면 correct sample만 로드됨.
+        incorrect sample이 필요하면 pairwise 모드 사용 필요.
+
+        기대값:
+        - 총 800개 샘플
+        - correct: 800개 (difficulty_weights 사용 시 correct만)
+        - 난이도 1-25 전체
+        """
+        n_samples = 800
+
+        dataset = load_dataset(
+            "codecontests",
+            split="train",
+            sampling_config={
+                "n_samples": n_samples,
+                "use_pairwise": False,
+                "difficulty_weights": {"all": 1.0},
+                "difficulty_bins": {"all": [1, 25]},
+            },
+            seed=42
+        )
+
+        # 샘플링 오차 허용 (±1%)
+        assert abs(len(dataset) - n_samples) <= n_samples * 0.01, \
+            f"Expected ~{n_samples} samples, got {len(dataset)}"
+
+        # difficulty_weights 사용 시 correct sample만 로드됨
+        correct_count = sum(1 for sample in dataset if sample["is_correct"])
+        assert correct_count == len(dataset), \
+            f"difficulty_weights 사용 시 모든 샘플이 correct여야 함, got {correct_count}/{len(dataset)}"
+
+        # 난이도 범위 검증
+        for sample in dataset:
+            difficulty = sample["metadata"]["difficulty"]
+            assert 1 <= difficulty <= 25, f"Expected difficulty 1-25, got {difficulty}"
+
+    def test_mixed_difficulty_sampling(self):
+        """Mixed difficulty: diff_7=35%, else=65%
+
+        기대값:
+        - 총 200개 샘플
+        - diff_7 (7): 70개 (35%)
+        - else (8-25): 130개 (65%)
+        - correct-only
+        """
+        n_samples = 200
+
+        dataset = load_dataset(
+            "codecontests",
+            split="train",
+            sampling_config={
+                "n_samples": n_samples,
+                "use_pairwise": False,
+                "difficulty_weights": {"diff_7": 0.35, "else": 0.65},
+                "difficulty_bins": {"diff_7": [7, 7], "else": [8, 25]},
+            },
+            seed=42
+        )
+
+        # 중복 제거로 인해 샘플 수가 약간 줄어들 수 있음 (±1% 오차 허용)
+        assert abs(len(dataset) - n_samples) <= n_samples * 0.01, \
+            f"Expected ~{n_samples} samples, got {len(dataset)}"
+
+        # difficulty 분포 확인
+        diff_7_count = sum(
+            1 for sample in dataset
+            if sample["metadata"]["difficulty"] == 7
+        )
+        else_count = sum(
+            1 for sample in dataset
+            if 8 <= sample["metadata"]["difficulty"] <= 25
+        )
+
+        # 기대값 검증 (오차 ±10% 허용)
+        expected_diff_7 = int(n_samples * 0.35)
+        expected_else = int(n_samples * 0.65)
+
+        assert abs(diff_7_count - expected_diff_7) <= n_samples * 0.1, \
+            f"diff_7: expected ~{expected_diff_7}, got {diff_7_count}"
+        assert abs(else_count - expected_else) <= n_samples * 0.1, \
+            f"else: expected ~{expected_else}, got {else_count}"
+
+        # 모든 샘플이 correct
+        all_correct = all(sample["is_correct"] for sample in dataset)
+        assert all_correct, "use_pairwise=False이면 모든 샘플이 correct여야 함"
+
+    def test_reproducibility_with_difficulty(self):
+        """동일 seed + difficulty 설정 → 동일 결과"""
+        sampling_config = {
+            "n_samples": 200,
+            "use_pairwise": False,
+            "difficulty_weights": {"diff_7": 0.35, "else": 0.65},
+            "difficulty_bins": {"diff_7": [7, 7], "else": [8, 25]},
+        }
+
+        dataset1 = load_dataset("codecontests", split="train", sampling_config=sampling_config, seed=42)
+        dataset2 = load_dataset("codecontests", split="train", sampling_config=sampling_config, seed=42)
+
+        ids1 = [sample["task_id"] for sample in dataset1]
+        ids2 = [sample["task_id"] for sample in dataset2]
+
+        assert ids1 == ids2, "동일 seed + config면 동일한 샘플이어야 함"

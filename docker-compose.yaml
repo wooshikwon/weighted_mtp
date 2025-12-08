@@ -1,0 +1,96 @@
+version: '3.8'
+
+# 기존 configs/production/ 그대로 사용 가능
+# Dockerfile에서 /app/storage → /storage 심볼릭 링크 생성
+
+services:
+  # Baseline MTP 학습
+  baseline:
+    build: .
+    image: weighted-mtp:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_TOKEN=${HF_TOKEN:-}
+      - MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI:-}
+    volumes:
+      - ./storage:/storage
+    shm_size: '16gb'
+    working_dir: /app
+    command: >
+      python src/weighted_mtp/pipelines/run_baseline.py
+        --config configs/production/baseline.yaml
+
+  # Critic 학습
+  critic:
+    build: .
+    image: weighted-mtp:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./storage:/storage
+    shm_size: '16gb'
+    command: >
+      python src/weighted_mtp/pipelines/run_critic.py
+        --config configs/production/critic_mlp.yaml
+
+  # Verifiable WMTP 학습
+  verifiable:
+    build: .
+    image: weighted-mtp:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./storage:/storage
+    shm_size: '16gb'
+    command: >
+      python src/weighted_mtp/pipelines/run_verifiable.py
+        --config configs/production/verifiable.yaml
+
+  # 분산 학습 (4-GPU)
+  distributed:
+    build: .
+    image: weighted-mtp:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./storage:/storage
+    shm_size: '16gb'
+    command: >
+      torchrun --nproc_per_node=4
+        src/weighted_mtp/pipelines/run_verifiable.py
+        --config configs/production/verifiable.yaml
+
+  # 평가
+  evaluate:
+    build: .
+    image: weighted-mtp:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./storage:/storage
+    command: >
+      python src/weighted_mtp/pipelines/run_evaluation.py
+        --checkpoint storage/checkpoints/verifiable/checkpoint_best.pt
+        --model-path storage/models/meta-llama-mtp
+        --dataset humaneval
+        --n-samples 1
+
+  # Interactive shell
+  shell:
+    build: .
+    image: weighted-mtp:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./storage:/storage
+    shm_size: '16gb'
+    stdin_open: true
+    tty: true
+    command: /bin/bash

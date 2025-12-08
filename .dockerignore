@@ -1,0 +1,48 @@
+# Storage (Volume mount로 제공)
+storage/
+
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+.eggs/
+*.egg-info/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test/Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Build
+dist/
+build/
+*.spec
+
+# Misc
+.DS_Store
+*.log
+.env
+.env.local
+
+# MLflow
+mlruns/
+
+# Jupyter
+.ipynb_checkpoints/

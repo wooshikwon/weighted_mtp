@@ -1,0 +1,445 @@
+"""MLflow 로깅 유틸리티
+
+연구 분석을 위한 추가 메트릭 계산 함수
+"""
+
+import logging
+
+import torch
+import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
+
+
+def compute_weight_statistics(
+    weights: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> dict[str, float]:
+    """Weight 분포 통계 계산
+
+    Args:
+        weights: Token weights [batch, seq, n_heads] or [batch, seq]
+        loss_mask: [batch, seq] 학습 대상 토큰 마스크 (labels != -100)
+
+    Returns:
+        통계 딕셔너리:
+            - weight_mean: 평균
+            - weight_std: 표준편차
+            - weight_min: 최소값
+            - weight_max: 최대값
+            - weight_entropy: 엔트로피
+    """
+    batch, seq = weights.shape[:2]
+    n_heads = weights.shape[2] if weights.dim() == 3 else 1
+
+    # bool 마스크 변환
+    mask = loss_mask.bool()
+
+    # weights가 [batch, seq, n_heads]인 경우 처리
+    if weights.dim() == 3:
+        mask = mask.view(batch, seq, 1).expand(-1, -1, n_heads)
+        weights_flat = weights[mask]
+    else:
+        weights_flat = weights.view(-1)[mask.view(-1)]
+
+    # 빈 텐서 처리
+    if weights_flat.numel() == 0:
+        return {
+            "weight_mean": 0.0,
+            "weight_std": 0.0,
+            "weight_min": 0.0,
+            "weight_max": 0.0,
+            "weight_entropy": 0.0,
+        }
+
+    # Entropy 계산 (log base e)
+    epsilon = 1e-10
+    entropy = -(weights_flat * torch.log(weights_flat + epsilon)).mean()
+
+    return {
+        "weight_mean": weights_flat.mean().item(),
+        "weight_std": weights_flat.std().item(),
+        "weight_min": weights_flat.min().item(),
+        "weight_max": weights_flat.max().item(),
+        "weight_entropy": entropy.item(),
+    }
+
+
+def compute_gradient_clip_stats(
+    model: torch.nn.Module,
+    max_grad_norm: float,
+) -> dict[str, float]:
+    """Gradient clipping 전후 통계 계산 (FSDP 호환)
+
+    Args:
+        model: 모델 (FSDP wrapped 또는 일반 모델)
+        max_grad_norm: Gradient clipping threshold
+
+    Returns:
+        통계 딕셔너리:
+            - grad_norm_pre_clip: Clipping 전 gradient norm
+            - grad_norm_post_clip: Clipping 후 gradient norm
+            - grad_clip_ratio: Clipping 비율 (post/pre)
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    is_fsdp = isinstance(model, FSDP)
+
+    if is_fsdp:
+        # FSDP clip_grad_norm_: 내부적으로 all-reduce 수행, 클리핑 전 norm 반환
+        grad_norm_pre = model.clip_grad_norm_(max_grad_norm).item()
+    else:
+        # Non-FSDP clip_grad_norm_: 내부적으로 norm 계산, 클리핑 전 norm 반환
+        params_list = [p for p in model.parameters() if p.grad is not None]
+        grad_norm_pre = torch.nn.utils.clip_grad_norm_(params_list, max_grad_norm).item()
+
+    # 클리핑 후 norm: 클리핑이 적용되면 max_grad_norm을 초과하지 않음
+    grad_norm_post = min(grad_norm_pre, max_grad_norm)
+
+    # Clipping 비율 계산
+    clip_ratio = grad_norm_post / grad_norm_pre if grad_norm_pre > 0 else 1.0
+
+    return {
+        "grad_norm_pre_clip": grad_norm_pre,
+        "grad_norm_post_clip": grad_norm_post,
+        "grad_clip_ratio": clip_ratio,
+    }
+
+
+def compute_gradient_norm_by_component(
+    model: torch.nn.Module,
+) -> dict[str, float]:
+    """컴포넌트별 gradient norm 계산 (trunk vs value_head 분리)
+
+    전체 모델의 gradient를 trunk과 value_head로 분리하여 각각의 norm 계산.
+    gradient 디버깅 및 학습 안정성 모니터링에 사용.
+
+    Args:
+        model: 모델 (FSDP wrapped 또는 일반 모델)
+
+    Returns:
+        통계 딕셔너리:
+            - trunk_grad_norm: Trunk 파라미터의 gradient L2 norm
+            - value_head_grad_norm: Value head 파라미터의 gradient L2 norm
+            - trunk_grad_count: Trunk gradient가 있는 파라미터 수
+            - value_head_grad_count: Value head gradient가 있는 파라미터 수
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    # FSDP인 경우 내부 모듈 접근
+    if isinstance(model, FSDP):
+        model_to_inspect = model.module
+    else:
+        model_to_inspect = model
+
+    trunk_grads = []
+    value_head_grads = []
+
+    for name, param in model_to_inspect.named_parameters():
+        if param.grad is not None:
+            grad_flat = param.grad.detach().flatten()
+            if "value_head" in name:
+                value_head_grads.append(grad_flat)
+            else:
+                trunk_grads.append(grad_flat)
+
+    # L2 norm 계산
+    if trunk_grads:
+        trunk_norm = torch.cat(trunk_grads).norm().item()
+    else:
+        trunk_norm = 0.0
+
+    if value_head_grads:
+        value_head_norm = torch.cat(value_head_grads).norm().item()
+    else:
+        value_head_norm = 0.0
+
+    return {
+        "trunk_grad_norm": trunk_norm,
+        "value_head_grad_norm": value_head_norm,
+        "trunk_grad_count": len(trunk_grads),
+        "value_head_grad_count": len(value_head_grads),
+    }
+
+
+def compute_gradient_clip_stats_by_component(
+    model: torch.nn.Module,
+    trunk_max_grad_norm: float,
+    value_head_max_grad_norm: float,
+) -> dict[str, float]:
+    """컴포넌트별 독립 gradient clipping (trunk vs value_head 분리)
+
+    trunk과 value_head에 각각 다른 max_grad_norm을 적용하여 clipping.
+    두 컴포넌트의 gradient scale이 크게 다를 때 유용.
+
+    FSDP 환경에서는 summon_full_params를 사용하여 gradient 접근.
+
+    Args:
+        model: 모델 (FSDP wrapped 또는 일반 모델)
+        trunk_max_grad_norm: Trunk 파라미터용 gradient clipping threshold
+        value_head_max_grad_norm: Value head 파라미터용 gradient clipping threshold
+
+    Returns:
+        통계 딕셔너리:
+            - trunk_grad_norm_pre: Trunk clipping 전 gradient norm
+            - trunk_grad_norm_post: Trunk clipping 후 gradient norm
+            - trunk_clip_ratio: Trunk clipping 비율
+            - value_head_grad_norm_pre: Value head clipping 전 gradient norm
+            - value_head_grad_norm_post: Value head clipping 후 gradient norm
+            - value_head_clip_ratio: Value head clipping 비율
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    is_fsdp = isinstance(model, FSDP)
+
+    if is_fsdp:
+        # FSDP: summon_full_params로 gradient 접근 후 clipping
+        # writeback=True로 clipping 결과를 다시 sharded gradient에 반영
+        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+        # 파라미터 이름 매핑 구축 (summon 전에)
+        trunk_param_names = set()
+        value_head_param_names = set()
+        for name, _ in model.module.named_parameters():
+            if "value_head" in name:
+                value_head_param_names.add(name)
+            else:
+                trunk_param_names.add(name)
+
+        with FSDP.summon_full_params(model, writeback=True, with_grads=True):
+            trunk_params = []
+            value_head_params = []
+
+            for name, param in model.module.named_parameters():
+                if param.grad is not None:
+                    if name in value_head_param_names:
+                        value_head_params.append(param)
+                    else:
+                        trunk_params.append(param)
+
+            # Trunk gradient clipping
+            if trunk_params and trunk_max_grad_norm > 0:
+                trunk_norm_pre = torch.nn.utils.clip_grad_norm_(
+                    trunk_params, trunk_max_grad_norm
+                ).item()
+                trunk_norm_post = min(trunk_norm_pre, trunk_max_grad_norm)
+                trunk_clip_ratio = trunk_norm_post / trunk_norm_pre if trunk_norm_pre > 0 else 1.0
+            else:
+                trunk_norm_pre = 0.0
+                trunk_norm_post = 0.0
+                trunk_clip_ratio = 1.0
+
+            # Value head gradient clipping
+            if value_head_params and value_head_max_grad_norm > 0:
+                value_head_norm_pre = torch.nn.utils.clip_grad_norm_(
+                    value_head_params, value_head_max_grad_norm
+                ).item()
+                value_head_norm_post = min(value_head_norm_pre, value_head_max_grad_norm)
+                value_head_clip_ratio = (
+                    value_head_norm_post / value_head_norm_pre if value_head_norm_pre > 0 else 1.0
+                )
+            else:
+                value_head_norm_pre = 0.0
+                value_head_norm_post = 0.0
+                value_head_clip_ratio = 1.0
+    else:
+        # Non-FSDP: 직접 파라미터 접근
+        trunk_params = []
+        value_head_params = []
+
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if "value_head" in name:
+                    value_head_params.append(param)
+                else:
+                    trunk_params.append(param)
+
+        # Trunk gradient clipping
+        if trunk_params and trunk_max_grad_norm > 0:
+            trunk_norm_pre = torch.nn.utils.clip_grad_norm_(
+                trunk_params, trunk_max_grad_norm
+            ).item()
+            trunk_norm_post = min(trunk_norm_pre, trunk_max_grad_norm)
+            trunk_clip_ratio = trunk_norm_post / trunk_norm_pre if trunk_norm_pre > 0 else 1.0
+        else:
+            trunk_norm_pre = 0.0
+            trunk_norm_post = 0.0
+            trunk_clip_ratio = 1.0
+
+        # Value head gradient clipping
+        if value_head_params and value_head_max_grad_norm > 0:
+            value_head_norm_pre = torch.nn.utils.clip_grad_norm_(
+                value_head_params, value_head_max_grad_norm
+            ).item()
+            value_head_norm_post = min(value_head_norm_pre, value_head_max_grad_norm)
+            value_head_clip_ratio = (
+                value_head_norm_post / value_head_norm_pre if value_head_norm_pre > 0 else 1.0
+            )
+        else:
+            value_head_norm_pre = 0.0
+            value_head_norm_post = 0.0
+            value_head_clip_ratio = 1.0
+
+    return {
+        "trunk_grad_norm_pre": trunk_norm_pre,
+        "trunk_grad_norm_post": trunk_norm_post,
+        "trunk_clip_ratio": trunk_clip_ratio,
+        "value_head_grad_norm_pre": value_head_norm_pre,
+        "value_head_grad_norm_post": value_head_norm_post,
+        "value_head_clip_ratio": value_head_clip_ratio,
+    }
+
+
+def compute_value_function_stats(
+    values: torch.Tensor,
+    returns: torch.Tensor,
+    loss_mask: torch.Tensor = None,
+) -> dict[str, float]:
+    """Value function 품질 통계 계산
+
+    Args:
+        values: Predicted values [batch, seq]
+        returns: Target returns [batch, seq]
+        loss_mask: [batch, seq] 학습 대상 토큰 마스크 (None이면 전체 사용)
+
+    Returns:
+        통계 딕셔너리:
+            - value_mse: Mean squared error
+            - value_mean: 평균 predicted value
+            - value_std: Predicted value 표준편차
+            - return_mean: 평균 return
+    """
+    if loss_mask is not None:
+        # 유효한 토큰만 선택
+        mask = loss_mask.reshape(-1).bool()
+        values_flat = values.reshape(-1)[mask]
+        returns_flat = returns.reshape(-1)[mask]
+    else:
+        values_flat = values.reshape(-1)
+        returns_flat = returns.reshape(-1)
+
+    # MSE
+    mse = F.mse_loss(values_flat, returns_flat)
+
+    return {
+        "value_mse": mse.item(),
+        "value_mean": values_flat.mean().item(),
+        "value_std": values_flat.std().item(),
+        "return_mean": returns_flat.mean().item(),
+    }
+
+
+def compute_critic_classification_counts(
+    value_logits: torch.Tensor,
+    is_correct: torch.Tensor,
+    attention_mask: torch.Tensor,
+    threshold: float = 0.5,
+) -> dict[str, float]:
+    """Critic 분류 성능을 위한 count 계산 (토큰 단위, micro-average용)
+
+    각 토큰의 value prediction이 해당 시퀀스의 정답 여부를 맞추는지 평가
+    V(s_t) → P(Success | s_t) 학습 목표에 부합
+
+    Args:
+        value_logits: Value predictions [batch, seq, 1]
+        is_correct: Binary labels [batch] - 시퀀스별 정답 여부
+        attention_mask: 유효 토큰 마스크 [batch, seq]
+        threshold: Binary classification threshold
+
+    Returns:
+        count 딕셔너리:
+            - tp: True Positives (토큰 단위)
+            - fp: False Positives (토큰 단위)
+            - fn: False Negatives (토큰 단위)
+            - correct_sum: correct 시퀀스 내 토큰 예측값 합
+            - correct_count: correct 시퀀스 내 유효 토큰 개수
+            - incorrect_sum: incorrect 시퀀스 내 토큰 예측값 합
+            - incorrect_count: incorrect 시퀀스 내 유효 토큰 개수
+    """
+    # value_logits: [batch, seq, 1] -> [batch, seq]
+    values = value_logits.squeeze(-1)
+    batch_size, seq_len = values.shape
+
+    # 시퀀스 정답을 토큰에 broadcast: [batch] -> [batch, seq]
+    token_labels = is_correct.view(-1, 1).expand(-1, seq_len)
+
+    # 유효 토큰 마스크
+    valid_mask = attention_mask.bool()
+
+    # 토큰 단위 예측
+    pred_positive = (values > threshold)
+    actual_positive = token_labels.bool()
+
+    # TP/FP/FN 계산 (유효 토큰만)
+    tp = ((pred_positive & actual_positive) & valid_mask).sum().item()
+    fp = ((pred_positive & ~actual_positive) & valid_mask).sum().item()
+    fn = ((~pred_positive & actual_positive) & valid_mask).sum().item()
+
+    # pred_gap 계산용: correct/incorrect 시퀀스 내 토큰 예측값
+    correct_seq_mask = is_correct.bool()  # [batch]
+    incorrect_seq_mask = ~correct_seq_mask
+
+    # correct 시퀀스 내 유효 토큰들의 예측값 합계
+    correct_token_mask = correct_seq_mask.view(-1, 1).expand(-1, seq_len) & valid_mask
+    correct_sum = values[correct_token_mask].sum().item() if correct_token_mask.any() else 0.0
+    correct_count = correct_token_mask.sum().item()
+
+    # incorrect 시퀀스 내 유효 토큰들의 예측값 합계
+    incorrect_token_mask = incorrect_seq_mask.view(-1, 1).expand(-1, seq_len) & valid_mask
+    incorrect_sum = values[incorrect_token_mask].sum().item() if incorrect_token_mask.any() else 0.0
+    incorrect_count = incorrect_token_mask.sum().item()
+
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "correct_sum": correct_sum,
+        "correct_count": correct_count,
+        "incorrect_sum": incorrect_sum,
+        "incorrect_count": incorrect_count,
+    }
+
+
+def compute_classification_metrics_from_counts(
+    tp: float,
+    fp: float,
+    fn: float,
+    correct_sum: float,
+    correct_count: float,
+    incorrect_sum: float,
+    incorrect_count: float,
+) -> dict[str, float]:
+    """누적된 count로부터 최종 분류 메트릭 계산 (micro-average)
+
+    Args:
+        tp, fp, fn: 누적된 True Positives, False Positives, False Negatives
+        correct_sum, correct_count: correct 시퀀스 예측값 합계와 개수
+        incorrect_sum, incorrect_count: incorrect 시퀀스 예측값 합계와 개수
+
+    Returns:
+        메트릭 딕셔너리:
+            - pred_gap: correct - incorrect 평균 예측값 차이
+            - mean_correct: correct 토큰 평균 예측값
+            - mean_incorrect: incorrect 토큰 평균 예측값
+            - precision: TP / (TP + FP)
+            - recall: TP / (TP + FN)
+            - f1: 2 * P * R / (P + R)
+    """
+    # 평균 예측값 계산
+    mean_correct = correct_sum / (correct_count + 1e-8)
+    mean_incorrect = incorrect_sum / (incorrect_count + 1e-8)
+    pred_gap = mean_correct - mean_incorrect if correct_count > 0 and incorrect_count > 0 else 0.0
+
+    # Precision/Recall/F1 계산
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+    return {
+        "pred_gap": pred_gap,
+        "mean_correct": mean_correct,
+        "mean_incorrect": mean_incorrect,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }

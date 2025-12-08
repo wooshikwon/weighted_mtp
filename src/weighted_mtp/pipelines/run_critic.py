@@ -1,0 +1,1214 @@
+"""Critic Pre-training Runner (독립 Value Model)
+
+독립 ValueModel (HuggingFace 기반)을 학습하는 파이프라인.
+Policy Model과 완전 분리된 별도 모델 사용.
+
+독립 실행:
+    python -m weighted_mtp.pipelines.run_critic --config configs/production/critic_mlp.yaml
+"""
+
+import argparse
+import os
+from pathlib import Path
+
+import mlflow
+import torch
+from omegaconf import OmegaConf, DictConfig
+from torch.utils.data import DataLoader
+
+from weighted_mtp.core.env import ensure_env_loaded
+from weighted_mtp.core.logging import setup_logging
+from weighted_mtp.data.dataloader import create_dataloader
+from weighted_mtp.models.value_model import ValueModel
+from weighted_mtp.models.tokenizer_utils import load_tokenizer_from_config
+from weighted_mtp.utils import (
+    GPUMonitor,
+    ThroughputTracker,
+    cleanup_old_checkpoints,
+    cleanup_s3_checkpoints,
+    compute_gradient_clip_stats,
+    compute_gradient_norm,
+    compute_lambda_value_loss,
+    compute_pairwise_accuracy,
+    compute_position_correlation,
+    compute_td_error_stats,
+    compute_token_variance,
+    create_output_end_mask,
+    create_scheduler,
+    get_model_dtype,
+    get_scheduled_lambda,
+    get_model_size,
+    get_system_info,
+    pairwise_ranking_loss,
+    save_value_model_checkpoint,
+    shutdown_s3_executor,
+    sync_mlruns_to_s3,
+)
+from weighted_mtp.runtime import (
+    init_distributed,
+    setup_environment,
+    is_main_process,
+    wrap_model_fsdp,
+    all_reduce_scalars,
+)
+
+
+def init_value_head_bias(value_model: ValueModel, bias_value: float) -> None:
+    """Value head의 마지막 레이어 bias를 특정 값으로 초기화
+
+    λ-return 학습 안정화를 위해 초기 예측값을 기대값(0.5)에 맞춤.
+
+    Args:
+        value_model: ValueModel 인스턴스
+        bias_value: 초기화할 bias 값 (보통 0.5)
+    """
+    value_head = value_model.value_head
+    head_type = getattr(value_head, "head_type", "unknown")
+
+    if head_type in ("linear", "sigmoid"):
+        # LinearValueHead, SigmoidValueHead: self.linear이 마지막 레이어
+        if hasattr(value_head, "linear") and value_head.linear.bias is not None:
+            value_head.linear.bias.data.fill_(bias_value)
+    elif head_type == "mlp":
+        # MLPValueHead: self.mlp[-1]이 마지막 레이어
+        if hasattr(value_head, "mlp"):
+            last_layer = value_head.mlp[-1]
+            if hasattr(last_layer, "bias") and last_layer.bias is not None:
+                last_layer.bias.data.fill_(bias_value)
+
+
+def load_value_model(
+    config: DictConfig,
+    device: torch.device,
+) -> ValueModel:
+    """독립 Value Model 로드
+
+    Args:
+        config: 설정 (models.value_model 포함)
+        device: 디바이스
+
+    Returns:
+        ValueModel 인스턴스
+    """
+    # Value head 설정 (training.value_head에서 읽기)
+    value_head_config = config.training.get("value_head", {})
+    value_head_type = value_head_config.get("type", "mlp")
+    dropout = value_head_config.get("dropout", 0.0)
+
+    # LoRA 설정 (learning_rate, weight_decay 제외하고 전달)
+    use_lora = getattr(config.training, "use_lora", False)
+    lora_config = None
+    if use_lora and hasattr(config.training, "lora"):
+        lora_full = OmegaConf.to_container(config.training.lora, resolve=True)
+        # LoRA 모델 설정만 추출 (학습 하이퍼파라미터 제외)
+        lora_config = {
+            k: v for k, v in lora_full.items()
+            if k not in ("learning_rate", "weight_decay")
+        }
+
+    # Value Model 로드
+    value_model = ValueModel.from_pretrained(
+        model_path=config.models.value_model.path,
+        value_head_type=value_head_type,
+        dropout=dropout,
+        device=str(device),
+        dtype=config.models.value_model.dtype,
+        use_lora=use_lora,
+        lora_config=lora_config,
+    )
+
+    return value_model
+
+
+def validate_critic(
+    value_model: ValueModel,
+    dataloader: DataLoader,
+    device: torch.device,
+    loss_type: str = "lambda_return",
+    lambda_gamma: float = 1.0,
+    lambda_lam: float = 0.95,
+    lambda_coef: float = 1.0,
+    value_loss_fn: str = "huber",
+    huber_delta: float = 0.5,
+    return_raw_counts: bool = False,
+) -> dict[str, float]:
+    """Critic Validation 수행
+
+    Args:
+        value_model: ValueModel 인스턴스
+        dataloader: Validation DataLoader (pairwise format)
+        device: 디바이스
+        loss_type: Loss 타입 ("lambda_return" | "pairwise_ranking")
+        lambda_gamma: λ-return gamma (discount factor, loss_type=lambda_return일 때 사용)
+        lambda_lam: λ-return lambda (GAE smoothing, loss_type=lambda_return일 때 사용)
+        lambda_coef: Loss 계수
+        value_loss_fn: Value loss 함수 ("huber" | "mse")
+        huber_delta: Huber loss delta (value_loss_fn=huber일 때 사용)
+        return_raw_counts: True이면 raw counts 반환 (분산학습용 aggregation)
+
+    Returns:
+        Validation metrics (pairwise_accuracy, mean_pos, mean_neg, margin, loss)
+    """
+    value_model.eval()
+
+    total_loss = 0.0
+    n_batches = 0
+    total_correct_pairs = 0.0
+    total_pairs = 0
+    total_mean_pos = 0.0
+    total_mean_neg = 0.0
+    total_pos_variance = 0.0
+    total_neg_variance = 0.0
+    # 좋은 Variance vs 나쁜 Variance 진단용
+    total_pos_spikiness = 0.0
+    total_neg_spikiness = 0.0
+    total_pos_mean_abs_td = 0.0
+    total_neg_mean_abs_td = 0.0
+    total_pos_pos_corr = 0.0
+    total_neg_pos_corr = 0.0
+
+    # 모델 dtype 감지
+    model_dtype = get_model_dtype(value_model)
+
+    with torch.no_grad():
+        for batch in dataloader:
+            # Pairwise batch 구조
+            pos_input_ids = batch["pos_input_ids"].to(device)
+            pos_attention_mask = batch["pos_attention_mask"].to(device)
+            pos_labels = batch["pos_labels"].to(device)
+            neg_input_ids = batch["neg_input_ids"].to(device)
+            neg_attention_mask = batch["neg_attention_mask"].to(device)
+            neg_labels = batch["neg_labels"].to(device)
+
+            # Batched Forward: pos+neg concat하여 1회 forward
+            batch_size = pos_input_ids.size(0)
+            combined_input_ids = torch.cat([pos_input_ids, neg_input_ids], dim=0)
+            combined_attention_mask = torch.cat([pos_attention_mask, neg_attention_mask], dim=0)
+
+            combined_value_logits = value_model(combined_input_ids, combined_attention_mask)
+
+            pos_value_logits = combined_value_logits[:batch_size]
+            neg_value_logits = combined_value_logits[batch_size:]
+
+            # 학습 대상 토큰 마스크 (labels != -100)
+            pos_loss_mask = (pos_labels != -100)
+            neg_loss_mask = (neg_labels != -100)
+
+            # output_end_mask 생성 (진짜 EOS 위치)
+            pos_output_end_mask = create_output_end_mask(pos_attention_mask)
+            neg_output_end_mask = create_output_end_mask(neg_attention_mask)
+
+            # Loss 계산 (loss_type에 따른 분기)
+            if loss_type == "pairwise_ranking":
+                value_loss = lambda_coef * pairwise_ranking_loss(
+                    pos_value_logits, neg_value_logits, pos_loss_mask, neg_loss_mask
+                )
+            elif loss_type == "lambda_return":
+                pos_rewards = torch.ones(pos_input_ids.size(0), device=device, dtype=model_dtype)
+                pos_lambda_loss = compute_lambda_value_loss(
+                    pos_value_logits, pos_rewards, pos_attention_mask, pos_loss_mask.float(),
+                    gamma=lambda_gamma, lam=lambda_lam,
+                    loss_type=value_loss_fn, huber_delta=huber_delta,
+                    output_end_mask=pos_output_end_mask,
+                )
+                neg_rewards = torch.zeros(neg_input_ids.size(0), device=device, dtype=model_dtype)
+                neg_lambda_loss = compute_lambda_value_loss(
+                    neg_value_logits, neg_rewards, neg_attention_mask, neg_loss_mask.float(),
+                    gamma=lambda_gamma, lam=lambda_lam,
+                    loss_type=value_loss_fn, huber_delta=huber_delta,
+                    output_end_mask=neg_output_end_mask,
+                )
+                value_loss = lambda_coef * (pos_lambda_loss + neg_lambda_loss) / 2
+            else:
+                raise ValueError(f"Unknown loss_type: {loss_type}")
+
+            # Pairwise accuracy 계산 (메트릭용)
+            pairwise_metrics = compute_pairwise_accuracy(
+                v_pos=pos_value_logits,
+                v_neg=neg_value_logits,
+                loss_mask_pos=pos_loss_mask,
+                loss_mask_neg=neg_loss_mask,
+            )
+
+            # Token-level variance 계산
+            pos_var = compute_token_variance(pos_value_logits, pos_loss_mask)
+            neg_var = compute_token_variance(neg_value_logits, neg_loss_mask)
+
+            # TD Error 스파이크 분석 (좋은 Variance vs 나쁜 Variance 구분)
+            pos_td_stats = compute_td_error_stats(pos_value_logits, pos_loss_mask)
+            neg_td_stats = compute_td_error_stats(neg_value_logits, neg_loss_mask)
+            pos_pos_corr = compute_position_correlation(pos_value_logits, pos_loss_mask)
+            neg_pos_corr = compute_position_correlation(neg_value_logits, neg_loss_mask)
+
+            total_loss += value_loss.item()
+            total_correct_pairs += pairwise_metrics["correct_pairs"]
+            total_pairs += pairwise_metrics["total_pairs"]
+            total_mean_pos += pairwise_metrics["mean_pos"]
+            total_mean_neg += pairwise_metrics["mean_neg"]
+            total_pos_variance += pos_var
+            total_neg_variance += neg_var
+            total_pos_spikiness += pos_td_stats["spikiness"]
+            total_neg_spikiness += neg_td_stats["spikiness"]
+            total_pos_mean_abs_td += pos_td_stats["mean_abs_td"]
+            total_neg_mean_abs_td += neg_td_stats["mean_abs_td"]
+            total_pos_pos_corr += pos_pos_corr
+            total_neg_pos_corr += neg_pos_corr
+            n_batches += 1
+
+    # 평균 계산
+    avg_loss = total_loss / n_batches if n_batches > 0 else 0.0
+    avg_pairwise_accuracy = total_correct_pairs / total_pairs if total_pairs > 0 else 0.0
+    avg_mean_pos = total_mean_pos / n_batches if n_batches > 0 else 0.0
+    avg_mean_neg = total_mean_neg / n_batches if n_batches > 0 else 0.0
+    avg_margin = avg_mean_pos - avg_mean_neg
+    avg_pos_variance = total_pos_variance / n_batches if n_batches > 0 else 0.0
+    avg_neg_variance = total_neg_variance / n_batches if n_batches > 0 else 0.0
+    avg_pos_spikiness = total_pos_spikiness / n_batches if n_batches > 0 else 0.0
+    avg_neg_spikiness = total_neg_spikiness / n_batches if n_batches > 0 else 0.0
+    avg_pos_mean_abs_td = total_pos_mean_abs_td / n_batches if n_batches > 0 else 0.0
+    avg_neg_mean_abs_td = total_neg_mean_abs_td / n_batches if n_batches > 0 else 0.0
+    avg_pos_pos_corr = total_pos_pos_corr / n_batches if n_batches > 0 else 0.0
+    avg_neg_pos_corr = total_neg_pos_corr / n_batches if n_batches > 0 else 0.0
+
+    metrics = {
+        "val_loss": avg_loss,
+        "val_pairwise_accuracy": avg_pairwise_accuracy,
+        "val_mean_pos": avg_mean_pos,
+        "val_mean_neg": avg_mean_neg,
+        "val_margin": avg_margin,
+        "val_pos_token_variance": avg_pos_variance,
+        "val_neg_token_variance": avg_neg_variance,
+        # TD Error 스파이크 진단 (pos: 낮아야 좋음, neg: 높아야 좋음)
+        "val_pos_spikiness": avg_pos_spikiness,
+        "val_neg_spikiness": avg_neg_spikiness,
+        "val_pos_mean_abs_td": avg_pos_mean_abs_td,
+        "val_neg_mean_abs_td": avg_neg_mean_abs_td,
+        # Position correlation (|값| < 0.3이면 건강)
+        "val_pos_position_corr": avg_pos_pos_corr,
+        "val_neg_position_corr": avg_neg_pos_corr,
+    }
+
+    # 분산학습용: raw counts 포함 반환
+    if return_raw_counts:
+        metrics["_raw_counts"] = {
+            "loss_sum": total_loss,
+            "n_batches": n_batches,
+            "correct_pairs": total_correct_pairs,
+            "total_pairs": total_pairs,
+            "mean_pos_sum": total_mean_pos,
+            "mean_neg_sum": total_mean_neg,
+            "pos_variance_sum": total_pos_variance,
+            "neg_variance_sum": total_neg_variance,
+            "pos_spikiness_sum": total_pos_spikiness,
+            "neg_spikiness_sum": total_neg_spikiness,
+            "pos_mean_abs_td_sum": total_pos_mean_abs_td,
+            "neg_mean_abs_td_sum": total_neg_mean_abs_td,
+            "pos_pos_corr_sum": total_pos_pos_corr,
+            "neg_pos_corr_sum": total_neg_pos_corr,
+        }
+
+    return metrics
+
+
+def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
+    """Critic pre-training 실행 (독립 Value Model)
+
+    Args:
+        config: 완전한 config 객체 (OmegaConf DictConfig)
+
+    Returns:
+        (final_metrics, best_checkpoint_path)
+    """
+    # 0. 환경변수 로드 (MLflow credentials 등)
+    ensure_env_loaded()
+
+    # Flash SDP 명시적 활성화 (SDPA memory efficiency 보장)
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(False)  # 비효율적 fallback 비활성화
+
+    # 2. Distributed 초기화 (torchrun 환경인 경우)
+    if "RANK" in os.environ:
+        rank, world_size = init_distributed()
+    else:
+        rank, world_size = 0, 1
+
+    # 3. 로깅 설정 (rank 정보 포함)
+    logger = setup_logging("CRITIC", level=config.logging.level, rank=rank)
+
+    if "RANK" in os.environ:
+        logger.info(f"Distributed training: rank={rank}, world_size={world_size}")
+    else:
+        logger.info("Local training (single device)")
+
+    logger.info("=== Critic Pre-training (독립 Value Model) ===")
+    logger.info(f"Experiment: {config.experiment.name}")
+    logger.info(f"Description: {config.experiment.description}")
+
+    # 4. Environment setup (seed + device)
+    actual_seed, device = setup_environment(config.runtime.seed)
+    logger.info(f"Device: {device}, Seed: {actual_seed}")
+
+    # SDP backend 상태 로그
+    if torch.cuda.is_available():
+        flash_enabled = torch.backends.cuda.flash_sdp_enabled()
+        mem_eff_enabled = torch.backends.cuda.mem_efficient_sdp_enabled()
+        math_enabled = torch.backends.cuda.math_sdp_enabled()
+        logger.info(f"SDP backends: flash={flash_enabled}, mem_efficient={mem_eff_enabled}, math={math_enabled}")
+
+    # 5. MLflow 초기화 (Rank 0만, experiment 이름이 있는 경우만)
+    use_mlflow = bool(config.mlflow.experiment)
+    use_s3_upload = config.checkpoint.get("s3_upload", True) and use_mlflow
+    mlflow_run_id = None
+    if is_main_process() and use_mlflow:
+        mlflow.set_tracking_uri(config.mlflow.tracking_uri)
+        mlflow.set_experiment(config.mlflow.experiment)
+        mlflow.start_run(
+            run_name=config.experiment.name,
+            tags={tag: "true" for tag in config.experiment.tags},
+        )
+        mlflow.log_params(OmegaConf.to_container(config, resolve=True))
+        mlflow_run_id = mlflow.active_run().info.run_id
+        logger.info(f"MLflow Run ID: {mlflow_run_id}")
+
+    # 6. Value Model 로드
+    value_model = load_value_model(config, device)
+    logger.info(f"Value Model loaded: {config.models.value_model.path}")
+
+    # λ-return bias 초기화 (FSDP wrapping 전에 수행)
+    value_loss_config = config.training.get("value_loss", {})
+    bias_init = value_loss_config.get("bias_init", None)
+    if bias_init is not None:
+        init_value_head_bias(value_model, bias_init)
+        logger.info(f"Value head bias initialized to {bias_init}")
+
+    # LoRA 설정 확인
+    use_lora = getattr(config.training, "use_lora", False)
+
+    # Backbone freeze 설정: use_lora=True면 LoRA가 freeze 제어 (원본 frozen, LoRA만 학습)
+    if use_lora:
+        logger.info("LoRA mode: backbone frozen, training LoRA + value head")
+    else:
+        backbone_frozen = getattr(config.training, "backbone_frozen", True)
+        if backbone_frozen:
+            value_model.freeze_backbone()
+            logger.info("Backbone frozen: training value head only")
+        else:
+            logger.info("Backbone unfrozen: training entire model")
+
+    # Model size 로깅 (FSDP wrapping 전에 계산)
+    model_size = get_model_size(value_model)
+
+    # Trainable params breakdown (FSDP 전에 계산, 로깅용)
+    trainable_breakdown = {
+        "value_head": sum(p.numel() for p in value_model.value_head.parameters() if p.requires_grad),
+        "backbone": sum(p.numel() for p in value_model.backbone.parameters() if p.requires_grad),
+    }
+
+    # 파라미터 개수 저장 (FSDP wrapping 전에 저장, 로깅용)
+    # FSDP 후에는 sharded 상태라 numel()이 다르게 나올 수 있음
+    if use_lora:
+        lora_param_count = sum(p.numel() for p in value_model.backbone.parameters() if p.requires_grad)
+        value_head_param_count = sum(p.numel() for p in value_model.value_head.parameters())
+    else:
+        backbone_frozen = getattr(config.training, "backbone_frozen", True)
+        if backbone_frozen:
+            lora_param_count = 0
+            value_head_param_count = sum(p.numel() for p in value_model.value_head.parameters() if p.requires_grad)
+        else:
+            lora_param_count = 0
+            value_head_param_count = sum(p.numel() for p in value_model.parameters())
+
+    # 메모리 디버깅: FSDP wrapping 전
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        mem_before_fsdp = torch.cuda.memory_allocated() / 1024**3
+        logger.info(f"[MEM DEBUG] Before FSDP: {mem_before_fsdp:.2f} GB allocated")
+
+    # 모델 디바이스 위치 확인 (CPU에서 시작해야 FSDP 샤딩이 효율적)
+    model_device = next(value_model.parameters()).device
+    logger.info(f"[MEM DEBUG] Model device before FSDP: {model_device}")
+
+    # FSDP wrapping
+    value_model = wrap_model_fsdp(
+        value_model,
+        device,
+        sharding_strategy=config.distributed.fsdp.sharding_strategy,
+        mixed_precision=config.distributed.fsdp.mixed_precision,
+        cpu_offload=config.distributed.fsdp.cpu_offload,
+        activation_checkpointing=config.distributed.fsdp.get("activation_checkpointing", False),
+    )
+
+    # 메모리 디버깅: FSDP wrapping 후
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        mem_after_fsdp = torch.cuda.memory_allocated() / 1024**3
+        logger.info(f"[MEM DEBUG] After FSDP: {mem_after_fsdp:.2f} GB allocated")
+        logger.info(f"[MEM DEBUG] FSDP sharding delta: {mem_after_fsdp - mem_before_fsdp:.2f} GB")
+
+    # FSDP 샤딩 검증: 모델이 GPU로 이동했는지 확인
+    model_device_after = next(value_model.parameters()).device
+    logger.info(f"[MEM DEBUG] Model device after FSDP: {model_device_after}")
+
+    # FSDP wrapping 후에 named_parameters()로 param 리스트 구성 (optimizer용)
+    # use_orig_params=True이므로 원본 파라미터 이름 구조 유지됨
+    if use_lora:
+        # backbone의 requires_grad=True 파라미터 (LoRA adapters)
+        lora_params = [p for n, p in value_model.named_parameters()
+                       if 'value_head' not in n and p.requires_grad]
+        # value_head 파라미터 (모두 학습)
+        value_head_params = [p for n, p in value_model.named_parameters()
+                             if 'value_head' in n]
+    else:
+        backbone_frozen = getattr(config.training, "backbone_frozen", True)
+        if backbone_frozen:
+            lora_params = []
+            value_head_params = [p for n, p in value_model.named_parameters()
+                                 if 'value_head' in n and p.requires_grad]
+        else:
+            lora_params = []
+            value_head_params = list(value_model.parameters())
+
+    tokenizer = load_tokenizer_from_config(config)
+
+    if is_main_process():
+        if use_mlflow:
+            # backbone_frozen은 use_lora=False일 때만 적용
+            backbone_frozen_effective = not use_lora and getattr(config.training, "backbone_frozen", True)
+            mlflow.log_params(
+                {
+                    "model_total_params": model_size["total_params"],
+                    "model_trainable_params": model_size["trainable_params"],
+                    "model_non_trainable_params": model_size["non_trainable_params"],
+                    "model_trainable_value_head": trainable_breakdown["value_head"],
+                    "model_trainable_backbone": trainable_breakdown["backbone"],
+                    "use_lora": use_lora,
+                    "backbone_frozen": backbone_frozen_effective,
+                }
+            )
+        logger.info(
+            f"Model size: {model_size['trainable_params']:,} trainable / "
+            f"{model_size['total_params']:,} total params"
+        )
+        logger.info(
+            f"Trainable breakdown - value_head: {trainable_breakdown['value_head']:,}, "
+            f"backbone: {trainable_breakdown['backbone']:,}"
+        )
+
+        # System info 로깅
+        system_info = get_system_info()
+        if use_mlflow:
+            mlflow.log_params(
+                {
+                    "system_cpu_count": system_info["cpu_count"],
+                    "system_ram_total_gb": round(system_info["ram_total_gb"], 2),
+                }
+            )
+
+    # GPU monitor 초기화
+    gpu_monitor = GPUMonitor(device)
+
+    # 5. Dataset & DataLoader 생성
+    logger.info(f"Dataset: {config.dataset.name}")
+    logger.info(f"Train: {config.dataset.train}")
+    logger.info(f"Validation: {config.dataset.validation}")
+
+    # sampling_config를 dict로 변환 (pairwise 모드 강제)
+    sampling_config = OmegaConf.to_container(config.data_sampling, resolve=True)
+    sampling_config["use_pairwise"] = True  # value head 학습은 항상 pairwise
+    logger.info("Pairwise 모드 (value head 학습)")
+
+    train_loader = create_dataloader(
+        dataset_path=config.dataset.train,
+        tokenizer=tokenizer,
+        batch_size=config.training.batch_size,
+        max_length=config.dataset.max_length,
+        sampling_config=sampling_config,
+        seed=config.data_sampling.seed,
+        shuffle=True,
+    )
+
+    # Validation용 sampling_config (val_n_samples 적용)
+    val_sampling_config = sampling_config.copy()
+    val_sampling_config["n_samples"] = config.data_sampling.val_n_samples
+
+    val_loader = create_dataloader(
+        dataset_path=config.dataset.validation,
+        tokenizer=tokenizer,
+        batch_size=config.training.batch_size,
+        max_length=config.dataset.max_length,
+        sampling_config=val_sampling_config,
+        seed=config.data_sampling.seed,
+        shuffle=False,
+    )
+
+    logger.info(f"Train batches: {len(train_loader)}")
+    logger.info(f"Validation batches: {len(val_loader)}")
+
+    # Dataset statistics 로깅
+    if is_main_process() and use_mlflow:
+        mlflow.log_params(
+            {
+                "dataset_train_samples": len(train_loader.dataset),
+                "dataset_val_samples": len(val_loader.dataset),
+                "dataset_train_batches": len(train_loader),
+                "dataset_val_batches": len(val_loader),
+            }
+        )
+
+    # 6. Optimizer (LoRA/Value Head 하이퍼파라미터 분리)
+    # lora_params, value_head_params는 FSDP wrapping 전에 저장됨 (line 361-373)
+    lora_config_full = config.training.get("lora", {})
+    value_head_config = config.training.get("value_head", {})
+
+    lora_lr = lora_config_full.get("learning_rate", 1e-4)
+    lora_weight_decay = lora_config_full.get("weight_decay", 0.01)
+    value_head_lr = value_head_config.get("learning_rate", 5e-4)
+    value_head_weight_decay = value_head_config.get("weight_decay", 0.01)
+
+    # Parameter groups 구성 (FSDP wrapping 후 named_parameters()로 가져온 파라미터 사용)
+    if use_lora:
+        param_groups = [
+            {
+                "params": lora_params,
+                "lr": lora_lr,
+                "weight_decay": lora_weight_decay,
+                "name": "lora",
+            },
+            {
+                "params": value_head_params,
+                "lr": value_head_lr,
+                "weight_decay": value_head_weight_decay,
+                "name": "value_head",
+            },
+        ]
+
+        # 로깅은 FSDP 전에 저장한 param count 사용 (FSDP 후에는 sharded 상태)
+        logger.info(f"LoRA params: {lora_param_count:,}, LR={lora_lr}, WD={lora_weight_decay}")
+        logger.info(f"Value Head params: {value_head_param_count:,}, LR={value_head_lr}, WD={value_head_weight_decay}")
+    else:
+        param_groups = [
+            {
+                "params": value_head_params,
+                "lr": value_head_lr,
+                "weight_decay": value_head_weight_decay,
+                "name": "value_head",
+            }
+        ]
+
+        logger.info(f"Value Head params: {value_head_param_count:,}, LR={value_head_lr}, WD={value_head_weight_decay}")
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        lr=lora_lr,  # defaults["lr"]용 (scheduler 로깅에 사용)
+        betas=(0.9, 0.95),
+    )
+
+    # 7. Training loop
+    best_val_margin = float("-inf")  # margin 기준 (높을수록 좋음)
+    global_step = 0
+
+    checkpoint_dir = Path(config.checkpoint.save_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    n_epochs = config.training.n_epochs
+    save_checkpoint_every = config.checkpoint.save_checkpoint_every
+
+    # Fractional epoch 처리
+    total_batches = len(train_loader)
+    batches_to_run = int(total_batches * n_epochs)
+
+    # Gradient accumulation 초기화
+    accumulation_counter = 0
+    gradient_accumulation_steps = config.training.gradient_accumulation_steps
+
+    # Optimization steps 계산
+    total_optimization_steps = (batches_to_run + gradient_accumulation_steps - 1) // gradient_accumulation_steps
+
+    logger.info(f"Total epochs: {n_epochs}")
+    logger.info(f"Total batches to run: {batches_to_run}")
+    logger.info(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+    logger.info(f"Total optimization steps: {total_optimization_steps}")
+    logger.info(f"Validation & Checkpoint every: {save_checkpoint_every} epochs")
+
+    # Learning rate scheduler 생성
+    lr_scheduler_config = config.training.get("lr_scheduler", {})
+    scheduler = create_scheduler(
+        optimizer=optimizer,
+        total_steps=total_optimization_steps,
+        scheduler_type=lr_scheduler_config.get("type", "constant"),
+        warmup_ratio=lr_scheduler_config.get("warmup_ratio", 0.05),
+        min_lr_ratio=lr_scheduler_config.get("min_lr_ratio", 0.0),
+    )
+
+    current_epoch = 0.0
+    batch_count = 0
+    next_checkpoint_epoch = save_checkpoint_every
+    train_loss_avg = 0.0
+
+    # Throughput tracker 초기화
+    throughput_tracker = ThroughputTracker()
+
+    # 모델 dtype 감지
+    model_dtype = get_model_dtype(value_model)
+
+    # Value loss 설정
+    value_loss_config = config.training.get("value_loss", {})
+    loss_type = value_loss_config.get("type", "lambda_return")
+    lambda_gamma = value_loss_config.get("gamma", 1.0)
+    lambda_coef = value_loss_config.get("coef", 1.0)
+    value_loss_fn = value_loss_config.get("loss_fn", "huber")  # "huber" | "mse"
+    huber_delta = value_loss_config.get("huber_delta", 0.5)
+
+    # Lambda scheduling 설정 (loss_type=lambda_return일 때만 사용)
+    lambda_schedule_config = value_loss_config.get("lambda_schedule", {})
+    lam_schedule_type = lambda_schedule_config.get("type", "linear")
+
+    # constant 타입: value 키에서 단일 λ 값 사용
+    if lam_schedule_type == "constant":
+        lam_start = lambda_schedule_config.get("value", 0.995)
+        lam_end = lam_start
+        lam_warmup_steps = 0
+        lam_decay_steps = 0
+    else:
+        lam_start = lambda_schedule_config.get("start", 1.0)
+        lam_end = lambda_schedule_config.get("end", 0.95)
+        lam_warmup_steps = lambda_schedule_config.get("warmup_steps", 250)
+        lam_decay_steps = lambda_schedule_config.get("decay_steps", 500)
+
+    # Validation용 λ (Pure MC로 일관된 평가 기준 유지)
+    val_lambda_lam = 1.0
+
+    logger.info(f"Value loss type: {loss_type}")
+    if loss_type == "lambda_return":
+        logger.info(f"λ-return: gamma={lambda_gamma}, coef={lambda_coef}, loss_fn={value_loss_fn}, huber_delta={huber_delta}")
+        if lam_schedule_type == "constant":
+            logger.info(f"λ-schedule: type=constant, value={lam_start}")
+        else:
+            logger.info(f"λ-schedule: type={lam_schedule_type}, start={lam_start}, end={lam_end}, warmup={lam_warmup_steps}, decay={lam_decay_steps}")
+        logger.info(f"λ-validation: lam={val_lambda_lam} (Pure MC)")
+    elif loss_type == "pairwise_ranking":
+        logger.info(f"Pairwise ranking: coef={lambda_coef}")
+
+    # Gradient clipping
+    max_grad_norm = config.training.get("max_grad_norm", 1.0)
+    logger.info(f"Gradient clipping: max_grad_norm={max_grad_norm}")
+
+    # Optimizer 초기화
+    optimizer.zero_grad()
+
+    # 7. Training loop
+    while batch_count < batches_to_run:
+        # Train until checkpoint boundary
+        target_epoch = min(next_checkpoint_epoch, n_epochs)
+        target_batches = int(target_epoch * total_batches)
+        batches_this_period = target_batches - batch_count
+
+        logger.info(f"--- Training to epoch {target_epoch:.2f} ---")
+
+        # Throughput tracking 시작
+        throughput_tracker.start_epoch()
+
+        # DataLoader에서 필요한 만큼만 사용
+        epoch_train_loader = iter(train_loader)
+        period_metrics_sum = {"train_loss": 0.0}
+        period_batches = 0
+
+        # Pairwise 메트릭용 변수
+        train_correct_pairs = 0.0
+        train_total_pairs = 0
+        train_mean_pos_sum = 0.0
+        train_mean_neg_sum = 0.0
+
+        for _ in range(batches_this_period):
+            try:
+                batch = next(epoch_train_loader)
+            except StopIteration:
+                epoch_train_loader = iter(train_loader)
+                batch = next(epoch_train_loader)
+
+            # 1 batch 훈련
+            value_model.train()
+
+            # Pairwise batch 구조
+            pos_input_ids = batch["pos_input_ids"].to(device)
+            pos_attention_mask = batch["pos_attention_mask"].to(device)
+            pos_labels = batch["pos_labels"].to(device)
+            neg_input_ids = batch["neg_input_ids"].to(device)
+            neg_attention_mask = batch["neg_attention_mask"].to(device)
+            neg_labels = batch["neg_labels"].to(device)
+
+            # Batched Forward: pos+neg concat
+            batch_size = pos_input_ids.size(0)
+            combined_input_ids = torch.cat([pos_input_ids, neg_input_ids], dim=0)
+            combined_attention_mask = torch.cat([pos_attention_mask, neg_attention_mask], dim=0)
+
+            # 메모리 디버깅: 첫 forward 전 (첫 배치에서만)
+            if global_step == 0 and accumulation_counter == 0 and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                mem_before_forward = torch.cuda.memory_allocated() / 1024**3
+                logger.info(f"[MEM DEBUG] Before 1st forward: {mem_before_forward:.2f} GB, batch_shape={combined_input_ids.shape}")
+
+            combined_value_logits = value_model(combined_input_ids, combined_attention_mask)
+
+            # 메모리 디버깅: 첫 forward 후 (첫 배치에서만)
+            if global_step == 0 and accumulation_counter == 0 and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                mem_after_forward = torch.cuda.memory_allocated() / 1024**3
+                logger.info(f"[MEM DEBUG] After 1st forward: {mem_after_forward:.2f} GB")
+
+            pos_value_logits = combined_value_logits[:batch_size]
+            neg_value_logits = combined_value_logits[batch_size:]
+
+            # 학습 대상 토큰 마스크
+            pos_loss_mask = (pos_labels != -100)
+            neg_loss_mask = (neg_labels != -100)
+
+            # output_end_mask 생성 (진짜 EOS 위치)
+            pos_output_end_mask = create_output_end_mask(pos_attention_mask)
+            neg_output_end_mask = create_output_end_mask(neg_attention_mask)
+
+            # Loss 계산 (loss_type에 따른 분기)
+            if loss_type == "pairwise_ranking":
+                value_loss = lambda_coef * pairwise_ranking_loss(
+                    pos_value_logits, neg_value_logits, pos_loss_mask, neg_loss_mask
+                )
+                current_lam = None
+            elif loss_type == "lambda_return":
+                current_lam = get_scheduled_lambda(
+                    global_step, lam_warmup_steps, lam_decay_steps, lam_start, lam_end,
+                    schedule_type=lam_schedule_type,
+                )
+                pos_rewards = torch.ones(pos_input_ids.size(0), device=device, dtype=model_dtype)
+                pos_lambda_loss = compute_lambda_value_loss(
+                    pos_value_logits, pos_rewards, pos_attention_mask, pos_loss_mask.float(),
+                    gamma=lambda_gamma, lam=current_lam,
+                    loss_type=value_loss_fn, huber_delta=huber_delta,
+                    output_end_mask=pos_output_end_mask,
+                )
+                neg_rewards = torch.zeros(neg_input_ids.size(0), device=device, dtype=model_dtype)
+                neg_lambda_loss = compute_lambda_value_loss(
+                    neg_value_logits, neg_rewards, neg_attention_mask, neg_loss_mask.float(),
+                    gamma=lambda_gamma, lam=current_lam,
+                    loss_type=value_loss_fn, huber_delta=huber_delta,
+                    output_end_mask=neg_output_end_mask,
+                )
+                value_loss = lambda_coef * (pos_lambda_loss + neg_lambda_loss) / 2
+            else:
+                raise ValueError(f"Unknown loss_type: {loss_type}")
+
+            # Pairwise 메트릭 누적 (accuracy 측정용)
+            pairwise_metrics = compute_pairwise_accuracy(
+                v_pos=pos_value_logits,
+                v_neg=neg_value_logits,
+                loss_mask_pos=pos_loss_mask,
+                loss_mask_neg=neg_loss_mask,
+            )
+            train_correct_pairs += pairwise_metrics["correct_pairs"]
+            train_total_pairs += pairwise_metrics["total_pairs"]
+            train_mean_pos_sum += pairwise_metrics["mean_pos"]
+            train_mean_neg_sum += pairwise_metrics["mean_neg"]
+
+            # Token-level variance 계산 (problem-level vs token-level 학습 진단)
+            pos_token_var = compute_token_variance(pos_value_logits, pos_loss_mask)
+            neg_token_var = compute_token_variance(neg_value_logits, neg_loss_mask)
+
+            # TD Error 스파이크 분석 (좋은 Variance vs 나쁜 Variance 구분)
+            pos_td_stats = compute_td_error_stats(pos_value_logits, pos_loss_mask)
+            neg_td_stats = compute_td_error_stats(neg_value_logits, neg_loss_mask)
+            pos_pos_corr = compute_position_correlation(pos_value_logits, pos_loss_mask)
+            neg_pos_corr = compute_position_correlation(neg_value_logits, neg_loss_mask)
+
+            # Throughput용 변수
+            batch_size_actual = pos_input_ids.size(0) * 2
+            n_tokens = pos_attention_mask.sum().item() + neg_attention_mask.sum().item()
+
+            # Loss scaling
+            scaled_loss = value_loss / gradient_accumulation_steps
+            scaled_loss.backward()
+
+            accumulation_counter += 1
+            batch_count += 1
+            period_batches += 1
+
+            throughput_tracker.update(batch_size_actual, int(n_tokens))
+            period_metrics_sum["train_loss"] += value_loss.item()
+
+            # Optimizer step
+            if accumulation_counter >= gradient_accumulation_steps:
+                # Gradient clipping
+                if max_grad_norm > 0:
+                    grad_clip_stats = compute_gradient_clip_stats(value_model, max_grad_norm)
+                else:
+                    grad_norm_dict = compute_gradient_norm(value_model)
+                    grad_clip_stats = {
+                        "grad_norm_pre_clip": grad_norm_dict["grad_norm"],
+                        "grad_norm_post_clip": grad_norm_dict["grad_norm"],
+                        "grad_clip_ratio": 1.0,
+                    }
+
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                optimizer.zero_grad()
+
+                global_step += 1
+                accumulation_counter = 0
+
+                # Step-level logging
+                if global_step % config.training.log_interval == 0:
+                    gpu_metrics = gpu_monitor.get_metrics()
+
+                    # 분리된 LR 추출
+                    lora_current_lr = optimizer.param_groups[0]["lr"]
+                    value_head_current_lr = optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else lora_current_lr
+
+                    batch_pairwise_acc = pairwise_metrics["pairwise_accuracy"]
+                    batch_mean_pos = pairwise_metrics["mean_pos"]
+                    batch_mean_neg = pairwise_metrics["mean_neg"]
+
+                    reduced = all_reduce_scalars({
+                        "loss": value_loss.item(),
+                        "pairwise_accuracy": batch_pairwise_acc,
+                        "mean_pos": batch_mean_pos,
+                        "mean_neg": batch_mean_neg,
+                        "pos_token_var": pos_token_var,
+                        "neg_token_var": neg_token_var,
+                        "pos_spikiness": pos_td_stats["spikiness"],
+                        "neg_spikiness": neg_td_stats["spikiness"],
+                        "pos_mean_abs_td": pos_td_stats["mean_abs_td"],
+                        "neg_mean_abs_td": neg_td_stats["mean_abs_td"],
+                        "pos_pos_corr": pos_pos_corr,
+                        "neg_pos_corr": neg_pos_corr,
+                    })
+
+                    if is_main_process():
+                        if use_mlflow:
+                            metrics_to_log = {
+                                "train/loss": reduced["loss"],
+                                "train/grad_norm": grad_clip_stats["grad_norm_post_clip"],
+                                "train/lora_lr": lora_current_lr,
+                                "train/value_head_lr": value_head_current_lr,
+                                "train/pairwise_accuracy": reduced["pairwise_accuracy"],
+                                "value/mean_pos": reduced["mean_pos"],
+                                "value/mean_neg": reduced["mean_neg"],
+                                "value/margin": reduced["mean_pos"] - reduced["mean_neg"],
+                                "value/pos_token_variance": reduced["pos_token_var"],
+                                "value/neg_token_variance": reduced["neg_token_var"],
+                                # TD Error 스파이크 진단 (pos: 낮아야 좋음, neg: 높아야 좋음)
+                                "value/pos_spikiness": reduced["pos_spikiness"],
+                                "value/neg_spikiness": reduced["neg_spikiness"],
+                                "value/pos_mean_abs_td": reduced["pos_mean_abs_td"],
+                                "value/neg_mean_abs_td": reduced["neg_mean_abs_td"],
+                                # Position correlation (|값| < 0.3이면 건강)
+                                "value/pos_position_corr": reduced["pos_pos_corr"],
+                                "value/neg_position_corr": reduced["neg_pos_corr"],
+                                "system/gpu_memory_allocated_gb": gpu_metrics["gpu_memory_allocated_gb"],
+                            }
+                            if current_lam is not None:
+                                metrics_to_log["train/lambda"] = current_lam
+                            mlflow.log_metrics(metrics_to_log, step=global_step)
+
+                    # 로그 메시지 (loss_type에 따라 다른 형식)
+                    if loss_type == "lambda_return":
+                        log_msg = (
+                            f"Step {global_step}/{total_optimization_steps}, "
+                            f"Loss: {reduced['loss']:.4f} [λ={current_lam:.4f}], "
+                            f"Acc: {reduced['pairwise_accuracy']:.3f}, "
+                            f"Margin: {reduced['mean_pos'] - reduced['mean_neg']:.4f}, "
+                        )
+                    else:
+                        log_msg = (
+                            f"Step {global_step}/{total_optimization_steps}, "
+                            f"Loss: {reduced['loss']:.4f}, "
+                            f"Acc: {reduced['pairwise_accuracy']:.3f}, "
+                            f"Margin: {reduced['mean_pos'] - reduced['mean_neg']:.4f}, "
+                        )
+                    logger.info(log_msg +
+                        f"LR: {value_head_current_lr:.2e}"
+                    )
+
+        # Period 종료
+
+        # Incomplete accumulation 처리
+        if accumulation_counter > 0:
+            logger.info(f"Processing incomplete accumulation ({accumulation_counter} batches)")
+            if max_grad_norm > 0:
+                compute_gradient_clip_stats(value_model, max_grad_norm)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            optimizer.zero_grad()
+            global_step += 1
+            accumulation_counter = 0
+
+        current_epoch = batch_count / total_batches
+
+        # Period metrics
+        train_loss_avg = period_metrics_sum["train_loss"] / period_batches
+        throughput_metrics = throughput_tracker.get_epoch_metrics()
+        gpu_metrics_epoch = gpu_monitor.get_metrics()
+
+        # Pairwise 메트릭 aggregation
+        reduced_train_pairwise = all_reduce_scalars({
+            "train_loss": train_loss_avg,
+            "train_correct_pairs": train_correct_pairs,
+            "train_total_pairs": train_total_pairs,
+            "train_mean_pos_sum": train_mean_pos_sum,
+            "train_mean_neg_sum": train_mean_neg_sum,
+        }, op="sum")
+
+        world_sz = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        train_loss_avg = reduced_train_pairwise["train_loss"] / max(1, world_sz)
+        train_pairwise_acc = reduced_train_pairwise["train_correct_pairs"] / max(1, reduced_train_pairwise["train_total_pairs"])
+        train_mean_pos = reduced_train_pairwise["train_mean_pos_sum"] / max(1, period_batches * world_sz)
+        train_mean_neg = reduced_train_pairwise["train_mean_neg_sum"] / max(1, period_batches * world_sz)
+        train_margin = train_mean_pos - train_mean_neg
+
+        logger.info(
+            f"Epoch {current_epoch:.2f} - "
+            f"Train Loss: {train_loss_avg:.4f}, "
+            f"Pairwise Acc: {train_pairwise_acc:.3f}, "
+            f"Margin: {train_margin:.4f}"
+        )
+
+        # Validation
+        logger.info(f"--- Validation at epoch {current_epoch:.2f} ---")
+
+        val_metrics = validate_critic(
+            value_model=value_model,
+            dataloader=val_loader,
+            device=device,
+            loss_type=loss_type,
+            lambda_gamma=lambda_gamma,
+            lambda_lam=val_lambda_lam,
+            lambda_coef=lambda_coef,
+            value_loss_fn=value_loss_fn,
+            huber_delta=huber_delta,
+            return_raw_counts=True,
+        )
+
+        # Validation aggregation
+        raw_counts = val_metrics["_raw_counts"]
+        reduced_val_counts = all_reduce_scalars({
+            "loss_sum": raw_counts["loss_sum"],
+            "n_batches": raw_counts["n_batches"],
+            "correct_pairs": raw_counts["correct_pairs"],
+            "total_pairs": raw_counts["total_pairs"],
+            "mean_pos_sum": raw_counts["mean_pos_sum"],
+            "mean_neg_sum": raw_counts["mean_neg_sum"],
+            "pos_variance_sum": raw_counts["pos_variance_sum"],
+            "neg_variance_sum": raw_counts["neg_variance_sum"],
+            "pos_spikiness_sum": raw_counts["pos_spikiness_sum"],
+            "neg_spikiness_sum": raw_counts["neg_spikiness_sum"],
+            "pos_mean_abs_td_sum": raw_counts["pos_mean_abs_td_sum"],
+            "neg_mean_abs_td_sum": raw_counts["neg_mean_abs_td_sum"],
+            "pos_pos_corr_sum": raw_counts["pos_pos_corr_sum"],
+            "neg_pos_corr_sum": raw_counts["neg_pos_corr_sum"],
+        }, op="sum")
+
+        avg_val_loss = reduced_val_counts["loss_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_pairwise_acc = reduced_val_counts["correct_pairs"] / max(1, reduced_val_counts["total_pairs"])
+        avg_val_mean_pos = reduced_val_counts["mean_pos_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_mean_neg = reduced_val_counts["mean_neg_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_margin = avg_val_mean_pos - avg_val_mean_neg
+        avg_val_pos_variance = reduced_val_counts["pos_variance_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_neg_variance = reduced_val_counts["neg_variance_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_pos_spikiness = reduced_val_counts["pos_spikiness_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_neg_spikiness = reduced_val_counts["neg_spikiness_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_pos_mean_abs_td = reduced_val_counts["pos_mean_abs_td_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_neg_mean_abs_td = reduced_val_counts["neg_mean_abs_td_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_pos_pos_corr = reduced_val_counts["pos_pos_corr_sum"] / max(1, reduced_val_counts["n_batches"])
+        avg_val_neg_pos_corr = reduced_val_counts["neg_pos_corr_sum"] / max(1, reduced_val_counts["n_batches"])
+
+        # Epoch-level 로깅
+        if is_main_process():
+            if use_mlflow:
+                mlflow.log_metrics(
+                    {
+                        "train/epoch_loss": train_loss_avg,
+                        "train/epoch_pairwise_accuracy": train_pairwise_acc,
+                        "train/epoch_margin": train_margin,
+                        "val/loss": avg_val_loss,
+                        "val/pairwise_accuracy": avg_val_pairwise_acc,
+                        "val/margin": avg_val_margin,
+                        "val/pos_token_variance": avg_val_pos_variance,
+                        "val/neg_token_variance": avg_val_neg_variance,
+                        # TD Error 스파이크 진단 (pos: 낮아야 좋음, neg: 높아야 좋음)
+                        "val/pos_spikiness": avg_val_pos_spikiness,
+                        "val/neg_spikiness": avg_val_neg_spikiness,
+                        "val/pos_mean_abs_td": avg_val_pos_mean_abs_td,
+                        "val/neg_mean_abs_td": avg_val_neg_mean_abs_td,
+                        # Position correlation (|값| < 0.3이면 건강)
+                        "val/pos_position_corr": avg_val_pos_pos_corr,
+                        "val/neg_position_corr": avg_val_neg_pos_corr,
+                        "perf/epoch_time_sec": throughput_metrics["epoch_time_sec"],
+                        "perf/samples_per_sec": throughput_metrics["samples_per_sec"],
+                        "system/gpu_memory_reserved_gb": gpu_metrics_epoch["gpu_memory_reserved_gb"],
+                    },
+                    step=global_step,
+                )
+
+        logger.info(
+            f"Validation - Loss: {avg_val_loss:.4f}, "
+            f"Pairwise Acc: {avg_val_pairwise_acc:.3f}, "
+            f"Margin: {avg_val_margin:.4f}, "
+            f"PosVar: {avg_val_pos_variance:.6f}, NegVar: {avg_val_neg_variance:.6f}"
+        )
+
+        # Aggregated validation metrics
+        aggregated_val_metrics = {
+            "val_loss": avg_val_loss,
+            "val_pairwise_accuracy": avg_val_pairwise_acc,
+            "val_mean_pos": avg_val_mean_pos,
+            "val_mean_neg": avg_val_mean_neg,
+            "val_margin": avg_val_margin,
+            "val_pos_token_variance": avg_val_pos_variance,
+            "val_neg_token_variance": avg_val_neg_variance,
+            "val_pos_spikiness": avg_val_pos_spikiness,
+            "val_neg_spikiness": avg_val_neg_spikiness,
+            "val_pos_mean_abs_td": avg_val_pos_mean_abs_td,
+            "val_neg_mean_abs_td": avg_val_neg_mean_abs_td,
+            "val_pos_position_corr": avg_val_pos_pos_corr,
+            "val_neg_position_corr": avg_val_neg_pos_corr,
+        }
+
+        # Checkpoint 저장 (매 validation마다 저장, cleanup으로 최신 N개만 유지)
+        is_best = avg_val_margin > best_val_margin
+        if is_best:
+            best_val_margin = avg_val_margin
+
+        checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{current_epoch:.2f}.pt"
+
+        # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
+        save_value_model_checkpoint(
+            value_model=value_model,
+            optimizer=optimizer,
+            epoch=current_epoch,
+            train_metrics={"train_loss": train_loss_avg},
+            val_metrics=aggregated_val_metrics,
+            checkpoint_path=checkpoint_path,
+            config=config,
+            s3_upload=use_s3_upload,
+            experiment_name=config.experiment.name,
+        )
+
+        # 로깅 및 cleanup은 rank 0만 수행
+        if is_main_process():
+            best_marker = " [BEST]" if is_best else ""
+            logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_margin: {avg_val_margin:.4f}){best_marker}")
+
+            if config.checkpoint.save_total_limit:
+                cleanup_old_checkpoints(
+                    checkpoint_dir=checkpoint_dir,
+                    save_total_limit=config.checkpoint.save_total_limit,
+                )
+
+                if use_s3_upload:
+                    cleanup_s3_checkpoints(
+                        experiment_name=config.experiment.name,
+                        save_total_limit=config.checkpoint.save_total_limit,
+                    )
+
+        next_checkpoint_epoch += save_checkpoint_every
+
+    # 8. Final checkpoint
+    if config.checkpoint.save_final:
+        final_path = checkpoint_dir / "checkpoint_final.pt"
+
+        logger.info("--- Final Validation ---")
+
+        final_val_raw = validate_critic(
+            value_model=value_model,
+            dataloader=val_loader,
+            device=device,
+            loss_type=loss_type,
+            lambda_gamma=lambda_gamma,
+            lambda_lam=val_lambda_lam,
+            lambda_coef=lambda_coef,
+            value_loss_fn=value_loss_fn,
+            huber_delta=huber_delta,
+            return_raw_counts=True,
+        )
+
+        final_raw_counts = final_val_raw["_raw_counts"]
+        reduced_final_counts = all_reduce_scalars({
+            "loss_sum": final_raw_counts["loss_sum"],
+            "n_batches": final_raw_counts["n_batches"],
+            "correct_pairs": final_raw_counts["correct_pairs"],
+            "total_pairs": final_raw_counts["total_pairs"],
+            "mean_pos_sum": final_raw_counts["mean_pos_sum"],
+            "mean_neg_sum": final_raw_counts["mean_neg_sum"],
+        }, op="sum")
+
+        final_avg_loss = reduced_final_counts["loss_sum"] / max(1, reduced_final_counts["n_batches"])
+        final_pairwise_acc = reduced_final_counts["correct_pairs"] / max(1, reduced_final_counts["total_pairs"])
+        final_mean_pos = reduced_final_counts["mean_pos_sum"] / max(1, reduced_final_counts["n_batches"])
+        final_mean_neg = reduced_final_counts["mean_neg_sum"] / max(1, reduced_final_counts["n_batches"])
+        final_margin = final_mean_pos - final_mean_neg
+
+        final_val_metrics = {
+            "val_loss": final_avg_loss,
+            "val_pairwise_accuracy": final_pairwise_acc,
+            "val_mean_pos": final_mean_pos,
+            "val_mean_neg": final_mean_neg,
+            "val_margin": final_margin,
+        }
+
+        # 모든 rank가 참여 (FSDP gathering), 실제 저장은 함수 내부에서 rank 0만 수행
+        save_value_model_checkpoint(
+            value_model=value_model,
+            optimizer=optimizer,
+            epoch=current_epoch,
+            train_metrics={"train_loss": train_loss_avg},
+            val_metrics=final_val_metrics,
+            checkpoint_path=final_path,
+            config=config,
+            s3_upload=use_s3_upload,
+            experiment_name=config.experiment.name,
+        )
+
+        if is_main_process():
+            logger.info(f"Final checkpoint saved: {final_path.name}")
+
+    # 9. 종료
+    shutdown_s3_executor()
+    if is_main_process() and use_mlflow:
+        mlflow.end_run()
+
+        # MLflow 메트릭/파라미터 S3 백업
+        if use_s3_upload:
+            sync_mlruns_to_s3()
+
+    epoch_checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"))
+    latest_checkpoint_path = str(epoch_checkpoints[-1]) if epoch_checkpoints else None
+
+    logger.info(f"Critic pre-training 완료! Latest checkpoint: {latest_checkpoint_path}")
+
+    final_metrics = final_val_metrics if config.checkpoint.save_final else aggregated_val_metrics
+    return final_metrics, latest_checkpoint_path
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Critic Pre-training (독립 Value Model)")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Config path (e.g., configs/production/critic_mlp.yaml)",
+    )
+    parser.add_argument(
+        "--override",
+        action="append",
+        dest="overrides",
+        help="Config override (e.g., --override experiment.name=test)",
+    )
+    args = parser.parse_args()
+
+    config = OmegaConf.load(args.config)
+
+    if args.overrides:
+        from weighted_mtp.utils.config_utils import apply_overrides
+        config = apply_overrides(config, args.overrides)
+
+    run_critic_training(config)

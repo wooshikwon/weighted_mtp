@@ -1,0 +1,149 @@
+# Critic Pre-training (독립 Value Model)
+# HuggingFace 기반 2.7B 모델 + MLP Value Head 학습
+# 프로덕션 설정 (VESSL H200 3-GPU)
+
+# 프로젝트 정보
+project:
+  name: weighted-mtp
+  version: "2.0.0"
+
+# 실험 메타정보
+experiment:
+  name: last-final-value-model-stratified-MC-mse
+  description: "Independent Value Model pretraining for TD error calculation"
+  stage: critic
+  tags:
+    - critic
+    - lambda-return
+    - mlp-value-head
+    - dropout-0.1
+    - independent-value-model
+
+# 모델 설정
+models:
+  # 독립 Value Model (raw 모델 기반, 2.7B)
+  value_model:
+    name: ref-sheared-llama-2.7b
+    path: storage/models/ref-sheared-llama-2.7b/raw
+    dtype: bfloat16
+
+# 데이터셋 설정
+dataset:
+  name: codecontests
+  train: storage/datasets/codecontests/processed/train.jsonl
+  validation: storage/datasets/codecontests/processed/valid.jsonl
+  max_length: 2048
+
+# 데이터 샘플링 (Pairwise)
+data_sampling:
+  seed: 84
+  use_pairwise: true
+  val_n_samples: 500        # Validation 샘플 수
+
+  n_samples: 125000 
+  max_pairs_per_problem: 50  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
+
+  # Length-Balanced 샘플링 (길이 편향 제거)
+  # 같은 problem 내 같은 length bin에서 correct/incorrect 매칭
+  # 세분화된 bin으로 평균 |Diff| 42.7 → 18.8 토큰 (56% 감소)
+  use_length_balanced: true
+  length_bins: [0, 50, 100, 125, 150, 175, 200, 250, 300, 350, 400, 500, 600, 800, 1000, 1500, 2000]
+
+  # Difficulty 기반 설정 (use_length_balanced=true 시에도 difficulty 필터로 사용)
+  difficulty_bins:
+    all: [1, 25]  # difficulty 0 제외
+  difficulty_weights:
+    all: 1.0
+
+# 학습 설정 (H100 80GB 4-GPU 최적화)
+training:
+  n_epochs: 1.5
+  batch_size: 32
+  gradient_accumulation_steps: 1  # Effective batch size = 32 × 1 × 3 = 96
+
+  # Global 설정 (FSDP 제약으로 분리 불가)
+  max_grad_norm: 1.0
+  log_interval: 5
+
+  # Backbone freeze 설정 (use_lora=true 시 무시됨)
+  backbone_frozen: true
+
+  # LoRA 설정 (과적합 방지를 위해 축소된 용량)
+  use_lora: true
+  lora:
+    rank: 32              # 64 → 32 (암기 용량 축소)
+    alpha: 64.0           # 128 → 64 (rank × 2)
+    dropout: 0.1          # 0.05 → 0.1 (규제 강화)
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    learning_rate: 2.0e-5  # OVM 표준 (7B 기준)
+    weight_decay: 0.01
+
+  # Value Head 설정
+  value_head:
+    type: mlp
+    dropout: 0.2
+    learning_rate: 1.0e-4  # LoRA의 5배 (균형 잡힌 학습)
+    weight_decay: 0.01
+
+  # Value loss 설정
+  value_loss:
+    type: "lambda_return"   # "lambda_return" | "pairwise_ranking"
+    loss_fn: "mse"        # "mse" | "huber" (0/1 terminal reward에 robust)
+    bias_init: 0.5          # Value head bias 초기값 (기대값 일치)
+
+    lambda_schedule:
+      type: constant        # 학습 전체에 걸쳐 일정한 λ 사용
+      value: 1.0            # λ=1.0: MC
+
+  # Learning rate scheduler (공유)
+  lr_scheduler:
+    type: cosine
+    warmup_ratio: 0.03      # 5% warmup (안정적 학습 시작)
+    min_lr_ratio: 0.005      # 완전 decay (마지막까지 학습 활용)
+
+# 체크포인트
+checkpoint:
+  save_dir: storage/checkpoints/critic/${experiment.name}
+  save_checkpoint_every: 0.2
+  save_best: true
+  save_final: true
+  save_total_limit: 6
+  s3_upload: false
+
+# 런타임 설정
+runtime:
+  device: cuda
+  seed: 42
+  mixed_precision: true
+
+# 분산학습 설정
+distributed:
+  fsdp:
+    sharding_strategy: FULL_SHARD
+    mixed_precision: true
+    cpu_offload: false
+    activation_checkpointing: true
+
+# 스토리지
+storage:
+  root: storage
+  models_dir: storage/models
+  datasets_dir: storage/datasets
+  checkpoints_dir: storage/checkpoints
+
+# MLflow 추적
+mlflow:
+  tracking_uri: ""
+  experiment: "weighted-mtp/production"
+
+# 로깅
+logging:
+  level: INFO
+  format: "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"

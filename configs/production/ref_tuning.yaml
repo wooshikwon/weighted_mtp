@@ -1,0 +1,118 @@
+# Reference Model Fine-tuning (HuggingFace NTP)
+# Rho-1에서 사용할 Reference Model을 codecontests 도메인에 적응
+# 프로덕션 설정 (VESSL H200 4-GPU)
+
+# 프로젝트 정보
+project:
+  name: weighted-mtp
+  version: "2.0.0"
+
+# 실험 메타정보
+experiment:
+  name: last-final-ref-tuning
+  description: "Reference model fine-tuning for Rho-1 (HuggingFace LlamaForCausalLM)"
+  stage: ref-tuning
+  tags:
+    - ref-tuning
+    - huggingface
+    - ntp
+    - production
+
+# 모델 설정 (HuggingFace 형식)
+models:
+  policy:
+    name: ref-sheared-llama-2.7b
+    path: storage/models/ref-sheared-llama-2.7b/raw
+    dtype: bfloat16
+
+# 데이터셋 설정
+dataset:
+  name: codecontests
+  train: storage/datasets/codecontests/processed/train.jsonl
+  validation: storage/datasets/codecontests/processed/valid.jsonl
+  max_length: 2048
+
+# 데이터 샘플링 (정답만 학습)
+data_sampling:
+  seed: 24
+  val_n_samples: 500
+  use_pairwise: false
+
+  n_samples: 200000
+  max_pairs_per_problem: 50  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
+
+  difficulty_bins:
+    all: [1, 25]  # difficulty 0 제외
+  difficulty_weights:
+    all: 1.0
+
+# 학습 설정 (2.7B 모델, H200 3-GPU 최적화)
+training:
+  n_epochs: 1.0
+  batch_size: 24  # Per GPU (2.7B 경량 모델)
+  gradient_accumulation_steps: 1  # Effective batch size = 36 × 1 × 3 = 108
+  learning_rate: 5.0e-5
+  max_grad_norm: 1
+  log_interval: 5
+
+  # LoRA 설정 (과적합 방지를 위해 축소된 용량)
+  use_lora: true
+  lora:
+    rank: 32              # 64 → 32 (암기 용량 축소)
+    alpha: 64.0           # 128 → 64 (rank × 2)
+    dropout: 0.1          # 0.05 → 0.1 (규제 강화)
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    weight_decay: 0.01    # 가중치 규제 강화
+
+  # Learning rate scheduler
+  lr_scheduler:
+    type: cosine
+    warmup_ratio: 0.03
+    min_lr_ratio: 0.005
+
+# 체크포인트
+checkpoint:
+  save_dir: storage/checkpoints/ref-tuning/${experiment.name}
+  save_checkpoint_every: 0.2
+  save_best: true
+  save_final: true
+  save_total_limit: 3
+  s3_upload: false
+
+# 런타임 설정
+runtime:
+  device: cuda
+  seed: 42
+  mixed_precision: true
+
+# 분산학습 설정
+distributed:
+  fsdp:
+    sharding_strategy: FULL_SHARD
+    mixed_precision: true
+    cpu_offload: false
+    activation_checkpointing: true  # 메모리 효율화 (필수)
+
+# 스토리지
+storage:
+  root: storage
+  models_dir: storage/models
+  datasets_dir: storage/datasets
+  checkpoints_dir: storage/checkpoints
+
+# MLflow 추적 (로컬 파일 기반)
+mlflow:
+  tracking_uri: ""  # 빈 문자열 = ./mlruns 디렉터리 사용
+  experiment: "weighted-mtp/production"
+
+# 로깅
+logging:
+  level: INFO
+  format: "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"

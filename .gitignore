@@ -1,0 +1,68 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment / packaging
+.venv/
+.uv/
+poetry.lock
+*.egg-info/
+dist/
+build/
+
+# Editor & OS artifacts
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Logs & temp
+logs/
+*.log
+*.txt
+*.tmp
+*.bak
+
+# Testing & Linting
+.coverage
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+results/
+
+# ML artifacts
+mlruns_archive/
+mlruns_vastai/
+mlflow/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Storage 내 대용량 파일만 제외
+storage/checkpoints/
+storage/models/
+storage/mlruns_nipa/
+storage/datasets/
+storage/datasets_local_small/
+
+# Scripts 내 캐시만 제외
+scripts/__pycache__/
+
+# Vendor (외부 의존성)
+vendor/
+
+# Generated data files
+*.jsonl
+*.jsonl.zst
+
+# Misc
+node_modules/
+
+mlruns_backup/

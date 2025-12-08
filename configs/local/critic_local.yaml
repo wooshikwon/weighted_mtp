@@ -1,0 +1,112 @@
+# Critic Local Test (독립 Value Model)
+# 로컬 테스트용 (2.7B HuggingFace 모델)
+
+project:
+  name: weighted-mtp
+  version: "2.0.0"
+
+experiment:
+  name: critic-pretrain-local
+  description: "Local test with independent Value Model"
+  stage: critic
+  tags:
+    - critic
+    - local
+    - independent-value-model
+
+# 독립 Value Model (HuggingFace 기반, 2.7B)
+models:
+  value_model:
+    name: ref-sheared-llama-2.7b
+    path: storage/models/ref-sheared-llama-2.7b/raw
+    tokenizer_path: storage/models/ref-sheared-llama-2.7b/tokenizer
+    dtype: float32  # 로컬은 float32
+
+dataset:
+  name: codecontests
+  train: storage/datasets/codecontests/processed/train.jsonl
+  validation: storage/datasets/codecontests/processed/valid.jsonl
+  max_length: 512  # 메모리 절감
+
+data_sampling:
+  seed: 42
+  val_n_samples: 50
+  use_pairwise: true
+
+  n_samples: 100  # 로컬 테스트용 소량
+
+  difficulty_bins:
+    diff_7: [7, 7]
+    else: [8, 25]
+  difficulty_weights:
+    diff_7: 0.35
+    else: 0.65
+
+training:
+  n_epochs: 0.1
+  batch_size: 1  # 메모리 제한 고려
+  gradient_accumulation_steps: 2
+
+  # Global 설정
+  max_grad_norm: 1.0
+  log_interval: 5
+
+  backbone_frozen: true  # 로컬에서는 value head만 학습
+  use_lora: false
+
+  # Value Head 설정 (Non-LoRA 모드에서 사용)
+  value_head:
+    type: mlp
+    dropout: 0.3
+    learning_rate: 1.0e-4
+    weight_decay: 0.01
+
+  # Value loss 설정
+  value_loss:
+    type: "lambda_return"   # "lambda_return" | "pairwise_ranking"
+    gamma: 1.0
+    coef: 1.0
+    bias_init: 0.5
+    lambda_schedule:
+      type: linear
+      start: 1.0
+      end: 0.95
+      warmup_steps: 10      # 로컬 테스트용 짧은 warmup
+      decay_steps: 50
+
+  lr_scheduler:
+    type: cosine
+    warmup_ratio: 0.05
+    min_lr_ratio: 0.0
+
+checkpoint:
+  save_dir: storage/checkpoints/critic/${experiment.name}
+  save_checkpoint_every: 0.1
+  save_best: true
+  save_final: true
+  save_total_limit: 2
+
+runtime:
+  device: mps
+  seed: 42
+  mixed_precision: false
+
+distributed:
+  fsdp:
+    sharding_strategy: NO_SHARD
+    mixed_precision: false
+    cpu_offload: false
+
+storage:
+  root: storage
+  models_dir: storage/models
+  datasets_dir: storage/datasets
+  checkpoints_dir: storage/checkpoints
+
+mlflow:
+  tracking_uri: "sqlite:///mlflow.db"
+  experiment: "weighted_mtp"
+
+logging:
+  level: INFO
+  format: "%(asctime)s [%(levelname)S] [%(name)s] %(message)s"
