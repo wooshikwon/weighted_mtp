@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
-Phase1 Storage 무결성 검증 및 체크리스트 생성
+Storage 무결성 검증 스크립트
 
 기능:
 - 모든 모델 무결성 검증 (SHA256, Config, SafeTensors)
-- 모든 데이터셋 검증 (파일 존재, Schema)
-- Phase1 체크리스트 자동 생성
-- 계획서와 실제 구조 비교
+- 모든 데이터셋 검증 (파일 존재, Schema, 메타데이터)
+- problem_index_map 검증 (Pairwise 학습 필수)
+- 검증 리포트 생성
 
 Usage:
     # 전체 검증
-    python scripts/verify_storage.py --check all
+    uv run python scripts/create_storage/verify_storage.py --check all
 
     # 모델만 검증
-    python scripts/verify_storage.py --check models
+    uv run python scripts/create_storage/verify_storage.py --check models
 
-    # Phase1 체크리스트 생성
-    python scripts/verify_storage.py --check all --phase1-checklist
+    # 데이터셋만 검증
+    uv run python scripts/create_storage/verify_storage.py --check datasets
 
     # 리포트 생성
-    python scripts/verify_storage.py --check all --generate-report
+    uv run python scripts/create_storage/verify_storage.py --check all --generate-report
 """
 
 import argparse
@@ -28,7 +28,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import yaml
 from safetensors import safe_open
@@ -80,21 +80,54 @@ MODELS_TO_VERIFY = {
     },
 }
 
+# 전체 데이터셋 (processed 디렉토리)
 DATASETS_TO_VERIFY = {
     "codecontests": {
+        "processed_dir": "storage/datasets/codecontests/processed",
+        "splits": ["train", "valid", "test"],
+        "required_fields": ["instruction", "input", "output", "task_id", "is_correct"],
+        "metadata_required": True,
+        "problem_index_map_required": True,  # Pairwise 학습 필수
+    },
+    "mbpp": {
+        "processed_dir": "storage/datasets/mbpp/processed",
+        "splits": ["train", "validation", "test"],
+        "required_fields": ["instruction", "input", "output", "task_id"],
+        "metadata_required": False,
+        "problem_index_map_required": False,
+    },
+    "humaneval": {
+        "processed_dir": "storage/datasets/humaneval/processed",
+        "splits": ["test"],
+        "required_fields": ["instruction", "input", "output", "task_id"],
+        "metadata_required": False,
+        "problem_index_map_required": False,
+    },
+    "gsm8k": {
+        "processed_dir": "storage/datasets/gsm8k/processed",
+        "splits": ["train", "test"],
+        "required_fields": ["instruction", "input", "output", "task_id"],
+        "metadata_required": False,
+        "problem_index_map_required": False,
+    },
+}
+
+# Small 데이터셋 (로컬 테스트용)
+SMALL_DATASETS_TO_VERIFY = {
+    "codecontests_small": {
         "small_dir": "storage/datasets_local_small/codecontests_small",
+        "files": ["train_small.jsonl", "valid_small.jsonl"],
+        "required_fields": ["instruction", "input", "output", "task_id"],
+    },
+    "mbpp_small": {
+        "small_dir": "storage/datasets_local_small/mbpp_small",
         "files": ["train_small.jsonl", "validation_small.jsonl"],
         "required_fields": ["instruction", "input", "output", "task_id"],
     },
-    "mbpp": {
-        "small_dir": "storage/datasets_local_small/mbpp_small",
-        "files": ["train_small.jsonl", "validation_small.jsonl"],
-        "required_fields": ["task_id", "text", "code"],
-    },
-    "humaneval": {
+    "humaneval_small": {
         "small_dir": "storage/datasets_local_small/humaneval_small",
         "files": ["test_small.jsonl"],
-        "required_fields": ["task_id", "prompt"],
+        "required_fields": ["instruction", "input", "output", "task_id"],
     },
 }
 
@@ -112,6 +145,18 @@ def calculate_sha256(file_path: Path) -> str:
     return sha256_hash.hexdigest()
 
 
+def format_size(size_bytes: int) -> str:
+    """파일 크기를 읽기 쉬운 형식으로 변환"""
+    if size_bytes >= 1024**3:
+        return f"{size_bytes / 1024**3:.2f} GB"
+    elif size_bytes >= 1024**2:
+        return f"{size_bytes / 1024**2:.1f} MB"
+    elif size_bytes >= 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_bytes} B"
+
+
 # ============================================================================
 # StorageVerifier 클래스
 # ============================================================================
@@ -121,6 +166,7 @@ class StorageVerifier:
         self.results = {
             "models": {},
             "datasets": {},
+            "small_datasets": {},
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -135,7 +181,7 @@ class StorageVerifier:
 
         for model_name in model_list:
             if model_name not in MODELS_TO_VERIFY:
-                print(f"⚠️  Unknown model: {model_name}, skipping...")
+                print(f"  Unknown model: {model_name}, skipping...")
                 continue
 
             print(f"[{model_name}]")
@@ -154,11 +200,11 @@ class StorageVerifier:
             }
 
             if model_passed:
-                print(f"✅ {model_name}: All checks passed!")
+                print(f"  {model_name}: All checks passed!")
             else:
-                print(f"❌ {model_name}: Verification failed!")
+                print(f"  {model_name}: Verification failed!")
                 for err in model_errors:
-                    print(f"  - {err}")
+                    print(f"    - {err}")
                 all_passed = False
 
             print()
@@ -176,11 +222,11 @@ class StorageVerifier:
         for file_rel in config["required_files"]:
             file_path = base_dir / file_rel
             if file_path.exists():
-                size_mb = file_path.stat().st_size / (1024**2)
-                print(f"    ✓ {file_rel} ({size_mb:.1f} MB)")
+                size = format_size(file_path.stat().st_size)
+                print(f"    [OK] {file_rel} ({size})")
             else:
                 errors.append(f"Missing: {file_rel}")
-                print(f"    ✗ {file_rel} NOT FOUND")
+                print(f"    [FAIL] {file_rel} NOT FOUND")
 
         # 2. SHA256 검증
         safetensors_file = base_dir / "safetensors/model.safetensors"
@@ -195,10 +241,10 @@ class StorageVerifier:
             actual_hash = calculate_sha256(safetensors_file)
 
             if expected_hash == actual_hash:
-                print(f"    ✓ SHA256 match: {actual_hash[:16]}...")
+                print(f"    [OK] SHA256 match: {actual_hash[:16]}...")
             else:
                 errors.append("SHA256 mismatch")
-                print(f"    ✗ SHA256 mismatch!")
+                print(f"    [FAIL] SHA256 mismatch!")
                 print(f"      Expected: {expected_hash}")
                 print(f"      Actual:   {actual_hash}")
         else:
@@ -208,48 +254,41 @@ class StorageVerifier:
         if config["config_checks"]:
             print("  [3/3] Verifying config...")
 
-            # Config 파일 로드 (명시적 경로, fallback 제거)
             yaml_path = base_dir / "configs/meta_adapter.yaml"
             json_path = base_dir / "configs/config.json"
 
-            config_file = None
             config_data = None
 
             if yaml_path.exists():
                 with open(yaml_path, "r") as f:
                     config_data = yaml.safe_load(f)
-                config_file = "meta_adapter.yaml"
             elif json_path.exists():
                 with open(json_path, "r") as f:
                     config_data = json.load(f)
-                config_file = "config.json"
             else:
-                # Config 파일이 없으면 명시적 오류
-                errors.append("Required config file not found (meta_adapter.yaml or config.json)")
-                print("    ✗ Required config file not found in configs/")
-                print("      Expected: configs/meta_adapter.yaml or configs/config.json")
+                errors.append("Config file not found")
+                print("    [FAIL] Config file not found")
                 return (False, errors)
 
-            # Config 검증
             for key, expected_value in config["config_checks"]:
                 actual_value = config_data.get(key)
 
                 if actual_value == expected_value:
-                    print(f"    ✓ {key}: {actual_value}")
+                    print(f"    [OK] {key}: {actual_value}")
                 else:
                     errors.append(
                         f"Config mismatch: {key} (expected={expected_value}, actual={actual_value})"
                     )
-                    print(f"    ✗ {key}: expected={expected_value}, actual={actual_value}")
+                    print(f"    [FAIL] {key}: expected={expected_value}, actual={actual_value}")
         else:
-            print("  [3/3] Skipping config checks (not defined)")
+            print("  [3/3] Skipping config checks")
 
         return (len(errors) == 0, errors)
 
     def verify_datasets(self, dataset_list: List[str]) -> bool:
-        """데이터셋 검증"""
+        """전체 데이터셋 검증 (processed 디렉토리)"""
         print("=" * 70)
-        print("Verifying Datasets")
+        print("Verifying Datasets (Full)")
         print("=" * 70)
         print()
 
@@ -257,17 +296,27 @@ class StorageVerifier:
 
         for dataset_name in dataset_list:
             if dataset_name not in DATASETS_TO_VERIFY:
-                print(f"⚠️  Unknown dataset: {dataset_name}, skipping...")
+                print(f"  Unknown dataset: {dataset_name}, skipping...")
                 continue
 
             print(f"[{dataset_name}]")
             print("-" * 70)
 
             config = DATASETS_TO_VERIFY[dataset_name]
-            small_dir = Path(config["small_dir"])
+            processed_dir = Path(config["processed_dir"])
+
+            if not processed_dir.exists():
+                print(f"  [SKIP] Directory not found: {processed_dir}")
+                self.results["datasets"][dataset_name] = {
+                    "passed": False,
+                    "errors": ["Directory not found"],
+                }
+                all_passed = False
+                print()
+                continue
 
             dataset_passed, dataset_errors = self._verify_single_dataset(
-                dataset_name, small_dir, config
+                dataset_name, processed_dir, config
             )
 
             self.results["datasets"][dataset_name] = {
@@ -276,11 +325,11 @@ class StorageVerifier:
             }
 
             if dataset_passed:
-                print(f"✅ {dataset_name}: All checks passed!")
+                print(f"  {dataset_name}: All checks passed!")
             else:
-                print(f"❌ {dataset_name}: Verification failed!")
+                print(f"  {dataset_name}: Verification failed!")
                 for err in dataset_errors:
-                    print(f"  - {err}")
+                    print(f"    - {err}")
                 all_passed = False
 
             print()
@@ -288,156 +337,151 @@ class StorageVerifier:
         return all_passed
 
     def _verify_single_dataset(
-        self, dataset_name: str, small_dir: Path, config: Dict
+        self, dataset_name: str, processed_dir: Path, config: Dict
     ) -> Tuple[bool, List[str]]:
         """단일 데이터셋 검증"""
         errors = []
+        splits = config["splits"]
+        required_fields = config["required_fields"]
+        metadata_required = config.get("metadata_required", False)
+        problem_index_map_required = config.get("problem_index_map_required", False)
 
-        # 1. 파일 존재 확인
-        print("  [1/2] Checking files...")
-        for file_name in config["files"]:
-            file_path = small_dir / file_name
-            if file_path.exists():
-                size_kb = file_path.stat().st_size / 1024
-                print(f"    ✓ {file_name} ({size_kb:.1f} KB)")
+        # 1. JSONL 파일 존재 확인
+        print("  [1/3] Checking JSONL files...")
+        for split in splits:
+            jsonl_path = processed_dir / f"{split}.jsonl"
+            if jsonl_path.exists():
+                size = format_size(jsonl_path.stat().st_size)
+                # 라인 수 카운트 (대용량 파일은 추정)
+                if jsonl_path.stat().st_size > 100 * 1024 * 1024:  # 100MB 이상
+                    line_count = "large"
+                else:
+                    with open(jsonl_path, "r") as f:
+                        line_count = sum(1 for _ in f)
+                print(f"    [OK] {split}.jsonl ({size}, {line_count} samples)")
             else:
-                errors.append(f"Missing: {file_name}")
-                print(f"    ✗ {file_name} NOT FOUND")
+                errors.append(f"Missing: {split}.jsonl")
+                print(f"    [FAIL] {split}.jsonl NOT FOUND")
 
         # 2. Schema 검증 (샘플 3개)
-        print("  [2/2] Validating schema...")
-        required_fields = config["required_fields"]
-
-        for file_name in config["files"]:
-            file_path = small_dir / file_name
-            if not file_path.exists():
+        print("  [2/3] Validating schema...")
+        for split in splits:
+            jsonl_path = processed_dir / f"{split}.jsonl"
+            if not jsonl_path.exists():
                 continue
 
-            print(f"    Checking {file_name}...")
-
-            with open(file_path, "r") as f:
+            with open(jsonl_path, "r") as f:
                 for i, line in enumerate(f):
-                    if i >= 3:  # 처음 3개만 체크
+                    if i >= 3:
                         break
 
                     try:
                         data = json.loads(line)
-
-                        # 필수 필드 확인 (유연하게)
-                        missing = [
-                            field for field in required_fields if field not in data
-                        ]
+                        missing = [field for field in required_fields if field not in data]
 
                         if missing:
-                            print(f"      ⚠️  Line {i+1}: missing {missing} (non-fatal)")
-                        else:
-                            print(f"      ✓ Line {i+1}: schema valid")
+                            errors.append(f"{split}.jsonl: missing fields {missing}")
+                            print(f"    [FAIL] {split} line {i+1}: missing {missing}")
+                        elif i == 0:
+                            print(f"    [OK] {split}: schema valid (checked 3 samples)")
 
-                    except json.JSONDecodeError as e:
-                        errors.append(f"{file_name} line {i+1}: JSON decode error")
-                        print(f"      ✗ Line {i+1}: JSON error")
+                    except json.JSONDecodeError:
+                        errors.append(f"{split}.jsonl line {i+1}: JSON decode error")
+                        print(f"    [FAIL] {split} line {i+1}: JSON error")
+
+        # 3. 메타데이터 검증
+        print("  [3/3] Validating metadata...")
+        for split in splits:
+            metadata_path = processed_dir / f"{split}_metadata.json"
+
+            if not metadata_path.exists():
+                if metadata_required:
+                    errors.append(f"Missing: {split}_metadata.json")
+                    print(f"    [FAIL] {split}_metadata.json NOT FOUND")
+                else:
+                    print(f"    [SKIP] {split}_metadata.json (optional)")
+                continue
+
+            size = format_size(metadata_path.stat().st_size)
+
+            try:
+                with open(metadata_path, "r") as f:
+                    metadata = json.load(f)
+
+                # problem_index_map 검증
+                if problem_index_map_required:
+                    if "problem_index_map" not in metadata:
+                        errors.append(f"{split}_metadata.json: missing problem_index_map")
+                        print(f"    [FAIL] {split}_metadata.json: problem_index_map NOT FOUND")
+                        print(f"           Run: uv run python scripts/create_storage/setup_datasets.py --datasets {dataset_name} --steps metadata")
+                    else:
+                        problem_count = len(metadata["problem_index_map"])
+                        stats = metadata.get("stats", {})
+                        valid_problems = stats.get("n_valid_problems", "N/A")
+                        total_pairs = stats.get("total_possible_pairs", "N/A")
+                        print(f"    [OK] {split}_metadata.json ({size})")
+                        print(f"         problems={problem_count}, valid={valid_problems}, pairs={total_pairs}")
+                else:
+                    print(f"    [OK] {split}_metadata.json ({size})")
+
+            except json.JSONDecodeError:
+                errors.append(f"{split}_metadata.json: JSON decode error")
+                print(f"    [FAIL] {split}_metadata.json: invalid JSON")
 
         return (len(errors) == 0, errors)
 
-    def generate_phase1_checklist(self) -> None:
-        """Phase1 체크리스트 생성"""
+    def verify_small_datasets(self) -> bool:
+        """Small 데이터셋 검증 (로컬 테스트용)"""
         print("=" * 70)
-        print("Phase 1 Completion Checklist")
+        print("Verifying Small Datasets")
         print("=" * 70)
         print()
 
-        checklist = {
-            "timestamp": self.results["timestamp"],
-            "steps": {},
-        }
+        all_passed = True
 
-        # Step 2: 모델 원본 다운로드
-        meta_mtp = self.results["models"].get("meta-llama-mtp", {})
-        ref_sheared = self.results["models"].get("ref-sheared-llama-2.7b", {})
+        for dataset_name, config in SMALL_DATASETS_TO_VERIFY.items():
+            print(f"[{dataset_name}]")
+            print("-" * 70)
 
-        checklist["steps"]["step2_model_download"] = {
-            "name": "모델 원본 다운로드 (Meta 7B_1T_4, Sheared LLaMA 2.7B)",
-            "status": "✅" if meta_mtp.get("passed") and ref_sheared.get("passed") else "❌",
-        }
+            small_dir = Path(config["small_dir"])
 
-        # Step 3-4: 모델 변환
-        checklist["steps"]["step3_meta_conversion"] = {
-            "name": "Meta LLaMA MTP 파생 자산 생성 (safetensors, config)",
-            "status": "✅" if meta_mtp.get("passed") else "❌",
-        }
+            if not small_dir.exists():
+                print(f"  [SKIP] Directory not found: {small_dir}")
+                self.results["small_datasets"][dataset_name] = {
+                    "passed": False,
+                    "errors": ["Directory not found"],
+                }
+                print()
+                continue
 
-        checklist["steps"]["step4_ref_conversion"] = {
-            "name": "Sheared LLaMA 2.7B 파생 자산 생성",
-            "status": "✅" if ref_sheared.get("passed") else "❌",
-        }
+            errors = []
 
-        # Step 5: Micro 모델
-        micro_mtp = self.results["models"].get("micro-mtp", {})
+            # 파일 존재 확인
+            print("  Checking files...")
+            for file_name in config["files"]:
+                file_path = small_dir / file_name
+                if file_path.exists():
+                    size = format_size(file_path.stat().st_size)
+                    print(f"    [OK] {file_name} ({size})")
+                else:
+                    errors.append(f"Missing: {file_name}")
+                    print(f"    [FAIL] {file_name} NOT FOUND")
 
-        checklist["steps"]["step5_micro_model"] = {
-            "name": "Micro 모델 생성 (Policy & Reference)",
-            "status": "✅" if micro_mtp.get("passed") else "❌",
-        }
+            passed = len(errors) == 0
+            self.results["small_datasets"][dataset_name] = {
+                "passed": passed,
+                "errors": errors,
+            }
 
-        # Step 6-8: 데이터셋
-        datasets_passed = all(
-            ds.get("passed", False) for ds in self.results["datasets"].values()
-        )
+            if passed:
+                print(f"  {dataset_name}: All checks passed!")
+            else:
+                print(f"  {dataset_name}: Verification failed!")
+                all_passed = False
 
-        checklist["steps"]["step6_dataset_download"] = {
-            "name": "데이터셋 원본 다운로드 (CodeContests, MBPP, HumanEval)",
-            "status": "✅" if datasets_passed else "❌",
-        }
-
-        checklist["steps"]["step8_dataset_small"] = {
-            "name": "Small 데이터셋 생성 및 검증",
-            "status": "✅" if datasets_passed else "❌",
-        }
-
-        # Step 9: 무결성 검증
-        all_models_passed = all(
-            m.get("passed", False) for m in self.results["models"].values()
-        )
-
-        checklist["steps"]["step9_verification"] = {
-            "name": "자산 무결성 검증 (모델 & 데이터셋)",
-            "status": "✅" if all_models_passed and datasets_passed else "❌",
-        }
-
-        # 출력
-        for step_id, step_info in checklist["steps"].items():
-            print(f"{step_info['status']} {step_info['name']}")
-
-        print()
-
-        # 전체 상태
-        all_passed = all(
-            step["status"] == "✅" for step in checklist["steps"].values()
-        )
-
-        if all_passed:
-            print("=" * 70)
-            print("✅ Phase 1 Complete!")
-            print("=" * 70)
             print()
-            print("모든 체크리스트 항목이 완료되었습니다.")
-            print("다음 단계: Phase 2 (코드 스켈레톤 구축)")
-        else:
-            print("=" * 70)
-            print("⚠️  Phase 1 Incomplete")
-            print("=" * 70)
-            print()
-            print("일부 항목이 완료되지 않았습니다. 위 체크리스트를 확인하세요.")
 
-        print()
-
-        # 체크리스트 파일 저장
-        checklist_file = Path("docs/phase1_checklist.json")
-        with open(checklist_file, "w") as f:
-            json.dump(checklist, f, indent=2, ensure_ascii=False)
-
-        print(f"✓ Checklist saved to {checklist_file}")
-        print()
+        return all_passed
 
     def generate_report(self) -> None:
         """검증 리포트 생성"""
@@ -455,23 +499,23 @@ class StorageVerifier:
         with open(report_file, "w") as f:
             json.dump(self.results, f, indent=2)
 
-        print(f"✓ Report saved to {report_file}")
+        print(f"  Report saved to {report_file}")
         print()
 
         # 요약
         total_models = len(self.results["models"])
-        passed_models = sum(
-            1 for m in self.results["models"].values() if m.get("passed")
-        )
+        passed_models = sum(1 for m in self.results["models"].values() if m.get("passed"))
 
         total_datasets = len(self.results["datasets"])
-        passed_datasets = sum(
-            1 for d in self.results["datasets"].values() if d.get("passed")
-        )
+        passed_datasets = sum(1 for d in self.results["datasets"].values() if d.get("passed"))
+
+        total_small = len(self.results["small_datasets"])
+        passed_small = sum(1 for d in self.results["small_datasets"].values() if d.get("passed"))
 
         print("Summary:")
-        print(f"  Models:   {passed_models}/{total_models} passed")
-        print(f"  Datasets: {passed_datasets}/{total_datasets} passed")
+        print(f"  Models:         {passed_models}/{total_models} passed")
+        print(f"  Datasets:       {passed_datasets}/{total_datasets} passed")
+        print(f"  Small Datasets: {passed_small}/{total_small} passed")
         print()
 
 
@@ -481,21 +525,21 @@ class StorageVerifier:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phase1 Storage 무결성 검증 및 체크리스트 생성",
+        description="Storage 무결성 검증 스크립트",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # 전체 검증
-  python scripts/verify_storage.py --check all
+  uv run python scripts/create_storage/verify_storage.py --check all
 
   # 모델만 검증
-  python scripts/verify_storage.py --check models
+  uv run python scripts/create_storage/verify_storage.py --check models
 
-  # Phase1 체크리스트 생성
-  python scripts/verify_storage.py --check all --phase1-checklist
+  # 데이터셋만 검증
+  uv run python scripts/create_storage/verify_storage.py --check datasets
 
   # 리포트 생성
-  python scripts/verify_storage.py --check all --generate-report
+  uv run python scripts/create_storage/verify_storage.py --check all --generate-report
         """,
     )
 
@@ -507,9 +551,9 @@ Examples:
     )
 
     parser.add_argument(
-        "--phase1-checklist",
+        "--include-small",
         action="store_true",
-        help="Generate Phase1 completion checklist",
+        help="Also verify small datasets",
     )
 
     parser.add_argument(
@@ -533,16 +577,27 @@ Examples:
             datasets_passed = verifier.verify_datasets(list(DATASETS_TO_VERIFY.keys()))
             all_passed = all_passed and datasets_passed
 
-        if args.phase1_checklist:
-            verifier.generate_phase1_checklist()
+            if args.include_small:
+                small_passed = verifier.verify_small_datasets()
+                all_passed = all_passed and small_passed
 
         if args.generate_report:
             verifier.generate_report()
 
+        # 최종 결과
+        print("=" * 70)
+        if all_passed:
+            print("All verifications PASSED")
+        else:
+            print("Some verifications FAILED")
+        print("=" * 70)
+
         sys.exit(0 if all_passed else 1)
 
     except Exception as e:
-        print(f"\n❌ Error: {e}", file=sys.stderr)
+        print(f"\nError: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
