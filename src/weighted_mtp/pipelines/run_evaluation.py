@@ -156,12 +156,23 @@ def load_model_for_evaluation(
     logger.info(f"Validation loss: {checkpoint_metadata['val_metrics']['val_loss']:.4f}")
 
     # LoRA 병합 (inference 최적화)
-    if hasattr(model, "merge_lora"):
-        model.merge_lora()
+    from weighted_mtp.models.lora import merge_lora_weights
+    try:
+        merge_lora_weights(model)
         logger.info("LoRA weights merged for inference optimization")
+    except Exception:
+        logger.info("No LoRA weights to merge (or already merged)")
 
-    # Load tokenizer
-    tokenizer_path = resolve_tokenizer_path(checkpoint_metadata['config']['model']['path'])
+    # Load tokenizer — config 구조: {models: {policy: {path: "..."}}}
+    config_dict = checkpoint_metadata.get('config', {})
+    if 'models' in config_dict and 'policy' in config_dict['models']:
+        model_path = config_dict['models']['policy']['path']
+    elif 'model' in config_dict:
+        model_path = config_dict['model']['path']
+    else:
+        model_path = "meta-llama/Meta-Llama-3-8B"
+        logger.warning(f"Config에서 모델 경로를 찾을 수 없습니다. 기본값 사용: {model_path}")
+    tokenizer_path = resolve_tokenizer_path(model_path)
     tokenizer = load_tokenizer(tokenizer_path)
 
     return model, tokenizer, checkpoint_metadata, device_obj
