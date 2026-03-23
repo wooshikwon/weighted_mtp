@@ -326,12 +326,14 @@ def run_evaluation(
         # Generate N samples using HuggingFace model.generate()
         inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
         input_ids = inputs["input_ids"].to(device_obj)
+        attention_mask = inputs["attention_mask"].to(device_obj)
 
         generated_codes = []
         for _ in range(num_samples_per_task):
             with torch.no_grad():
                 output_ids = model.generate(
                     input_ids,
+                    attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature if temperature > 0 else 1.0,
                     do_sample=(temperature > 0),

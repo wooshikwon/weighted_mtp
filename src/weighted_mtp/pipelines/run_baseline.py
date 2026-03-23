@@ -390,6 +390,11 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
     td_stats_ema = None
 
     if weight_mode in ("critic", "shuffled"):
+        if not hasattr(config.models, "value_model") or not hasattr(config.models.value_model, "checkpoint_path"):
+            raise ValueError(
+                f"weight_mode='{weight_mode}' requires config.models.value_model.checkpoint_path, "
+                "but it is not defined in the config."
+            )
         value_checkpoint_path = config.models.value_model.checkpoint_path
         logger.info(f"Loading Value Model from: {value_checkpoint_path}")
 
@@ -533,10 +538,15 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
 
     # Fractional epoch 처리
     total_batches = len(train_loader)
-    batches_to_run = int(total_batches * n_epochs)
+    batches_to_run = max(1, int(total_batches * n_epochs))
 
     # Gradient accumulation
     accumulation_counter = 0
+    grad_clip_stats = {
+        "grad_norm_pre_clip": 0.0,
+        "grad_norm_post_clip": 0.0,
+        "grad_clip_ratio": 1.0,
+    }
     gradient_accumulation_steps = config.training.gradient_accumulation_steps
 
     total_optimization_steps = (batches_to_run + gradient_accumulation_steps - 1) // gradient_accumulation_steps
@@ -738,6 +748,15 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
                     model,
                     config.training.max_grad_norm,
                 )
+            else:
+                from weighted_mtp.utils.metrics_utils import compute_gradient_norm
+
+                grad_norm_dict = compute_gradient_norm(model)
+                grad_clip_stats = {
+                    "grad_norm_pre_clip": grad_norm_dict["grad_norm"],
+                    "grad_norm_post_clip": grad_norm_dict["grad_norm"],
+                    "grad_clip_ratio": 1.0,
+                }
 
             optimizer.step()
             if scheduler is not None:

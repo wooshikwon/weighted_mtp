@@ -108,6 +108,7 @@ def save_checkpoint(
 def load_checkpoint_for_evaluation(
     checkpoint_path: Path,
     device: torch.device,
+    inference_only: bool = True,
     dtype: torch.dtype | None = None,
 ):
     """평가용 checkpoint 로드 (full 또는 LoRA checkpoint 자동 감지)
