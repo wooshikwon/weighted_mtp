@@ -334,17 +334,22 @@ def run_evaluation(
                 include_response_header=True,
             )
 
-        # Generate N samples using HuggingFace model.generate()
+        # Generate N samples using HuggingFace model.generate() (batched)
         inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
         input_ids = inputs["input_ids"].to(device_obj)
         attention_mask = inputs["attention_mask"].to(device_obj)
+        prompt_len = input_ids.shape[1]
 
         generated_codes = []
-        for _ in range(num_samples_per_task):
+        gen_batch_size = min(5, num_samples_per_task)  # OOM 방지용 배치 크기
+        remaining = num_samples_per_task
+
+        while remaining > 0:
+            n = min(gen_batch_size, remaining)
             with torch.no_grad():
                 output_ids = model.generate(
-                    input_ids,
-                    attention_mask=attention_mask,
+                    input_ids.expand(n, -1),
+                    attention_mask=attention_mask.expand(n, -1),
                     max_new_tokens=max_new_tokens,
                     temperature=temperature if temperature > 0 else 1.0,
                     do_sample=(temperature > 0),
@@ -352,11 +357,12 @@ def run_evaluation(
                     num_return_sequences=1,
                     pad_token_id=tokenizer.pad_token_id,
                 )
-
-            # Decode only the generated part (exclude prompt)
-            generated_ids = output_ids[0, input_ids.shape[1]:]
-            generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-            generated_codes.append(generated_text)
+            # Decode each sample (exclude prompt)
+            for i in range(n):
+                generated_ids = output_ids[i, prompt_len:]
+                generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                generated_codes.append(generated_text)
+            remaining -= n
 
         # Execute and check (데이터셋별 분기)
         task_results = []
