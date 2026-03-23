@@ -1,7 +1,7 @@
 """Value Loss 유틸리티
 
 Pairwise Ranking Loss 및 MC MSE Loss 계산
-run_critic, run_verifiable에서 공통 사용
+run_critic, run_baseline에서 공통 사용
 """
 
 import torch

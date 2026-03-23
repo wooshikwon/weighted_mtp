@@ -5,7 +5,7 @@ Parameter groups 분리 (trunk/value_head)
 """
 
 import logging
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
 
 import torch
 from torch.optim.lr_scheduler import (
@@ -15,14 +15,11 @@ from torch.optim.lr_scheduler import (
     LRScheduler,
 )
 
-if TYPE_CHECKING:
-    from weighted_mtp.models.meta_mtp.adapter import MetaLlamaMTPAdapter
-
 logger = logging.getLogger(__name__)
 
 
 def create_param_groups(
-    adapter: "MetaLlamaMTPAdapter",
+    adapter: torch.nn.Module,
     trunk_lr: float,
     value_head_lr: float,
 ) -> list[dict]:
@@ -32,7 +29,7 @@ def create_param_groups(
     LoRA 미사용 시 모든 trainable transformer 파라미터 포함.
 
     Args:
-        adapter: MetaLlamaMTPAdapter 인스턴스
+        adapter: torch.nn.Module 인스턴스
         trunk_lr: Trunk (transformer 또는 LoRA) peak learning rate
         value_head_lr: Value head peak learning rate
 

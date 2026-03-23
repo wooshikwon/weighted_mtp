@@ -2,6 +2,7 @@
 
 import pytest
 from pathlib import Path
+from unittest.mock import patch
 from omegaconf import OmegaConf
 
 from weighted_mtp.utils.config_utils import (
@@ -14,7 +15,8 @@ from weighted_mtp.utils.config_utils import (
 class TestValidateConfigBasic:
     """기본 config 검증 테스트"""
 
-    def test_valid_baseline_config(self, project_root: Path):
+    @patch("pathlib.Path.exists", return_value=True)
+    def test_valid_baseline_config(self, mock_exists, project_root: Path):
         """유효한 baseline config 검증 통과"""
         config_path = project_root / "configs" / "local" / "baseline_local.yaml"
         config = OmegaConf.load(config_path)
@@ -22,9 +24,10 @@ class TestValidateConfigBasic:
         # 검증 통과 (예외 없음)
         validate_config(config)
 
-    def test_valid_verifiable_config(self, project_root: Path):
+    @patch("pathlib.Path.exists", return_value=True)
+    def test_valid_verifiable_config(self, mock_exists, project_root: Path):
         """유효한 verifiable config 검증 통과"""
-        config_path = project_root / "configs" / "production" / "verifiable_pairwise.yaml"
+        config_path = project_root / "configs" / "production" / "verifiable.yaml"
         config = OmegaConf.load(config_path)
 
         # 검증 통과 (예외 없음)
@@ -298,7 +301,8 @@ class TestValidateStageSpecific:
 class TestLoadAndValidateConfig:
     """load_and_validate_config() 함수 테스트"""
 
-    def test_load_valid_config(self, project_root: Path):
+    @patch("pathlib.Path.exists", return_value=True)
+    def test_load_valid_config(self, mock_exists, project_root: Path):
         """유효한 config 로드 및 검증"""
         config_path = project_root / "configs" / "local" / "baseline_local.yaml"
         config = load_and_validate_config(str(config_path))
@@ -351,7 +355,8 @@ class TestValidateConfigPathChecks:
         with pytest.raises(ConfigValidationError, match="모델 경로가 존재하지 않음"):
             validate_config(config)
 
-    def test_checkpoint_path_skipped(self):
+    @patch("pathlib.Path.exists", return_value=True)
+    def test_checkpoint_path_skipped(self, mock_exists):
         """Checkpoint 경로는 검증 건너뜀"""
         config = OmegaConf.create(
             {

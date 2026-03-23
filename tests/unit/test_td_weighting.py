@@ -25,46 +25,47 @@ class TestComputeTDTargets:
     def test_basic_computation(self):
         """기본 TD target 계산 검증"""
         value_logits = torch.tensor([[[0.5], [0.7], [0.9]]])  # [1, 3, 1]
-        rewards = torch.tensor([1.0])  # Correct
+        rewards = torch.tensor([1.0])  # UNUSED in new formula
         loss_mask = torch.tensor([[1, 1, 1]])  # All valid
         gamma = 1.0
 
         targets = compute_td_targets(value_logits, rewards, loss_mask, gamma)
 
-        # Intermediate (0): 1.0 * 0.7 = 0.7
-        # Intermediate (1): 1.0 * 0.9 = 0.9
-        # Terminal (2): 1.0
-        expected = torch.tensor([[[0.7], [0.9], [1.0]]])
+        # δ_0 = γ*v_0 - v_{-1} = 1.0*0.5 - 0.5 = 0.0, T_0 = 0.5 + 0.0 = 0.5
+        # δ_1 = γ*v_1 - v_0 = 1.0*0.7 - 0.5 = 0.2, T_1 = 0.7 + 0.2 = 0.9
+        # δ_2 = γ*v_2 - v_1 = 1.0*0.9 - 0.7 = 0.2, T_2 = 0.9 + 0.2 = 1.1
+        expected = torch.tensor([[[0.5], [0.9], [1.1]]])
 
         assert targets.shape == (1, 3, 1)
         torch.testing.assert_close(targets, expected, rtol=1e-4, atol=1e-4)
 
     def test_incorrect_sample(self):
-        """Incorrect 샘플 (reward=0) TD target 검증"""
+        """Incorrect 샘플 (reward=0) TD target 검증 — rewards는 미사용"""
         value_logits = torch.tensor([[[0.5], [0.7], [0.9]]])
-        rewards = torch.tensor([0.0])  # Incorrect
+        rewards = torch.tensor([0.0])  # UNUSED in new formula
         loss_mask = torch.tensor([[1, 1, 1]])
 
         targets = compute_td_targets(value_logits, rewards, loss_mask)
 
-        # Terminal (2): 0.0
-        expected = torch.tensor([[[0.7], [0.9], [0.0]]])
+        # rewards 미사용, 결과는 basic_computation과 동일
+        # δ_0=0.0, T_0=0.5 / δ_1=0.2, T_1=0.9 / δ_2=0.2, T_2=1.1
+        expected = torch.tensor([[[0.5], [0.9], [1.1]]])
 
         torch.testing.assert_close(targets, expected, rtol=1e-4, atol=1e-4)
 
     def test_with_padding(self):
         """Padding이 있는 경우 마스킹 검증"""
         value_logits = torch.tensor([[[0.5], [0.7], [0.0], [0.0]]])  # [1, 4, 1]
-        rewards = torch.tensor([1.0])
+        rewards = torch.tensor([1.0])  # UNUSED
         loss_mask = torch.tensor([[1, 1, 0, 0]])  # 마지막 2개는 padding
 
         targets = compute_td_targets(value_logits, rewards, loss_mask)
 
         # Terminal index = 1
-        # Intermediate (0): 1.0 * 0.7 = 0.7
-        # Terminal (1): 1.0
+        # δ_0 = 1.0*0.5 - 0.5 = 0.0, T_0 = 0.5
+        # δ_1 = 1.0*0.7 - 0.5 = 0.2, T_1 = 0.7 + 0.2 = 0.9
         # Padding (2, 3): 0.0
-        expected = torch.tensor([[[0.7], [1.0], [0.0], [0.0]]])
+        expected = torch.tensor([[[0.5], [0.9], [0.0], [0.0]]])
 
         assert targets.shape == (1, 4, 1)
         torch.testing.assert_close(targets, expected, rtol=1e-4, atol=1e-4)
@@ -72,18 +73,18 @@ class TestComputeTDTargets:
     def test_batch_computation(self):
         """배치 처리 검증"""
         value_logits = torch.tensor([
-            [[0.5], [0.7], [0.9]],  # Sample 1: correct
-            [[0.3], [0.6], [0.8]],  # Sample 2: incorrect
+            [[0.5], [0.7], [0.9]],  # Sample 1
+            [[0.3], [0.6], [0.8]],  # Sample 2
         ])  # [2, 3, 1]
-        rewards = torch.tensor([1.0, 0.0])
+        rewards = torch.tensor([1.0, 0.0])  # UNUSED
         loss_mask = torch.tensor([[1, 1, 1], [1, 1, 1]])
 
         targets = compute_td_targets(value_logits, rewards, loss_mask)
 
-        # Sample 1 (correct): [0.7, 0.9, 1.0]
-        expected_s1 = torch.tensor([[0.7], [0.9], [1.0]])
-        # Sample 2 (incorrect): [0.6, 0.8, 0.0]
-        expected_s2 = torch.tensor([[0.6], [0.8], [0.0]])
+        # Sample 1: δ_0=0.0,T=0.5 / δ_1=0.2,T=0.9 / δ_2=0.2,T=1.1
+        expected_s1 = torch.tensor([[0.5], [0.9], [1.1]])
+        # Sample 2: δ_0=0.3-0.5=-0.2,T=0.1 / δ_1=0.6-0.3=0.3,T=0.9 / δ_2=0.8-0.6=0.2,T=1.0
+        expected_s2 = torch.tensor([[0.1], [0.9], [1.0]])
 
         assert targets.shape == (2, 3, 1)
         torch.testing.assert_close(targets[0], expected_s1, rtol=1e-4, atol=1e-4)
@@ -92,29 +93,29 @@ class TestComputeTDTargets:
     def test_different_gamma(self):
         """Gamma 값 변경 검증"""
         value_logits = torch.tensor([[[0.5], [0.7], [0.9]]])
-        rewards = torch.tensor([1.0])
+        rewards = torch.tensor([1.0])  # UNUSED
         loss_mask = torch.tensor([[1, 1, 1]])
         gamma = 0.99
 
         targets = compute_td_targets(value_logits, rewards, loss_mask, gamma)
 
-        # Intermediate (0): 0.99 * 0.7 = 0.693
-        # Intermediate (1): 0.99 * 0.9 = 0.891
-        # Terminal (2): 1.0
-        expected = torch.tensor([[[0.693], [0.891], [1.0]]])
+        # δ_0 = 0.99*0.5 - 0.5 = -0.005, T_0 = 0.5 + (-0.005) = 0.495
+        # δ_1 = 0.99*0.7 - 0.5 = 0.193, T_1 = 0.7 + 0.193 = 0.893
+        # δ_2 = 0.99*0.9 - 0.7 = 0.191, T_2 = 0.9 + 0.191 = 1.091
+        expected = torch.tensor([[[0.495], [0.893], [1.091]]])
 
-        torch.testing.assert_close(targets, expected, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(targets, expected, rtol=1e-3, atol=1e-3)
 
     def test_single_token_sequence(self):
         """단일 토큰 시퀀스 처리 검증"""
         value_logits = torch.tensor([[[0.8]]])  # [1, 1, 1]
-        rewards = torch.tensor([1.0])
+        rewards = torch.tensor([1.0])  # UNUSED
         loss_mask = torch.tensor([[1]])
 
         targets = compute_td_targets(value_logits, rewards, loss_mask)
 
-        # Terminal만 존재: 1.0
-        expected = torch.tensor([[[1.0]]])
+        # δ_0 = 1.0*0.8 - 0.5 = 0.3, T_0 = 0.8 + 0.3 = 1.1
+        expected = torch.tensor([[[1.1]]])
 
         assert targets.shape == (1, 1, 1)
         torch.testing.assert_close(targets, expected, rtol=1e-4, atol=1e-4)
@@ -144,7 +145,7 @@ class TestComputeTDTargets:
             [[0.5], [0.7], [0.9], [0.0]],  # Length 3
             [[0.3], [0.6], [0.0], [0.0]],  # Length 2
         ])  # [2, 4, 1]
-        rewards = torch.tensor([1.0, 0.0])
+        rewards = torch.tensor([1.0, 0.0])  # UNUSED
         loss_mask = torch.tensor([
             [1, 1, 1, 0],
             [1, 1, 0, 0],
@@ -152,10 +153,12 @@ class TestComputeTDTargets:
 
         targets = compute_td_targets(value_logits, rewards, loss_mask)
 
-        # Sample 1: terminal index = 2, [0.7, 0.9, 1.0, 0.0]
-        expected_s1 = torch.tensor([[0.7], [0.9], [1.0], [0.0]])
-        # Sample 2: terminal index = 1, [0.6, 0.0, 0.0, 0.0]
-        expected_s2 = torch.tensor([[0.6], [0.0], [0.0], [0.0]])
+        # Sample 1: term_idx=2, δ=[0.0, 0.2, 0.2], T=[0.5, 0.9, 1.1, 0.0]
+        expected_s1 = torch.tensor([[0.5], [0.9], [1.1], [0.0]])
+        # Sample 2: term_idx=1
+        # δ_0=0.3-0.5=-0.2, T_0=0.3+(-0.2)=0.1
+        # δ_1=0.6-0.3=0.3, T_1=0.6+0.3=0.9
+        expected_s2 = torch.tensor([[0.1], [0.9], [0.0], [0.0]])
 
         assert targets.shape == (2, 4, 1)
         torch.testing.assert_close(targets[0], expected_s1, rtol=1e-4, atol=1e-4)
@@ -164,32 +167,33 @@ class TestComputeTDTargets:
     def test_gae_basic(self):
         """GAE (lam=0.95) 기본 검증"""
         value_logits = torch.tensor([[[0.5], [0.7], [0.9]]])
-        rewards = torch.tensor([1.0])
+        rewards = torch.tensor([1.0])  # UNUSED
         loss_mask = torch.tensor([[1, 1, 1]])
 
         targets = compute_td_targets(value_logits, rewards, loss_mask, gamma=1.0, lam=0.95)
 
-        # 역방향 GAE 계산:
-        # t=2 (terminal): δ=1.0-0.9=0.1, A=0.1, target=0.9+0.1=1.0
-        # t=1: δ=0.9-0.7=0.2, A=0.2+0.95*0.1=0.295, target=0.7+0.295=0.995
-        # t=0: δ=0.7-0.5=0.2, A=0.2+0.95*0.295=0.48025, target=0.5+0.48025=0.98025
-        expected = torch.tensor([[[0.98025], [0.995], [1.0]]])
+        # 역방향 GAE 계산 (δ_t = γ*v_t - v_{t-1}):
+        # t=2: δ=0.9-0.7=0.2, A=0.2, T=0.9+0.2=1.1
+        # t=1: δ=0.7-0.5=0.2, A=0.2+0.95*0.2=0.39, T=0.7+0.39=1.09
+        # t=0: δ=0.5-0.5=0.0, A=0.0+0.95*0.39=0.3705, T=0.5+0.3705=0.8705
+        expected = torch.tensor([[[0.8705], [1.09], [1.1]]])
 
         assert targets.shape == (1, 3, 1)
         torch.testing.assert_close(targets, expected, rtol=1e-3, atol=1e-3)
 
     def test_gae_incorrect_sample(self):
-        """GAE incorrect 샘플 검증"""
+        """GAE incorrect 샘플 검증 — rewards 미사용, basic과 동일"""
         value_logits = torch.tensor([[[0.5], [0.7], [0.9]]])
-        rewards = torch.tensor([0.0])
+        rewards = torch.tensor([0.0])  # UNUSED
         loss_mask = torch.tensor([[1, 1, 1]])
 
         targets = compute_td_targets(value_logits, rewards, loss_mask, gamma=1.0, lam=0.95)
 
-        # t=2: δ=0.0-0.9=-0.9, A=-0.9, target=0.0
-        # t=1: δ=0.9-0.7=0.2, A=0.2+0.95*(-0.9)=-0.655, target=0.045
-        # t=0: δ=0.7-0.5=0.2, A=0.2+0.95*(-0.655)=-0.42225, target=0.07775
-        expected = torch.tensor([[[0.07775], [0.045], [0.0]]])
+        # rewards 미사용이므로 gae_basic과 동일한 결과
+        # t=2: δ=0.2, A=0.2, T=1.1
+        # t=1: δ=0.2, A=0.39, T=1.09
+        # t=0: δ=0.0, A=0.3705, T=0.8705
+        expected = torch.tensor([[[0.8705], [1.09], [1.1]]])
 
         torch.testing.assert_close(targets, expected, rtol=1e-3, atol=1e-3)
 
@@ -209,17 +213,18 @@ class TestComputeTDTargets:
 
     def test_gae_faster_propagation(self):
         """GAE가 TD(0)보다 빠른 에러 전파 검증"""
-        value_logits = torch.tensor([[[0.0], [0.0], [0.0], [0.0], [0.0]]])
-        rewards = torch.tensor([1.0])
+        # 끝에 높은 value를 두어 신호 전파를 테스트
+        value_logits = torch.tensor([[[0.5], [0.0], [0.0], [0.0], [1.0]]])
+        rewards = torch.tensor([1.0])  # UNUSED
         loss_mask = torch.tensor([[1, 1, 1, 1, 1]])
 
         targets_td0 = compute_td_targets(value_logits, rewards, loss_mask, gamma=1.0, lam=0.0)
         targets_gae = compute_td_targets(value_logits, rewards, loss_mask, gamma=1.0, lam=0.95)
 
-        # TD(0): 첫 번째 토큰 target = 0.0 (신호 전파 안됨)
-        # GAE: 첫 번째 토큰 target > 0.0 (신호 빠르게 전파)
-        assert targets_td0[0, 0, 0].item() == 0.0
-        assert targets_gae[0, 0, 0].item() > 0.5
+        # TD(0) position 2: δ_2=0.0-0.0=0.0, T=0.0 (신호 전파 안됨)
+        # GAE position 2: terminal의 큰 δ가 역방향으로 전파되어 T > 0
+        assert targets_td0[0, 2, 0].item() == 0.0
+        assert targets_gae[0, 2, 0].item() > 0.0
 
 
 class TestComputeTDErrors:

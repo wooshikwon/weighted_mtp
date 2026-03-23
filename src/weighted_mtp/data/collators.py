@@ -4,7 +4,6 @@
 - Alpaca 템플릿 적용 (instruction + input + output)
 - Instruction/Input 부분은 loss 계산에서 제외 (labels = -100)
 - Output 부분만 학습 대상
-- MTP 지원 (n_future_tokens=4)
 """
 
 from dataclasses import dataclass
@@ -67,7 +66,6 @@ class AlpacaDataCollator:
     Args:
         tokenizer: HuggingFace PreTrainedTokenizer
         max_length: 최대 시퀀스 길이 (기본 2048)
-        n_future_tokens: MTP 미래 토큰 수 (기본 4)
         padding: Padding 전략 ("max_length" 또는 "longest")
 
     Examples:
@@ -92,7 +90,6 @@ class AlpacaDataCollator:
 
     tokenizer: PreTrainedTokenizer
     max_length: int = 2048
-    n_future_tokens: int = 4
     padding: str = "max_length"
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:

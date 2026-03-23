@@ -26,9 +26,6 @@ from weighted_mtp.utils.evaluation_utils import (
     strip_markdown_code_block,
     truncate_at_stop_sequences,
 )
-from weighted_mtp.utils.generation_utils import (
-    generate_with_mtp,
-)
 from weighted_mtp.utils.metrics_utils import (
     GPUMonitor,
     ThroughputTracker,
@@ -75,8 +72,7 @@ from weighted_mtp.utils.pairwise_utils import (
     pairwise_ranking_loss,
 )
 from weighted_mtp.utils.loss_utils import (
-    compute_mtp_ce_loss,
-    compute_mtp_ce_loss_unweighted,
+    compute_weighted_ntp_loss,
 )
 
 __all__ = [
@@ -101,8 +97,6 @@ __all__ = [
     "postprocess_humaneval_completion",
     "strip_markdown_code_block",
     "truncate_at_stop_sequences",
-    # Generation utils
-    "generate_with_mtp",
     # Metrics utils
     "GPUMonitor",
     "ThroughputTracker",
@@ -135,8 +129,7 @@ __all__ = [
     "compute_lambda_return",
     "compute_lambda_value_loss",
     "compute_mc_value_loss",
-    "compute_mtp_ce_loss",
-    "compute_mtp_ce_loss_unweighted",
+    "compute_weighted_ntp_loss",
     "compute_pairwise_accuracy",
     "compute_position_correlation",
     "compute_td_error_stats",

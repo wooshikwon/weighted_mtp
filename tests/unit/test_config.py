@@ -10,7 +10,6 @@ import yaml
     [
         "configs/production/baseline.yaml",
         "configs/production/verifiable.yaml",
-        "configs/production/rho1.yaml",
     ],
 )
 def test_load_stage_configs(project_root: Path, config_path: str):

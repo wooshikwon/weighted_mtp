@@ -79,12 +79,10 @@ class TestAlpacaDataCollator:
         collator = AlpacaDataCollator(
             tokenizer=tokenizer,
             max_length=2048,
-            n_future_tokens=4,
             padding="max_length",
         )
 
         assert collator.max_length == 2048
-        assert collator.n_future_tokens == 4
         assert collator.padding == "max_length"
 
     def test_single_sample_masking(self, tokenizer):

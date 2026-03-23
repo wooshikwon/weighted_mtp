@@ -97,19 +97,9 @@ def main():
 
         run_critic_training(config=config)
 
-    elif stage == "verifiable":
-        from weighted_mtp.pipelines.run_verifiable import run_verifiable_training
-
-        run_verifiable_training(config=config)
-
-    elif stage == "rho1":
-        from weighted_mtp.pipelines.run_rho1 import run_rho1_training
-
-        run_rho1_training(config=config)
-
     else:
         logger.error(f"Unknown stage: {stage}")
-        logger.error("Available stages: baseline, critic, verifiable, rho1")
+        logger.error("Available stages: baseline, critic")
         sys.exit(1)
 
 

@@ -31,7 +31,7 @@ def save_checkpoint(
     실제 파일 저장 및 S3 업로드는 rank 0만 수행합니다.
 
     Args:
-        adapter: MetaLlamaMTPAdapter (FSDP-wrapped 또는 일반 모델)
+        adapter: torch.nn.Module (FSDP-wrapped 또는 일반 모델)
         optimizer: torch.optim.Optimizer
         epoch: 현재 epoch (fractional epoch 지원)
         train_metrics: Training metrics
@@ -108,25 +108,22 @@ def save_checkpoint(
 def load_checkpoint_for_evaluation(
     checkpoint_path: Path,
     device: torch.device,
-    inference_only: bool = True,
     dtype: torch.dtype | None = None,
 ):
     """평가용 checkpoint 로드 (full 또는 LoRA checkpoint 자동 감지)
 
     checkpoint_type에 따라 적절한 방식으로 모델을 로드합니다.
     - "full": 전체 adapter_state_dict 로드
-    - "lora": base model 로드 후 LoRA + extra_heads 적용
+    - "lora": base model 로드 후 LoRA 적용
 
     Args:
         checkpoint_path: Checkpoint 파일 경로
         device: torch.device
-        inference_only: True면 extra_heads, value_head 로드 스킵 (메모리 절약 ~1.2GB)
-                       평가/추론 시에는 head 0만 사용하므로 True 권장
         dtype: 모델 dtype 지정 (None이면 원본 유지, MPS는 bfloat16 미지원으로 float16 권장)
 
     Returns:
         (model, checkpoint_metadata)
-        - model: MetaLlamaMTPAdapter (eval 모드)
+        - model: torch.nn.Module (eval 모드)
         - checkpoint_metadata: {
             "epoch": float,
             "config": dict,  # 학습 설정 (모델 경로 등)
@@ -138,7 +135,6 @@ def load_checkpoint_for_evaluation(
         KeyError: checkpoint에 필수 키가 없음
 
     Examples:
-        >>> # 기본 사용 (inference_only=True, 메모리 최적화)
         >>> model, metadata = load_checkpoint_for_evaluation(
         ...     checkpoint_path=Path("storage/checkpoints/baseline/checkpoint_best.pt"),
         ...     device=torch.device("cpu"),
@@ -150,10 +146,13 @@ def load_checkpoint_for_evaluation(
         ...     dtype=torch.float16,  # MPS는 bfloat16 미지원
         ... )
     """
+    from transformers import AutoModelForCausalLM, AutoConfig
+    from weighted_mtp.models.lora import apply_lora_to_hf_model, load_hf_lora_state_dict
+
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint 파일이 존재하지 않습니다: {checkpoint_path}")
 
-    # Checkpoint 로드
+    # 1. Checkpoint 파일 로드
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     logger.info(f"Checkpoint 로드 완료: {checkpoint_path}")
 
@@ -161,62 +160,36 @@ def load_checkpoint_for_evaluation(
     checkpoint_type = checkpoint.get("checkpoint_type", "full")
     logger.info(f"Checkpoint 타입: {checkpoint_type}")
 
-    # Config 정보 추출
+    # 2. Config 정보 추출
     config_info = checkpoint.get("config", {})
     if not config_info:
-        config_info = {"model": {"path": "storage/models/meta-llama-mtp"}}
+        config_info = {"model": {"path": "meta-llama/Meta-Llama-3-8B"}}
         logger.warning(
             f"Checkpoint에 config 정보가 없습니다. 기본값 사용: {config_info['model']['path']}"
         )
 
-    from weighted_mtp.models.meta_mtp.adapter import MetaLlamaMTPAdapter
+    model_path = config_info["model"]["path"]
+
+    # 3. Base HuggingFace 모델 로드
+    model_config = AutoConfig.from_pretrained(model_path)
+    model_config._attn_implementation = "sdpa"
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=model_config,
+        torch_dtype=dtype or torch.bfloat16,
+        low_cpu_mem_usage=True,
+        attn_implementation="sdpa",
+    )
 
     if checkpoint_type == "lora":
-        # LoRA checkpoint: base model 로드 후 학습된 파라미터 적용
+        # 4. LoRA checkpoint: LoRA 적용 후 학습된 파라미터 로드
         lora_config = checkpoint.get("lora_config")
-
-        model = MetaLlamaMTPAdapter.from_pretrained(
-            model_path=config_info["model"]["path"],
-            device=device,
-            use_lora=True,
-            lora_config=lora_config,
-        )
-
-        # LoRA 파라미터 적용 (필수)
-        current_state_dict = model.state_dict()
-
-        for key, value in checkpoint.get("lora_state_dict", {}).items():
-            if key in current_state_dict:
-                current_state_dict[key] = value
-
-        # extra_heads, value_head 적용 (inference_only=False일 때만)
-        skipped_params = 0
-        if not inference_only:
-            for key, value in checkpoint.get("extra_heads_state_dict", {}).items():
-                if key in current_state_dict:
-                    current_state_dict[key] = value
-
-            for key, value in checkpoint.get("value_head_state_dict", {}).items():
-                if key in current_state_dict:
-                    current_state_dict[key] = value
-        else:
-            # 스킵된 파라미터 수 계산 (로깅용)
-            extra_heads_params = sum(
-                v.numel() for v in checkpoint.get("extra_heads_state_dict", {}).values()
-            )
-            value_head_params = sum(
-                v.numel() for v in checkpoint.get("value_head_state_dict", {}).values()
-            )
-            skipped_params = extra_heads_params + value_head_params
-            if skipped_params > 0:
-                skipped_mb = skipped_params * 2 / 1024 / 1024  # bfloat16 기준
-                logger.info(f"inference_only=True: extra_heads/value_head 스킵 ({skipped_params:,} params, ~{skipped_mb:.0f}MB 절약)")
-
-        model.load_state_dict(current_state_dict)
+        model = apply_lora_to_hf_model(model, lora_config)
+        load_hf_lora_state_dict(model, checkpoint.get("lora_state_dict", {}))
         logger.info("LoRA checkpoint 적용 완료")
 
     else:
-        # Full checkpoint: 전체 adapter_state_dict 로드
+        # 5. Full checkpoint: 전체 adapter_state_dict 로드
         required_keys = ["adapter_state_dict", "epoch", "val_metrics"]
         missing_keys = [k for k in required_keys if k not in checkpoint]
         if missing_keys:
@@ -225,19 +198,14 @@ def load_checkpoint_for_evaluation(
                 f"사용 가능한 키: {list(checkpoint.keys())}"
             )
 
-        model = MetaLlamaMTPAdapter.from_pretrained(
-            model_path=config_info["model"]["path"],
-            device=device,
-        )
         model.load_state_dict(checkpoint["adapter_state_dict"])
         logger.info("Full checkpoint 적용 완료")
 
-    model.eval()
+    # Device 이동
+    if device.type != "cpu":
+        model = model.to(device)
 
-    # dtype 변환 (MPS는 bfloat16 미지원, float16 사용 권장)
-    if dtype is not None:
-        model = model.to(dtype=dtype)
-        logger.info(f"모델 dtype 변환: {dtype}")
+    model.eval()
 
     # Metadata 구성
     checkpoint_metadata = {
@@ -308,7 +276,7 @@ def save_lora_checkpoint(
     - 전체 모델을 rank 0에 모으지 않아 OOM 방지
 
     Args:
-        adapter: MetaLlamaMTPAdapter (FSDP-wrapped 또는 일반 모델, LoRA 적용됨)
+        adapter: torch.nn.Module (FSDP-wrapped 또는 일반 모델, LoRA 적용됨)
         optimizer: torch.optim.Optimizer
         epoch: 현재 epoch (fractional epoch 지원)
         train_metrics: Training metrics
@@ -434,7 +402,7 @@ def _extract_trainable_params_fsdp(
     전체 모델을 rank 0에 모으지 않아 OOM 방지.
 
     Args:
-        adapter: FSDP-wrapped MetaLlamaMTPAdapter
+        adapter: FSDP-wrapped model
         save_value_head: Value head 포함 여부
 
     Returns:
@@ -714,7 +682,7 @@ def load_lora_checkpoint(
     - value_head 파라미터 (선택적)
 
     Args:
-        adapter: MetaLlamaMTPAdapter (LoRA가 적용된 상태)
+        adapter: torch.nn.Module (LoRA가 적용된 상태)
         checkpoint_path: LoRA checkpoint 경로
         device: torch.device
         load_value_head: Value head도 함께 로드할지 여부
