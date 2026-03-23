@@ -1,6 +1,6 @@
-"""Verifiable WMTP Weighting 단위 테스트
+"""Verifiable Weighting 단위 테스트
 
-TD error 기반 weight 계산 및 value/MTP head 시점 매핑 검증
+TD error 기반 weight 계산 및 value head 시점 매핑 검증
 """
 
 import pytest
@@ -112,20 +112,20 @@ class TestComputeTDTargets:
     def test_td0_targets(self):
         """TD(0) targets 검증 (lam=0)"""
         value_logits = torch.tensor([[[0.5], [0.7], [0.9]]])  # [1, 3, 1]
-        rewards = torch.tensor([1.0])
+        rewards = torch.tensor([1.0])  # UNUSED in new formula
         loss_mask = torch.tensor([[True, True, True]])
 
         td_targets = compute_td_targets(
             value_logits, rewards, loss_mask, gamma=1.0, lam=0.0
         )
 
-        # TD(0): Target_t = V(s_t) + δ_t = γV(s_{t+1})
-        # Position 0: 1.0 * 0.7 = 0.7
-        # Position 1: 1.0 * 0.9 = 0.9
-        # Position 2: R = 1.0
-        assert td_targets[0, 0, 0].item() == pytest.approx(0.7, rel=0.01)
+        # δ_t = γ*v_t - v_{t-1}, Target_t = v_t + δ_t
+        # Position 0: δ=0.5-0.5=0.0, T=0.5
+        # Position 1: δ=0.7-0.5=0.2, T=0.9
+        # Position 2: δ=0.9-0.7=0.2, T=1.1
+        assert td_targets[0, 0, 0].item() == pytest.approx(0.5, rel=0.01)
         assert td_targets[0, 1, 0].item() == pytest.approx(0.9, rel=0.01)
-        assert td_targets[0, 2, 0].item() == pytest.approx(1.0, rel=0.01)
+        assert td_targets[0, 2, 0].item() == pytest.approx(1.1, rel=0.01)
 
     def test_mc_targets(self):
         """Monte Carlo targets 검증 (lam=1)"""
@@ -183,14 +183,13 @@ class TestBuildWeights:
 
 
 class TestWeightMapping:
-    """Weight와 MTP head 매핑 테스트"""
+    """Weight와 position 매핑 테스트"""
 
     def test_weight_position_alignment(self):
-        """Weight가 position t에서 모든 head에 동일하게 적용되는지 검증
+        """Weight가 position t에서 올바르게 적용되는지 검증
 
         Weight[t]는 V(s_t)의 품질을 나타내므로,
-        position t에서 예측하는 모든 MTP head (t+1, t+2, t+3, t+4)에
-        동일한 weight가 적용되어야 함.
+        position t에서의 NTP loss에 해당 weight가 적용되어야 함.
         """
         batch_size = 1
         seq_len = 8

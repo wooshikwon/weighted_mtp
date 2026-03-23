@@ -34,7 +34,7 @@ def load_base_model_for_evaluation(
     Returns:
         (model, tokenizer, metadata, device_obj)
     """
-    from weighted_mtp.models.meta_mtp.adapter import MetaLlamaMTPAdapter
+    from transformers import AutoModelForCausalLM, AutoConfig
     from weighted_mtp.models.tokenizer_utils import load_tokenizer, resolve_tokenizer_path
 
     # Device 설정
@@ -60,17 +60,19 @@ def load_base_model_for_evaluation(
     if dtype_obj:
         logger.info(f"dtype: {dtype_obj}")
 
-    # Base 모델 로드 (LoRA 없이)
+    # Base 모델 로드 (HuggingFace)
     logger.info("Loading base model (no SFT)...")
-    model = MetaLlamaMTPAdapter.from_pretrained(
-        model_path=model_path,
-        device=device_obj,
-        use_lora=False,
+    model_config = AutoConfig.from_pretrained(model_path)
+    model_config._attn_implementation = "sdpa"
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=model_config,
+        torch_dtype=dtype_obj or torch.bfloat16,
+        low_cpu_mem_usage=True,
+        attn_implementation="sdpa",
     )
-
-    # dtype 변환
-    if dtype_obj is not None:
-        model = model.to(dtype_obj)
+    if device_obj.type != "cpu":
+        model = model.to(device_obj)
 
     model.eval()
 

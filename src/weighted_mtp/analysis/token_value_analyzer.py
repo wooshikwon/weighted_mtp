@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from transformers import PreTrainedTokenizer
 
-from weighted_mtp.models.meta_mtp.adapter import MetaLlamaMTPAdapter
+import torch.nn
 from weighted_mtp.data.collators import apply_alpaca_template
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,7 @@ class TokenValueAnalyzer:
 
     def __init__(
         self,
-        adapter: MetaLlamaMTPAdapter,
+        adapter: torch.nn.Module,
         tokenizer: PreTrainedTokenizer,
         device: torch.device,
     ):

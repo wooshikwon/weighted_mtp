@@ -1,18 +1,20 @@
-# NTP Baseline (Uniform Weighting)
-# LLaMA-3 8B LoRA, uniform token weights
+# NTP TAW (Token Advantage Weighting)
+# LLaMA-3 8B LoRA with Critic-based token weighting
 # Production config (VESSL H200 4-GPU)
 
 experiment:
-  name: ntp_baseline
+  name: ntp_taw
   stage: baseline
-  description: "NTP Baseline (uniform weights) - LLaMA-3 8B LoRA"
-  tags: [ntp, baseline, llama3-8b]
+  description: "NTP TAW (Token Advantage Weighting) - LLaMA-3 8B LoRA with Critic"
+  tags: [ntp, taw, llama3-8b, critic]
 
-# Model
+# Models
 models:
   policy:
     path: meta-llama/Meta-Llama-3-8B
     dtype: bfloat16
+  value_model:
+    checkpoint_path: storage/checkpoints/critic_llama3/checkpoint_final.pt
 
 # Dataset
 dataset:
@@ -34,7 +36,13 @@ data_sampling:
 
 # Training
 training:
-  weight_mode: uniform
+  weight_mode: critic
+  td_lambda: 0.95
+  beta: 1.0
+  weight_clip_min: 0.1
+  weight_clip_max: 3.0
+  td_ema_momentum: 0.1
+  td_ema_warmup_steps: 10
   n_epochs: 1.0
   batch_size: 12
   gradient_accumulation_steps: 2
@@ -65,7 +73,7 @@ distributed:
 
 # Checkpoint
 checkpoint:
-  save_dir: storage/checkpoints/ntp_baseline
+  save_dir: storage/checkpoints/ntp_taw
   save_checkpoint_every: 0.5
   save_final: true
 

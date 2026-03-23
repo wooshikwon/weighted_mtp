@@ -134,8 +134,7 @@ def test_unwrap_model_fsdp_wrapped(simple_model, device):
     if device.type == "cuda" and is_distributed():
         model = simple_model.to(device)
 
-        # TransformerBlock을 사용하지 않는 간단한 모델이므로
-        # auto_wrap_policy 없이 wrapping
+        # 간단한 모델이므로 auto_wrap_policy 없이 wrapping
         fsdp_model = FSDP(model, device_id=device.index)
 
         # Unwrap 후 원본 모델과 동일해야 함

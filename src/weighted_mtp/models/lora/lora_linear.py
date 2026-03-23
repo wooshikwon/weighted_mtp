@@ -19,7 +19,7 @@ class LoRALinear(nn.Module):
     """LoRA가 적용된 Linear 레이어
 
     원본 nn.Linear를 감싸서 low-rank adaptation 수행
-    FSDP와 호환되도록 설계 (TransformerBlock 내부에 위치)
+    FSDP와 호환되도록 설계 (Transformer layer 내부에 위치)
 
     Args:
         in_features: 입력 차원
@@ -168,7 +168,7 @@ def apply_lora_to_linear(
     target_names에 해당하는 nn.Linear를 LoRALinear로 교체
 
     Args:
-        module: 대상 모듈 (예: TransformerBlock)
+        module: 대상 모듈 (예: LlamaDecoderLayer)
         target_names: LoRA 적용할 Linear 이름 (예: ["wq", "wk", "wv", "wo"])
         rank: LoRA rank
         alpha: LoRA scaling factor
@@ -178,7 +178,7 @@ def apply_lora_to_linear(
         LoRA가 적용된 모듈 (in-place 수정)
 
     Example:
-        >>> block = TransformerBlock(layer_id=0, args=model_args)
+        >>> block = LlamaDecoderLayer(layer_id=0, args=model_args)
         >>> apply_lora_to_linear(block.attention, ["wq", "wk", "wv", "wo"], rank=8)
     """
     for name in target_names:

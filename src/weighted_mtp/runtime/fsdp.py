@@ -37,17 +37,7 @@ def _detect_transformer_layer_cls(model: torch.nn.Module) -> set:
     """
     from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
-    # HuggingFace LlamaForCausalLM 감지 (model.model.layers 구조)
-    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-        return {LlamaDecoderLayer}
-
-    # ValueModel 감지 (model.backbone.layers 구조, LlamaModel 기반)
-    if hasattr(model, 'backbone') and hasattr(model.backbone, 'layers'):
-        return {LlamaDecoderLayer}
-
-    # MetaLlamaMTPAdapter (기본)
-    from weighted_mtp.models.meta_mtp.transformer import TransformerBlock
-    return {TransformerBlock}
+    return {LlamaDecoderLayer}
 
 
 def wrap_model_fsdp(
@@ -62,7 +52,7 @@ def wrap_model_fsdp(
     """FSDP로 모델 래핑
 
     Distributed 환경에서만 FSDP 적용, MPS/CPU local test는 skip
-    MetaLlamaMTPAdapter와 HuggingFace LlamaForCausalLM 모두 지원
+    HuggingFace LlamaForCausalLM 및 ValueModel 지원
 
     Args:
         model: 원본 모델

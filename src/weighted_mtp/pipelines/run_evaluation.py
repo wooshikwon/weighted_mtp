@@ -24,7 +24,6 @@ from weighted_mtp.utils import (
     execute_code_with_tests,
     execute_codecontests_tests,
     execute_mbpp_tests,
-    generate_with_mtp,
     load_checkpoint_for_evaluation,
     postprocess_humaneval_completion,
 )
@@ -324,16 +323,27 @@ def run_evaluation(
                 include_response_header=True,
             )
 
-        # Generate N samples
-        generated_codes = generate_with_mtp(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            num_return_sequences=num_samples_per_task,
-            device=device_obj,
-        )
+        # Generate N samples using HuggingFace model.generate()
+        inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+        input_ids = inputs["input_ids"].to(device_obj)
+
+        generated_codes = []
+        for _ in range(num_samples_per_task):
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature if temperature > 0 else 1.0,
+                    do_sample=(temperature > 0),
+                    top_p=0.95 if temperature > 0 else 1.0,
+                    num_return_sequences=1,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+
+            # Decode only the generated part (exclude prompt)
+            generated_ids = output_ids[0, input_ids.shape[1]:]
+            generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            generated_codes.append(generated_text)
 
         # Execute and check (데이터셋별 분기)
         task_results = []
