@@ -11,7 +11,11 @@ import torch
 
 from weighted_mtp.core.env import ensure_env_loaded
 from weighted_mtp.core.logging import setup_logging
-from weighted_mtp.pipelines.run_evaluation import load_model_for_evaluation, run_evaluation
+from weighted_mtp.pipelines.run_evaluation import (
+    load_model_for_evaluation,
+    run_evaluation,
+    run_evalplus_evaluation,
+)
 
 # 환경변수 로드 (MLflow credentials 등)
 ensure_env_loaded()
@@ -108,6 +112,15 @@ def main():
         help="Base 모델 경로 (SFT 전 pure 모델 평가, 예: storage/models/meta-llama-mtp)",
     )
 
+    # Eval mode
+    parser.add_argument(
+        "--eval-mode",
+        type=str,
+        default="evalplus",
+        choices=["evalplus", "legacy"],
+        help="평가 모드 — evalplus: HumanEval(+)/MBPP(+) 학회 표준, legacy: 기존 커스텀 실행기 (기본: evalplus)",
+    )
+
     # Dataset
     parser.add_argument(
         "--dataset",
@@ -122,13 +135,13 @@ def main():
         "--num-samples",
         type=int,
         default=None,
-        help="문제당 생성 샘플 수 (기본: codecontests=20, 나머지=100)",
+        help="문제당 생성 샘플 수 (기본: evalplus=1 greedy, legacy=100)",
     )
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.2,
-        help="Sampling temperature (0=greedy, 기본: 0.2)",
+        default=None,
+        help="Sampling temperature (기본: evalplus=0.0 greedy, legacy=0.2)",
     )
     parser.add_argument(
         "--temperature-search",
@@ -163,6 +176,14 @@ def main():
         help="MLflow 로깅 비활성화",
     )
 
+    # Output
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="storage/eval_results",
+        help="결과 저장 디렉토리 (기본: storage/eval_results)",
+    )
+
     # Test parameters
     parser.add_argument(
         "--max-tasks",
@@ -173,12 +194,26 @@ def main():
 
     args = parser.parse_args()
 
-    # 데이터셋별 기본 샘플 수 설정
-    if args.num_samples is None:
-        if args.dataset == "codecontests":
-            args.num_samples = 10
-        else:
-            args.num_samples = 100
+    # eval-mode에 따른 기본값 설정
+    if args.eval_mode == "evalplus":
+        # evalplus: greedy Pass@1이 기본
+        if args.temperature is None:
+            args.temperature = 0.0
+        if args.num_samples is None:
+            args.num_samples = 1
+        # GSM8K, CodeContests는 evalplus 미지원 → legacy로 자동 전환
+        if args.dataset in ("gsm8k", "codecontests"):
+            logger.info(f"{args.dataset}은 evalplus 미지원 → legacy 모드로 전환")
+            args.eval_mode = "legacy"
+    else:
+        # legacy: 기존 기본값
+        if args.temperature is None:
+            args.temperature = 0.2
+        if args.num_samples is None:
+            if args.dataset == "codecontests":
+                args.num_samples = 10
+            else:
+                args.num_samples = 100
 
     # 모델 소스 확인 (checkpoint 또는 base-model)
     use_base_model = args.base_model is not None
@@ -211,6 +246,7 @@ def main():
         logger.info(f"Dataset: {args.dataset}")
         logger.info(f"Temperature: {args.temperature}")
 
+    logger.info(f"Eval mode: {args.eval_mode}")
     logger.info(f"Samples per task: {args.num_samples}")
     logger.info(f"Max tokens: {args.max_tokens}")
     logger.info(f"Device: {args.device}")
@@ -219,9 +255,7 @@ def main():
 
     # Run evaluation
     try:
-        all_results = []
-
-        # 모델을 한 번만 로드하고 여러 temperature에서 재사용
+        # 모델을 한 번만 로드
         if use_base_model:
             model, tokenizer, checkpoint_metadata, device_obj = load_base_model_for_evaluation(
                 model_path=args.base_model,
@@ -235,68 +269,93 @@ def main():
                 dtype=args.dtype,
             )
 
-        for temp in temperatures:
-            if len(temperatures) > 1:
-                logger.info(f"\n--- Temperature {temp} 평가 시작 ---")
-
-            results = run_evaluation(
-                checkpoint_path=model_source,
-                dataset_name=args.dataset,
-                num_samples_per_task=args.num_samples,
-                temperature=temp,
-                max_new_tokens=args.max_tokens,
-                device=args.device,
-                dtype=args.dtype,
-                mlflow_enabled=not args.no_mlflow,
-                max_tasks=args.max_tasks,
+        # EvalPlus 모드: HumanEval(+)/MBPP(+)
+        if args.eval_mode == "evalplus":
+            results = run_evalplus_evaluation(
                 model=model,
                 tokenizer=tokenizer,
                 checkpoint_metadata=checkpoint_metadata,
                 device_obj=device_obj,
+                dataset_name=args.dataset,
+                num_samples=args.num_samples,
+                temperature=args.temperature,
+                max_new_tokens=args.max_tokens,
+                output_dir=args.output_dir,
+                max_tasks=args.max_tasks,
             )
-            results["temperature"] = temp
-            all_results.append(results)
 
-        # Temperature Search 결과 출력
-        if len(temperatures) > 1:
+            # EvalPlus 결과 출력
             print("\n" + "=" * 60)
-            print("Temperature Search 결과")
+            print(f"EvalPlus Results ({args.dataset})")
+            print("=" * 60)
+            if results.get("pass_at_k"):
+                for k, v in results["pass_at_k"].items():
+                    print(f"{args.dataset} (base): {k} = {v:.2%}")
+            if results.get("evalplus"):
+                for k, v in results["evalplus"].items():
+                    print(f"{k} = {v:.2%}")
+            print(f"Samples saved: {results.get('samples_path', 'N/A')}")
             print("=" * 60)
 
-            # 각 temperature 결과
-            for r in all_results:
-                temp = r["temperature"]
-                pass1 = r["pass_at_k"].get("pass@1", 0)
-                print(f"Temperature {temp}: pass@1 = {pass1:.2%}")
-
-            # 최적 temperature 찾기 (pass@1 기준)
-            best_result = max(all_results, key=lambda x: x["pass_at_k"].get("pass@1", 0))
-            best_temp = best_result["temperature"]
-
-            print("=" * 60)
-            print(f"최적 Temperature: {best_temp}")
-            print("=" * 60)
-            for k, v in best_result["pass_at_k"].items():
-                print(f"{k}: {v:.2%}")
-            print("=" * 60)
-
-            results = best_result
+        # Legacy 모드: 기존 커스텀 평가
         else:
-            # 단일 temperature 결과 출력
-            print("\n" + "=" * 50)
-            print("평가 결과 요약")
-            print("=" * 50)
-            for k, v in results["pass_at_k"].items():
-                print(f"{k}: {v:.2%}")
-            print("=" * 50)
+            all_results = []
+            for temp in temperatures:
+                if len(temperatures) > 1:
+                    logger.info(f"\n--- Temperature {temp} 평가 시작 ---")
 
-        print(f"총 평가 태스크: {len(results['per_task'])}")
-        if results['checkpoint_metadata'].get('is_base_model'):
-            print("Model: Base (no SFT)")
-        else:
-            print(f"Checkpoint epoch: {results['checkpoint_metadata']['epoch']}")
-            print(f"Checkpoint val_loss: {results['checkpoint_metadata']['val_metrics']['val_loss']:.4f}")
-        print("=" * 50)
+                results = run_evaluation(
+                    checkpoint_path=model_source,
+                    dataset_name=args.dataset,
+                    num_samples_per_task=args.num_samples,
+                    temperature=temp,
+                    max_new_tokens=args.max_tokens,
+                    device=args.device,
+                    dtype=args.dtype,
+                    mlflow_enabled=not args.no_mlflow,
+                    max_tasks=args.max_tasks,
+                    model=model,
+                    tokenizer=tokenizer,
+                    checkpoint_metadata=checkpoint_metadata,
+                    device_obj=device_obj,
+                )
+                results["temperature"] = temp
+                all_results.append(results)
+
+            # Temperature Search 결과 출력
+            if len(temperatures) > 1:
+                print("\n" + "=" * 60)
+                print("Temperature Search 결과")
+                print("=" * 60)
+                for r in all_results:
+                    temp = r["temperature"]
+                    pass1 = r["pass_at_k"].get("pass@1", 0)
+                    print(f"Temperature {temp}: pass@1 = {pass1:.2%}")
+
+                best_result = max(all_results, key=lambda x: x["pass_at_k"].get("pass@1", 0))
+                best_temp = best_result["temperature"]
+                print("=" * 60)
+                print(f"최적 Temperature: {best_temp}")
+                print("=" * 60)
+                for k, v in best_result["pass_at_k"].items():
+                    print(f"{k}: {v:.2%}")
+                print("=" * 60)
+                results = best_result
+            else:
+                print("\n" + "=" * 50)
+                print("평가 결과 요약")
+                print("=" * 50)
+                for k, v in results["pass_at_k"].items():
+                    print(f"{k}: {v:.2%}")
+                print("=" * 50)
+
+            print(f"총 평가 태스크: {len(results['per_task'])}")
+            if results['checkpoint_metadata'].get('is_base_model'):
+                print("Model: Base (no SFT)")
+            else:
+                print(f"Checkpoint epoch: {results['checkpoint_metadata']['epoch']}")
+                print(f"Checkpoint val_loss: {results['checkpoint_metadata']['val_metrics']['val_loss']:.4f}")
+            print("=" * 50)
 
         logger.info("평가 완료")
 

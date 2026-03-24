@@ -1,6 +1,11 @@
 """평가 파이프라인
 
 Checkpoint를 로드하여 벤치마크 데이터셋에서 Pass@K 평가 수행
+
+eval_mode:
+  - "evalplus": HumanEval(+)/MBPP(+) — evalplus 패키지로 평가 (학회 표준)
+  - "legacy": 기존 커스텀 실행기 (CodeContests, 디버깅용)
+  - GSM8K는 항상 자체 exact match 사용
 """
 
 import json
@@ -524,3 +529,193 @@ def run_evaluation(
         "per_task": per_task_pass_at_k,
         "checkpoint_metadata": checkpoint_metadata,
     }
+
+
+# ============================================================================
+# EvalPlus 기반 평가 (HumanEval+, MBPP+)
+# ============================================================================
+
+
+def run_evalplus_evaluation(
+    model: Any,
+    tokenizer: Any,
+    checkpoint_metadata: dict,
+    device_obj: torch.device,
+    dataset_name: str = "humaneval",
+    num_samples: int = 1,
+    temperature: float = 0.0,
+    max_new_tokens: int = 512,
+    output_dir: str = "storage/eval_results",
+    max_tasks: int | None = None,
+) -> dict[str, Any]:
+    """EvalPlus 기반 평가 (HumanEval+/MBPP+)
+
+    Phase 1: 솔루션 생성 → evalplus 호환 JSONL 저장
+    Phase 2: evalplus evaluate 호출 → 결과 파싱
+
+    Args:
+        model: 평가 대상 모델
+        tokenizer: 토크나이저
+        checkpoint_metadata: 체크포인트 메타데이터
+        device_obj: torch.device
+        dataset_name: "humaneval" 또는 "mbpp"
+        num_samples: 문제당 샘플 수 (greedy=1)
+        temperature: sampling temperature (0=greedy)
+        max_new_tokens: 최대 생성 토큰 수
+        output_dir: 결과 저장 디렉토리
+        max_tasks: 최대 문제 수 (None=전체)
+
+    Returns:
+        {"pass_at_k": {"pass@1": float, ...}, "evalplus": {"humaneval+": float, ...}, ...}
+    """
+    import subprocess as sp
+
+    eval_logger = setup_logging("EVALPLUS")
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # EvalPlus 데이터셋 로드
+    eval_logger.info(f"Loading {dataset_name} problems from evalplus...")
+    try:
+        from evalplus.data import get_human_eval_plus, get_mbpp_plus
+    except ImportError:
+        raise ImportError(
+            "evalplus 패키지가 설치되지 않았습니다.\n"
+            "설치: pip install evalplus"
+        )
+
+    if dataset_name == "humaneval":
+        problems = get_human_eval_plus()
+    elif dataset_name == "mbpp":
+        problems = get_mbpp_plus()
+    else:
+        raise ValueError(f"evalplus는 humaneval/mbpp만 지원합니다: {dataset_name}")
+
+    task_ids = sorted(problems.keys())
+    if max_tasks:
+        task_ids = task_ids[:max_tasks]
+    eval_logger.info(f"Evaluating {len(task_ids)} tasks, {num_samples} samples each")
+
+    # Phase 1: 솔루션 생성
+    samples = []
+    gen_batch_size = min(5, num_samples)
+
+    for task_idx, task_id in enumerate(tqdm(task_ids, desc=f"Generating ({dataset_name})")):
+        problem = problems[task_id]
+        prompt = problem["prompt"]
+
+        inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+        input_ids = inputs["input_ids"].to(device_obj)
+        attention_mask = inputs["attention_mask"].to(device_obj)
+        prompt_len = input_ids.shape[1]
+
+        remaining = num_samples
+        while remaining > 0:
+            n = min(gen_batch_size, remaining)
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids.expand(n, -1),
+                    attention_mask=attention_mask.expand(n, -1),
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature if temperature > 0 else 1.0,
+                    do_sample=(temperature > 0),
+                    top_p=0.95 if temperature > 0 else 1.0,
+                    num_return_sequences=1,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            for i in range(n):
+                generated_ids = output_ids[i, prompt_len:]
+                completion = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+                # HumanEval 후처리: stop sequences에서 truncate
+                if dataset_name == "humaneval":
+                    completion = postprocess_humaneval_completion(completion, prompt)
+
+                samples.append({
+                    "task_id": task_id,
+                    "completion": completion,
+                })
+            remaining -= n
+
+        # 처음 3개 디버그 출력
+        if task_idx < 3:
+            preview = samples[-1]["completion"][:200]
+            eval_logger.info(f"[SAMPLE] {task_id}:\n{preview}\n{'='*50}")
+
+    # JSONL 저장
+    samples_path = output_path / f"samples_{dataset_name}.jsonl"
+    with open(samples_path, "w", encoding="utf-8") as f:
+        for s in samples:
+            f.write(json.dumps(s, ensure_ascii=False) + "\n")
+    eval_logger.info(f"Saved {len(samples)} samples → {samples_path}")
+
+    # Phase 2: evalplus evaluate 호출
+    eval_logger.info("Running evalplus evaluation...")
+    evalplus_dataset = "humaneval" if dataset_name == "humaneval" else "mbpp"
+
+    cmd = [
+        "evalplus.evaluate",
+        "--dataset", evalplus_dataset,
+        "--samples", str(samples_path),
+    ]
+    eval_logger.info(f"Command: {' '.join(cmd)}")
+
+    result = sp.run(cmd, capture_output=True, text=True, timeout=600)
+    eval_logger.info(f"evalplus stdout:\n{result.stdout}")
+    if result.returncode != 0:
+        eval_logger.warning(f"evalplus stderr:\n{result.stderr}")
+
+    # Phase 3: 결과 파싱
+    pass_at_k, evalplus_scores = _parse_evalplus_output(result.stdout, dataset_name)
+
+    eval_logger.info("=== EvalPlus Results ===")
+    for k, v in pass_at_k.items():
+        eval_logger.info(f"{k}: {v:.2%}")
+    for k, v in evalplus_scores.items():
+        eval_logger.info(f"{k}: {v:.2%}")
+
+    return {
+        "pass_at_k": pass_at_k,
+        "evalplus": evalplus_scores,
+        "samples_path": str(samples_path),
+        "checkpoint_metadata": checkpoint_metadata,
+    }
+
+
+def _parse_evalplus_output(stdout: str, dataset_name: str) -> tuple[dict, dict]:
+    """evalplus CLI 출력 파싱
+
+    Returns:
+        (pass_at_k, evalplus_scores)
+        pass_at_k: {"pass@1": float} (base 테스트)
+        evalplus_scores: {"humaneval+_pass@1": float, ...} (augmented 테스트)
+    """
+    import re
+
+    pass_at_k = {}
+    evalplus_scores = {}
+
+    # evalplus 출력 형식:
+    # humaneval (base tests): pass@1: 0.7317
+    # humaneval+ (base + extra tests): pass@1: 0.6585
+    for line in stdout.split("\n"):
+        line = line.strip()
+
+        # Base tests
+        match = re.match(r"(\w+)\s+\(base tests?\).*?pass@(\d+):\s+([\d.]+)", line, re.IGNORECASE)
+        if match:
+            k = int(match.group(2))
+            score = float(match.group(3))
+            pass_at_k[f"pass@{k}"] = score
+            continue
+
+        # Plus tests
+        match = re.match(r"(\w+)\+?\s+\(base \+ extra tests?\).*?pass@(\d+):\s+([\d.]+)", line, re.IGNORECASE)
+        if match:
+            name = match.group(1).lower()
+            k = int(match.group(2))
+            score = float(match.group(3))
+            evalplus_scores[f"{name}+_pass@{k}"] = score
+            continue
+
+    return pass_at_k, evalplus_scores
