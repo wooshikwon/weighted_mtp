@@ -11,6 +11,7 @@ eval_mode:
 import json
 import os
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -654,7 +655,7 @@ def run_evalplus_evaluation(
     evalplus_dataset = "humaneval" if dataset_name == "humaneval" else "mbpp"
 
     cmd = [
-        "evalplus.evaluate",
+        sys.executable, "-m", "evalplus.evaluate",
         "--dataset", evalplus_dataset,
         "--samples", str(samples_path),
     ]
@@ -717,5 +718,13 @@ def _parse_evalplus_output(stdout: str, dataset_name: str) -> tuple[dict, dict]:
             score = float(match.group(3))
             evalplus_scores[f"{name}+_pass@{k}"] = score
             continue
+
+    if not pass_at_k and not evalplus_scores:
+        logger = setup_logging("EVALPLUS")
+        logger.warning(
+            "evalplus 출력에서 메트릭을 파싱하지 못했습니다.\n"
+            f"stdout 전문:\n{stdout}\n"
+            "evalplus 버전이나 출력 형식이 변경되었을 수 있습니다."
+        )
 
     return pass_at_k, evalplus_scores

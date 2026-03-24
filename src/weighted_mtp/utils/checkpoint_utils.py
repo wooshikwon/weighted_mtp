@@ -161,15 +161,17 @@ def load_checkpoint_for_evaluation(
     checkpoint_type = checkpoint.get("checkpoint_type", "full")
     logger.info(f"Checkpoint 타입: {checkpoint_type}")
 
-    # 2. Config 정보 추출
+    # 2. Config 정보 추출 + 모델 경로 해석
     config_info = checkpoint.get("config", {})
-    if not config_info:
-        config_info = {"model": {"path": "meta-llama/Meta-Llama-3-8B"}}
-        logger.warning(
-            f"Checkpoint에 config 정보가 없습니다. 기본값 사용: {config_info['model']['path']}"
-        )
+    if "models" in config_info and "policy" in config_info["models"]:
+        model_path = config_info["models"]["policy"]["path"]
+    elif "model" in config_info and "path" in config_info.get("model", {}):
+        model_path = config_info["model"]["path"]
+    else:
+        model_path = checkpoint.get("base_model_path", "meta-llama/Meta-Llama-3-8B")
+        logger.warning(f"Config에서 모델 경로를 찾을 수 없습니다. 기본값 사용: {model_path}")
 
-    model_path = config_info["model"]["path"]
+    logger.info(f"Base model path: {model_path}")
 
     # 3. Base HuggingFace 모델 로드
     model_config = AutoConfig.from_pretrained(model_path)
@@ -182,12 +184,12 @@ def load_checkpoint_for_evaluation(
         attn_implementation="sdpa",
     )
 
-    if checkpoint_type == "lora":
+    if checkpoint_type in ("lora", "hf_lora"):
         # 4. LoRA checkpoint: LoRA 적용 후 학습된 파라미터 로드
         lora_config = checkpoint.get("lora_config")
         model = apply_lora_to_hf_model(model, lora_config)
         load_hf_lora_state_dict(model, checkpoint.get("lora_state_dict", {}))
-        logger.info("LoRA checkpoint 적용 완료")
+        logger.info(f"{checkpoint_type} checkpoint 적용 완료")
 
     else:
         # 5. Full checkpoint: 전체 adapter_state_dict 로드

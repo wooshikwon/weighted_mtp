@@ -254,9 +254,14 @@ def generate_metadata(jsonl_path: Path, output_path: Path, tokenizer=None):
             problem_id = metadata.get("problem_id")
             if not problem_id:
                 task_id = item.get("task_id", "")
-                # "problemname_correct_0" → "problemname"
-                parts = task_id.rsplit("_", 2)
-                problem_id = parts[0] if len(parts) >= 3 else task_id
+                # "problem_name_correct_0" → "problem_name"
+                # rsplit 대신 marker 기반 분리 (problem_id에 underscore 포함 가능)
+                for marker in ("_correct_", "_incorrect_"):
+                    if marker in task_id:
+                        problem_id = task_id[:task_id.index(marker)]
+                        break
+                if not problem_id:
+                    problem_id = task_id
 
             if not problem_id:
                 continue
