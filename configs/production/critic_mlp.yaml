@@ -45,7 +45,10 @@ data_sampling:
   use_pairwise: true
   val_n_samples: 500        # Validation 샘플 수
 
-  n_samples: 125000 
+  # CodeContests+: 전체 pair capacity에 맞춰 조정
+  # 전체 실험: setup_codecontests_plus.py 메타데이터의 pair capacity 참고
+  # Go/No-Go: 125000 이하로 축소
+  n_samples: 125000
   max_pairs_per_problem: 50  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
 
   # Length-Balanced 샘플링 (길이 편향 제거)
@@ -55,6 +58,7 @@ data_sampling:
   length_bins: [0, 50, 100, 125, 150, 175, 200, 250, 300, 350, 400, 500, 600, 800, 1000, 1500, 2000]
 
   # Difficulty 기반 설정 (use_length_balanced=true 시에도 difficulty 필터로 사용)
+  # CodeContests+: difficulty 없는 문제는 기본값 5 할당 → [1, 25] 범위에 포함됨
   difficulty_bins:
     all: [1, 25]  # difficulty 0 제외
   difficulty_weights:
