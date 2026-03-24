@@ -14,7 +14,8 @@ models:
     path: meta-llama/Meta-Llama-3-8B
     dtype: bfloat16
   value_model:
-    checkpoint_path: storage/checkpoints/critic_llama3/checkpoint_final.pt
+    checkpoint_path: storage/checkpoints/critic/ntp_critic_llama3_8b/checkpoint_final.pt
+    base_model_path: storage/models/llama3-8b-code-merged
 
 # Dataset
 dataset:

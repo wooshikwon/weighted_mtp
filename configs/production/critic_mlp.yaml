@@ -1,30 +1,35 @@
 # Critic Pre-training (독립 Value Model)
-# HuggingFace 기반 2.7B 모델 + MLP Value Head 학습
-# 프로덕션 설정 (VESSL H200 3-GPU)
+# LLaMA-3 8B (Baseline SFT merged) + MLP Value Head
+# Production config (A100/H100 80GB 4-GPU)
+#
+# 파이프라인: Baseline SFT → merge_sft_for_value.py → 이 config로 Critic 학습
+# Value backbone은 Baseline SFT에서 LoRA merge한 "code-enhanced" LLaMA-3 8B
 
 # 프로젝트 정보
 project:
   name: weighted-mtp
-  version: "2.0.0"
+  version: "3.0.0"
 
 # 실험 메타정보
 experiment:
-  name: last-final-value-model-stratified-MC-mse
-  description: "Independent Value Model pretraining for TD error calculation"
+  name: ntp_critic_llama3_8b
+  description: "Critic pretraining — LLaMA-3 8B (SFT-merged) backbone + MLP Value Head + Pairwise Ranking"
   stage: critic
   tags:
     - critic
-    - lambda-return
+    - ntp
+    - llama3-8b
+    - sft-initialized
+    - pairwise-ranking
     - mlp-value-head
-    - dropout-0.1
-    - independent-value-model
 
 # 모델 설정
 models:
-  # 독립 Value Model (raw 모델 기반, 2.7B)
+  # 독립 Value Model (Baseline SFT merged model 기반)
+  # scripts/merge_sft_for_value.py로 생성된 모델
   value_model:
-    name: ref-sheared-llama-2.7b
-    path: storage/models/ref-sheared-llama-2.7b/raw
+    name: llama3-8b-code-merged
+    path: storage/models/llama3-8b-code-merged
     dtype: bfloat16
 
 # 데이터셋 설정
@@ -55,11 +60,11 @@ data_sampling:
   difficulty_weights:
     all: 1.0
 
-# 학습 설정 (H100 80GB 4-GPU 최적화)
+# 학습 설정 (A100/H100 80GB 4-GPU)
 training:
   n_epochs: 1.5
-  batch_size: 32
-  gradient_accumulation_steps: 1  # Effective batch size = 32 × 1 × 3 = 96
+  batch_size: 24
+  gradient_accumulation_steps: 1  # Effective batch size = 24 × 1 × 4 = 96
 
   # Global 설정 (FSDP 제약으로 분리 불가)
   max_grad_norm: 1.0
