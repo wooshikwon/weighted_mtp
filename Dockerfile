@@ -12,14 +12,17 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 WORKDIR /app
 
-# Dependencies (캐시 활용을 위해 먼저 복사)
+# Dependencies (캐시 활용: 의존성 레이어를 소스보다 먼저 설치)
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen
+RUN uv sync --frozen --no-install-project
 
 # Source code
 COPY src/ ./src/
 COPY configs/ ./configs/
 COPY scripts/ ./scripts/
+
+# Project install (editable, src/ 필요)
+RUN uv sync --frozen
 
 # Environment
 ENV PATH="/app/.venv/bin:$PATH"
