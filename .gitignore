@@ -66,3 +66,4 @@ vendor/
 node_modules/
 
 mlruns_backup/
+mlflow.db
