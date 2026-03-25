@@ -59,12 +59,12 @@ class TestValueHead:
     def test_mlp_value_head_structure(self):
         """MLPValueHead 구조 검증"""
         value_head = MLPValueHead(hidden_size=4096)
-        
-        # 4096 → 512 → 256 → 1
+
+        # 4096 → 1024 → 512 → 1 (hidden_size // 4 → hidden_size // 8)
         assert value_head.mlp[0].in_features == 4096
-        assert value_head.mlp[0].out_features == 512  # 4096 // 8
-        assert value_head.mlp[3].in_features == 512
-        assert value_head.mlp[3].out_features == 256  # 4096 // 16
+        assert value_head.mlp[0].out_features == 1024  # 4096 // 4
+        assert value_head.mlp[3].in_features == 1024
+        assert value_head.mlp[3].out_features == 512  # 4096 // 8
         assert value_head.mlp[6].out_features == 1
 
 
