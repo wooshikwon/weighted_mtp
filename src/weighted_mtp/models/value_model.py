@@ -1,9 +1,9 @@
 """독립 Value Model
 
 HuggingFace LlamaModel 기반의 완전 독립된 Value Model.
-Policy Model(MTP)과 완전히 분리되어 별도 backbone 사용.
+Policy Model(LlamaForCausalLM)과 완전히 분리되어 별도 backbone 사용.
 
-Critic 파이프라인에서 학습, Verifiable에서 eval only로 사용.
+Critic 파이프라인에서 학습, Baseline (critic weight mode)에서 eval only로 사용.
 """
 
 from pathlib import Path
@@ -210,8 +210,9 @@ class ValueModel(nn.Module):
         # Config에서 value head 설정 추출
         config_dict = checkpoint.get("config", {})
         training_config = config_dict.get("training", {})
-        value_head_type = training_config.get("value_head_type", "mlp")
-        dropout = training_config.get("dropout", 0.0)
+        value_head_config = training_config.get("value_head", {})
+        value_head_type = value_head_config.get("type", training_config.get("value_head_type", "mlp"))
+        dropout = value_head_config.get("dropout", training_config.get("dropout", 0.0))
 
         models_config = config_dict.get("models", {})
         value_model_config = models_config.get("value_model", {})
@@ -276,8 +277,9 @@ class ValueModel(nn.Module):
 
         # 학습 설정 추출
         training_config = config_dict.get("training", {})
-        value_head_type = training_config.get("value_head_type", "mlp")
-        dropout = training_config.get("dropout", 0.0)
+        value_head_config = training_config.get("value_head", {})
+        value_head_type = value_head_config.get("type", training_config.get("value_head_type", "mlp"))
+        dropout = value_head_config.get("dropout", training_config.get("dropout", 0.0))
         dtype = value_model_config.get("dtype", "bfloat16")
 
         # 모델 생성

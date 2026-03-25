@@ -5,7 +5,7 @@
 Weighted Multi-Token Prediction (WMTP) 프로젝트는 코드 생성 모델의 성능 향상을 위해 **토큰별 가중치 학습**을 적용합니다. 핵심 아이디어는 모든 토큰을 동일하게 학습하는 대신, **올바른 코드 생성에 중요한 토큰에 더 높은 가중치**를 부여하는 것입니다.
 
 ### 핵심 목표
-- **MTP (Multi-Token Prediction)**: 다음 토큰만 예측하는 NTP 대신, 여러 미래 토큰을 동시에 예측
+- **NTP + Weight Modes**: HuggingFace LlamaForCausalLM 기반 Next-Token Prediction에 4가지 가중치 전략 적용
 - **Value-Weighted Learning**: TD(Temporal Difference) 기반 value function으로 토큰별 중요도 추정
 - **Verifiable Reward**: 코드 실행 결과를 binary reward로 활용 (pass=1, fail=0)
 
@@ -22,19 +22,12 @@ weighted_mtp/
 │   │   ├── collators.py      # Batch collation, Alpaca 템플릿
 │   │   └── dataloader.py     # DataLoader 팩토리
 │   ├── models/               # 모델 정의
-│   │   ├── meta_mtp/         # Meta LLaMA MTP 모델
-│   │   │   ├── adapter.py    # MetaLlamaMTPAdapter (Policy Model)
-│   │   │   ├── transformer.py# Transformer 구현
-│   │   │   └── checkpoints.py# 체크포인트 로딩
-│   │   ├── value_model.py    # ValueModel (독립 Critic)
+│   │   ├── value_model.py    # ValueModel (독립 Critic, HuggingFace LlamaModel)
 │   │   ├── value_head.py     # Value Head (Linear/MLP/Sigmoid)
 │   │   └── lora.py           # LoRA 구현
 │   ├── pipelines/            # 학습/평가 파이프라인
-│   │   ├── run_baseline.py   # Baseline MTP 학습
+│   │   ├── run_baseline.py   # NTP 학습 (4 weight modes: uniform/critic/random/shuffled)
 │   │   ├── run_critic.py     # Critic (Value Model) 학습
-│   │   ├── run_verifiable.py # Verifiable WMTP 학습 (핵심)
-│   │   ├── run_rho1.py       # Rho-1 Selective 학습
-│   │   ├── run_ref_tuning.py # Reference Model SFT
 │   │   └── run_evaluation.py # 벤치마크 평가
 │   ├── runtime/              # 분산 학습 인프라
 │   │   ├── fsdp.py           # FSDP wrapping, all-reduce
@@ -42,15 +35,19 @@ weighted_mtp/
 │   │   └── environment.py    # 환경 설정
 │   ├── value_weighting/      # 가중치 계산 로직
 │   │   ├── td_weighting.py   # TD error 기반 가중치
-│   │   └── rho1_weighting.py # Rho-1 selective 가중치
+│   │   └── control_weights.py # 대조군 가중치 (random, shuffled)
 │   └── utils/                # 유틸리티
-│       ├── loss_utils.py     # MTP CE Loss 계산
+│       ├── loss_utils.py     # NTP CE Loss 계산
 │       ├── pairwise_utils.py # Pairwise ranking, λ-return
-│       ├── checkpoint_utils.py# 체크포인트 저장/로딩
-│       └── generation_utils.py# MTP 생성 유틸
+│       └── checkpoint_utils.py# 체크포인트 저장/로딩
 ├── configs/                  # YAML 설정 파일
 │   ├── local/                # 로컬 개발용
 │   └── production/           # 프로덕션 학습용
+│       ├── baseline.yaml     # uniform weight mode
+│       ├── taw.yaml          # critic weight mode (TAW)
+│       ├── random_matched.yaml # random weight mode
+│       ├── shuffled.yaml     # shuffled weight mode
+│       └── critic_mlp.yaml   # Critic (Value Model) 학습
 ├── scripts/                  # 실행 스크립트
 │   └── vessl/                # VESSL AI 학습 스크립트
 ├── storage/                  # 모델/데이터 저장소
@@ -64,40 +61,30 @@ weighted_mtp/
 
 ## 모델 아키텍처
 
-### 1. Policy Model (MetaLlamaMTPAdapter)
+### 1. Policy Model (HuggingFace LlamaForCausalLM)
 
-MTP 학습을 위한 Transformer 모델입니다. Meta LLaMA3를 기반으로 하며, `n_future_tokens`개의 미래 토큰을 동시에 예측합니다.
+NTP 학습을 위한 Policy Model입니다. HuggingFace `meta-llama/Meta-Llama-3-8B`를 사용합니다.
 
-**파일**: `src/weighted_mtp/models/meta_mtp/adapter.py`
+**모델**: `transformers.LlamaForCausalLM`
 
 ```
-Transformer 구조:
-├── tok_embeddings (Embedding)
-├── layers[0..N-k] (trunk layers)
-├── extra_heads[0..k-1] (MTP heads)
-├── norm (RMSNorm)
-└── output (Linear → vocab)
+LlamaForCausalLM 구조:
+├── model (LlamaModel)
+│   ├── embed_tokens (Embedding)
+│   ├── layers[0..N] (LlamaDecoderLayer)
+│   └── norm (RMSNorm)
+└── lm_head (Linear → vocab)
 
 Forward:
-  input_ids → embedding → trunk layers → [head_0, head_1, ..., head_k]
+  input_ids → embedding → decoder layers → lm_head
                                               ↓
-                                    logits [batch, seq, k, vocab]
+                                    logits [batch, seq, vocab]
 ```
 
-**주요 메서드**:
-- `from_pretrained()`: Safetensors 또는 checkpoint에서 로드
-- `apply_lora()`: LoRA (Low-Rank Adaptation) 적용
-- `forward()`: MTP logits 반환, `return_hidden_states=True`로 hidden states 반환
-
-**Flash Attention 구현**:
-```python
-# Training 시 Flash Attention (start_pos=0, seqlen>1)
-if start_pos == 0 and seqlen > 1:
-    output = F.scaled_dot_product_attention(
-        xq, keys, values,
-        is_causal=True,  # Causal masking 자동 적용
-    )
-```
+**주요 특징**:
+- HuggingFace 표준 API 사용 (`from_pretrained()`, `generate()`)
+- SDPA (Scaled Dot-Product Attention) 자동 활용
+- LoRA (Low-Rank Adaptation) 적용 지원
 
 ### 2. Value Model (독립 Critic)
 
@@ -118,7 +105,7 @@ Forward:
 - Policy Model과 완전히 분리된 별도 모델 (별도 backbone)
 - Pairwise Ranking Loss로 학습 (correct > incorrect 순서 학습)
 - LoRA로 효율적인 fine-tuning 지원
-- Verifiable 파이프라인에서 eval only로 사용
+- Baseline (critic weight mode)에서 eval only로 사용
 
 ### 3. Value Head
 
@@ -139,26 +126,28 @@ Forward:
 ### 전체 학습 순서
 
 ```
-1. Reference Model SFT (run_ref_tuning.py)
-   └─> storage/checkpoints/ref_tuned/
-
-2. Critic 학습 (run_critic.py)
+1. Critic 학습 (run_critic.py)
    └─> storage/checkpoints/critic_best/
 
-3. Verifiable WMTP 학습 (run_verifiable.py)
-   └─> storage/checkpoints/verifiable/
+2. NTP 학습 (run_baseline.py, 4 weight modes)
+   └─> storage/checkpoints/{baseline,taw,random_matched,shuffled}/
 
-4. 평가 (run_evaluation.py)
+3. 평가 (run_evaluation.py)
    └─> MLflow metrics
 ```
 
 ### 1. Baseline (run_baseline.py)
 
-가중치 없이 MTP CE Loss만으로 학습하는 baseline입니다.
+4가지 weight mode를 지원하는 통합 NTP 파이프라인입니다.
+
+- **uniform**: 표준 NTP (가중치 없음, baseline)
+- **critic**: TAW - Token Advantage Weighting (핵심 연구 기여)
+- **random**: Random-Matched (LogNormal 분포, 대조군)
+- **shuffled**: Shuffled (Critic 가중치 위치 셔플, 대조군)
 
 ```python
-# 모든 head에 대해 CE Loss 평균
-Loss = Σ_{k=1}^{n_future} CE(logits_k, labels_{t+k}) / n_future
+# NTP CE Loss
+Loss = CE(logits, labels)  # weight mode에 따라 토큰별 가중치 적용
 ```
 
 ### 2. Critic (run_critic.py)
@@ -186,7 +175,7 @@ value_loss = F.smooth_l1_loss(values, lambda_targets)  # Huber loss
 2. 각각 forward하여 sequence-level value 계산
 3. Correct의 평균 value가 incorrect보다 높도록 학습
 
-### 3. Verifiable WMTP (run_verifiable.py)
+### 3. TAW - Token Advantage Weighting (run_baseline.py, weight_mode: critic)
 
 **핵심 파이프라인**. 학습된 Critic으로 토큰별 가중치를 계산하여 Policy Model을 학습합니다.
 
@@ -202,7 +191,7 @@ td_errors = compute_td_errors(value_logits, rewards, loss_mask, gamma)
 weights = build_weights(td_errors, loss_mask, beta, min_weight, max_weight)
 
 # 4. Weighted CE Loss
-loss_dict = compute_mtp_ce_loss(logits, labels, attention_mask, weights)
+loss_dict = compute_ntp_ce_loss(logits, labels, attention_mask, weights)
 ```
 
 **TD Error 계산** (`value_weighting/td_weighting.py`):
@@ -231,24 +220,6 @@ w = clamp(w, min_weight, max_weight)
 # 역방향 계산: A_t = δ_t + γλ·A_{t+1}
 # Target_t = V_t + A_t
 # λ=0.0: TD(0), λ=0.95: GAE 권장값, λ=1.0: Monte Carlo
-```
-
-### 4. Rho-1 (run_rho1.py)
-
-Reference Model과의 perplexity 차이로 토큰 선택 학습합니다.
-
-**Selective Token Loss**:
-```python
-# Reference (frozen) vs Policy forward
-ppl_ref = CE(ref_logits, labels)
-ppl_policy = CE(policy_logits, labels)
-
-# 선택 기준: Reference 대비 어려운 토큰 (상위 k%)
-excess_loss = ppl_policy - ppl_ref
-weights = compute_mtp_selective_weights(excess_loss, k_percent=0.6)
-
-# 선택된 토큰만 학습
-loss = compute_mtp_ce_loss(logits, labels, attention_mask, weights)
 ```
 
 ---
@@ -361,8 +332,7 @@ wrapped_model = FSDP(
 
 **Transformer Layer 자동 감지**:
 ```python
-# HuggingFace LlamaModel → LlamaDecoderLayer
-# MetaLlamaMTPAdapter → TransformerBlock
+# HuggingFace LlamaModel/LlamaForCausalLM → LlamaDecoderLayer
 transformer_layer_cls = _detect_transformer_layer_cls(model)
 ```
 
@@ -370,7 +340,7 @@ transformer_layer_cls = _detect_transformer_layer_cls(model)
 
 | 전략 | 설명 | 용도 |
 |------|------|------|
-| `FULL_SHARD` | ZeRO-3 (Model + Optimizer + Gradient 샤딩) | Verifiable/Baseline |
+| `FULL_SHARD` | ZeRO-3 (Model + Optimizer + Gradient 샤딩) | Baseline (all weight modes) |
 | `SHARD_GRAD_OP` | ZeRO-2 (Optimizer + Gradient만) | 메모리 중간 |
 | `NO_SHARD` | DDP (복제) | Critic (Value Head만 학습) |
 
@@ -410,19 +380,17 @@ if world_size > 1:
 
 ## 설정 파일 구조
 
-**위치**: `configs/production/verifiable.yaml`
+**위치**: `configs/production/taw.yaml`
 
 ```yaml
 experiment:
-  name: verifiable_wmtp
-  run_prefix: verifiable
+  name: taw_ntp
+  run_prefix: taw
 
 models:
   policy:
-    path: storage/models/meta-llama-mtp
+    path: meta-llama/Meta-Llama-3-8B
     dtype: bfloat16
-    params_override:
-      max_seq_len: 2048
 
   critic:
     checkpoint_path: storage/checkpoints/critic_best/checkpoint.pt
@@ -490,16 +458,16 @@ runtime:
 
 ```python
 # 1. Checkpoint 로드
-adapter = load_checkpoint_for_evaluation(checkpoint_path)
+model = load_checkpoint_for_evaluation(checkpoint_path)
 
 # 2. 데이터셋 로드
 dataset = load_evaluation_dataset("humaneval", split="test")
 
-# 3. 생성 (MTP 활용)
+# 3. 코드 생성
 for task in dataset:
-    completions = generate_with_mtp(
-        adapter, tokenizer, task["prompt"],
-        num_samples=100,  # Pass@100
+    completions = model.generate(
+        tokenizer(task["prompt"]),
+        num_return_sequences=100,  # Pass@100
         temperature=0.8,
     )
 
@@ -551,11 +519,11 @@ G_t^λ = (1-λ)γV_{t+1} + λγG_{t+1}^λ
 
 ## 참고
 
-- **Transformer 구현**: `src/weighted_mtp/models/meta_mtp/transformer.py`
-- **Adapter**: `src/weighted_mtp/models/meta_mtp/adapter.py`
+- **Policy Model**: HuggingFace `meta-llama/Meta-Llama-3-8B` (`LlamaForCausalLM`)
 - **Value Model**: `src/weighted_mtp/models/value_model.py`
 - **메타데이터 로딩**: `src/weighted_mtp/data/datasets.py`
 - **분산학습**: `src/weighted_mtp/runtime/fsdp.py`, `distributed.py`
 - **Value Weighting**: `src/weighted_mtp/value_weighting/td_weighting.py`
+- **Control Weights**: `src/weighted_mtp/value_weighting/control_weights.py`
 - **Pairwise Utils**: `src/weighted_mtp/utils/pairwise_utils.py`
-- **MTP Loss**: `src/weighted_mtp/utils/loss_utils.py`
+- **NTP Loss**: `src/weighted_mtp/utils/loss_utils.py`

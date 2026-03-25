@@ -38,7 +38,7 @@ mlflow:
 파이프라인 실행 시 자동으로 MLflow에 기록됩니다:
 
 ```bash
-PYTHONPATH=src python src/weighted_mtp/pipelines/run_baseline.py \
+python -m weighted_mtp.pipelines.run_baseline \
   --config configs/local/baseline_local.yaml
 ```
 

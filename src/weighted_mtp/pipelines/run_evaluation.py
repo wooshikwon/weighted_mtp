@@ -33,6 +33,23 @@ from weighted_mtp.utils import (
     load_checkpoint_for_evaluation,
     postprocess_humaneval_completion,
 )
+from weighted_mtp.utils.evaluation_utils import HUMANEVAL_STOP_SEQUENCES
+
+
+def _build_stop_token_ids(tokenizer, stop_sequences: list[str]) -> list[int]:
+    """Stop sequences를 token ID로 변환하여 generate()의 eos_token_id에 전달.
+
+    각 stop sequence의 첫 번째 토큰만 사용 (조기 종료 트리거).
+    정확한 truncation은 기존 post-processing이 담당.
+    """
+    stop_ids = set()
+    if tokenizer.eos_token_id is not None:
+        stop_ids.add(tokenizer.eos_token_id)
+    for seq in stop_sequences:
+        token_ids = tokenizer.encode(seq, add_special_tokens=False)
+        if token_ids:
+            stop_ids.add(token_ids[0])
+    return list(stop_ids)
 
 
 def _load_codecontests_tests(split: str = "test") -> dict[str, dict]:
@@ -350,6 +367,12 @@ def run_evaluation(
         gen_batch_size = min(5, num_samples_per_task)  # OOM 방지용 배치 크기
         remaining = num_samples_per_task
 
+        # Stop token IDs for early termination (code-specific stop sequences)
+        stop_ids = _build_stop_token_ids(
+            tokenizer,
+            HUMANEVAL_STOP_SEQUENCES if dataset_name == "humaneval" else [],
+        )
+
         while remaining > 0:
             n = min(gen_batch_size, remaining)
             with torch.no_grad():
@@ -362,6 +385,7 @@ def run_evaluation(
                     top_p=0.95 if temperature > 0 else 1.0,
                     num_return_sequences=1,
                     pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=stop_ids if stop_ids else tokenizer.eos_token_id,
                 )
             # Decode each sample (exclude prompt)
             for i in range(n):
@@ -601,6 +625,9 @@ def run_evalplus_evaluation(
     samples = []
     gen_batch_size = min(5, num_samples)
 
+    # Stop token IDs for early termination (HumanEval/MBPP code stop sequences)
+    stop_ids = _build_stop_token_ids(tokenizer, HUMANEVAL_STOP_SEQUENCES)
+
     for task_idx, task_id in enumerate(tqdm(task_ids, desc=f"Generating ({dataset_name})")):
         problem = problems[task_id]
         prompt = problem["prompt"]
@@ -623,6 +650,7 @@ def run_evalplus_evaluation(
                     top_p=0.95 if temperature > 0 else 1.0,
                     num_return_sequences=1,
                     pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=stop_ids if stop_ids else tokenizer.eos_token_id,
                 )
             for i in range(n):
                 generated_ids = output_ids[i, prompt_len:]

@@ -1,10 +1,9 @@
-version: '3.8'
-
-# 기존 configs/production/ 그대로 사용 가능
-# Dockerfile에서 /app/storage → /storage 심볼릭 링크 생성
+# NTP Pipeline — Docker Compose
+# 실행 순서: baseline → merge → critic → taw/random/shuffled → evaluate
+# 모든 서비스는 4-GPU FSDP 분산학습 사용 (evaluate 제외)
 
 services:
-  # Baseline MTP 학습
+  # ── Phase 1: Baseline SFT (uniform weights) ──────────────────────
   baseline:
     build: .
     image: weighted-mtp:latest
@@ -12,75 +11,131 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - HF_TOKEN=${HF_TOKEN:-}
-      - MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI:-}
     volumes:
       - ./storage:/storage
     shm_size: '16gb'
     working_dir: /app
     command: >
-      python src/weighted_mtp/pipelines/run_baseline.py
+      torchrun --nproc_per_node=4
+        -m weighted_mtp.pipelines.run_baseline
         --config configs/production/baseline.yaml
 
-  # Critic 학습
+  # ── Phase 1.5: LoRA Merge (Baseline SFT → Critic base model) ───
+  merge:
+    build: .
+    image: weighted-mtp:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./storage:/storage
+    shm_size: '16gb'
+    command: >
+      python scripts/merge_sft_for_value.py
+        --checkpoint storage/checkpoints/ntp_baseline/checkpoint_final.pt
+        --output storage/models/llama3-8b-code-merged
+
+  # ── Phase 2: Critic Training (Pairwise value learning) ──────────
   critic:
     build: .
     image: weighted-mtp:latest
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-    volumes:
-      - ./storage:/storage
-    shm_size: '16gb'
-    command: >
-      python src/weighted_mtp/pipelines/run_critic.py
-        --config configs/production/critic_mlp.yaml
-
-  # Verifiable WMTP 학습
-  verifiable:
-    build: .
-    image: weighted-mtp:latest
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-    volumes:
-      - ./storage:/storage
-    shm_size: '16gb'
-    command: >
-      python src/weighted_mtp/pipelines/run_verifiable.py
-        --config configs/production/verifiable.yaml
-
-  # 분산 학습 (4-GPU)
-  distributed:
-    build: .
-    image: weighted-mtp:latest
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - ./storage:/storage
     shm_size: '16gb'
     command: >
       torchrun --nproc_per_node=4
-        src/weighted_mtp/pipelines/run_verifiable.py
-        --config configs/production/verifiable.yaml
+        -m weighted_mtp.pipelines.run_critic
+        --config configs/production/critic_mlp.yaml
 
-  # 평가
+  # ── Phase 3: TAW (Token Advantage Weighting) ────────────────────
+  taw:
+    build: .
+    image: weighted-mtp:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./storage:/storage
+    shm_size: '16gb'
+    command: >
+      torchrun --nproc_per_node=4
+        -m weighted_mtp.pipelines.run_baseline
+        --config configs/production/taw.yaml
+
+  # ── Phase 3: Random-Matched (ablation control) ──────────────────
+  random-matched:
+    build: .
+    image: weighted-mtp:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./storage:/storage
+    shm_size: '16gb'
+    command: >
+      torchrun --nproc_per_node=4
+        -m weighted_mtp.pipelines.run_baseline
+        --config configs/production/random_matched.yaml
+
+  # ── Phase 3: Shuffled (ablation control) ────────────────────────
+  shuffled:
+    build: .
+    image: weighted-mtp:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./storage:/storage
+    shm_size: '16gb'
+    command: >
+      torchrun --nproc_per_node=4
+        -m weighted_mtp.pipelines.run_baseline
+        --config configs/production/shuffled.yaml
+
+  # ── Phase 4: Evaluation (single GPU, EvalPlus) ──────────────────
   evaluate:
     build: .
     image: weighted-mtp:latest
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - ./storage:/storage
     command: >
-      python src/weighted_mtp/pipelines/run_evaluation.py
-        --checkpoint storage/checkpoints/verifiable/checkpoint_best.pt
-        --model-path storage/models/meta-llama-mtp
+      python -m weighted_mtp evaluate
+        --checkpoint storage/checkpoints/ntp_baseline/checkpoint_final.pt
         --dataset humaneval
-        --n-samples 1
+        --eval-mode evalplus
+        --num-samples 1
 
-  # Interactive shell
+  # ── Utility: Data preprocessing ─────────────────────────────────
+  preprocess:
+    build: .
+    image: weighted-mtp:latest
+    volumes:
+      - ./storage:/storage
+    command: >
+      python scripts/create_storage/setup_codecontests_plus.py
+
+  preprocess-gonogo:
+    build: .
+    image: weighted-mtp:latest
+    volumes:
+      - ./storage:/storage
+    command: >
+      python scripts/create_storage/setup_codecontests_plus.py
+        --max-problems 500 --max-solutions-per-problem 100
+
+  # ── Utility: Interactive shell ──────────────────────────────────
   shell:
     build: .
     image: weighted-mtp:latest

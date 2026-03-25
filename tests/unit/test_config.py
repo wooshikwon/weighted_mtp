@@ -9,7 +9,8 @@ import yaml
     "config_path",
     [
         "configs/production/baseline.yaml",
-        "configs/production/verifiable.yaml",
+        "configs/production/taw.yaml",
+        "configs/production/critic_mlp.yaml",
     ],
 )
 def test_load_stage_configs(project_root: Path, config_path: str):

@@ -29,7 +29,7 @@ HF_TOKEN=<your-huggingface-token>
 ```
 
 HuggingFace 토큰은 https://huggingface.co/settings/tokens 에서 발급.
-`facebook/multi-token-prediction` 모델 접근을 위해 Meta 라이선스 동의 필요.
+`meta-llama/Meta-Llama-3-8B` 모델 접근을 위해 Meta 라이선스 동의 필요.
 
 ---
 
@@ -37,16 +37,17 @@ HuggingFace 토큰은 https://huggingface.co/settings/tokens 에서 발급.
 
 HuggingFace에서 모델을 다운로드하고 SafeTensors 형식으로 변환합니다.
 
-### 2.1 Meta LLaMA MTP (7B)
+### 2.1 Policy Model (meta-llama/Meta-Llama-3-8B)
+
+HuggingFace에서 직접 로드합니다. `HF_TOKEN`과 Meta 라이선스 동의가 필요합니다.
 
 ```bash
-# 다운로드 + 변환 + config 동기화 + 검증
-uv run python scripts/create_storage/setup_models.py \
-  --model meta-llama-mtp \
-  --steps all
+# HuggingFace 모델은 자동 다운로드됨 (configs에서 path 지정)
+# 사전 다운로드가 필요한 경우:
+huggingface-cli download meta-llama/Meta-Llama-3-8B --local-dir storage/models/meta-llama-3-8b
 ```
 
-### 2.2 Sheared-LLaMA 2.7B (Reference Model)
+### 2.2 Sheared-LLaMA 2.7B (Value/Critic Model)
 
 ```bash
 uv run python scripts/create_storage/setup_models.py \
@@ -59,47 +60,12 @@ uv run python scripts/create_storage/setup_models.py \
 원본 모델 없이 랜덤 초기화된 경량 모델 생성:
 
 ```bash
-# Micro-MTP (4 layers, 512 hidden)
-uv run python scripts/create_storage/setup_models.py \
-  --model meta-llama-mtp \
-  --create-micro \
-  --micro-type mtp \
-  --micro-init random
-
-# Micro-Reference
+# Micro-Reference (Value Model 테스트용)
 uv run python scripts/create_storage/setup_models.py \
   --model ref-sheared-llama \
   --create-micro \
   --micro-type reference \
   --micro-init random
-```
-
-### 모델 디렉터리 구조
-
-```
-storage/models/
-├── meta-llama-mtp/              # Base MTP (약 25GB)
-│   ├── raw/                     # HuggingFace 원본
-│   │   ├── 7B_1T_4/
-│   │   │   ├── consolidated.pth
-│   │   │   └── params.json
-│   │   └── tokenizer.model
-│   ├── safetensors/
-│   │   ├── model.safetensors    # 변환된 모델
-│   │   └── SHA256SUMS
-│   ├── configs/
-│   │   ├── params.json
-│   │   └── meta_adapter.yaml
-│   └── tokenizer/
-│       └── tokenizer.model
-├── ref-sheared-llama-2.7b/      # Reference model (약 10GB)
-│   ├── raw/
-│   ├── safetensors/
-│   └── configs/
-├── micro-mtp/                   # 로컬 테스트용 (약 180MB)
-│   ├── safetensors/
-│   └── configs/
-└── micro-reference/             # 로컬 테스트용
 ```
 
 ---
@@ -261,16 +227,11 @@ uv sync --dev
 # 2. 환경변수 설정
 echo "HF_TOKEN=<your-token>" > .env
 
-# 3. Micro 모델 생성 (로컬 테스트용)
-uv run python scripts/create_storage/setup_models.py \
-  --model meta-llama-mtp \
-  --create-micro --micro-type mtp --micro-init random
-
-# 4. Small 데이터셋 준비
+# 3. Small 데이터셋 준비
 uv run python scripts/create_storage/setup_datasets.py \
   --datasets all --steps process,small
 
-# 5. 검증
+# 4. 검증
 uv run python scripts/create_storage/verify_storage.py --check all
 ```
 
@@ -295,7 +256,7 @@ echo $HF_TOKEN
 huggingface-cli login
 
 # Meta 모델 라이선스 동의 확인
-# https://huggingface.co/facebook/multi-token-prediction
+# https://huggingface.co/meta-llama/Meta-Llama-3-8B
 ```
 
 ### 메모리 부족

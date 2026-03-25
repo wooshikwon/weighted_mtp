@@ -21,7 +21,7 @@ models:
 dataset:
   name: codecontests
   train: storage/datasets/codecontests/processed/train.jsonl
-  validation: storage/datasets/codecontests/processed/validation.jsonl
+  validation: storage/datasets/codecontests/processed/valid.jsonl
   max_length: 2048
 
 # Data sampling
@@ -77,6 +77,9 @@ checkpoint:
   save_dir: storage/checkpoints/ntp_shuffled
   save_checkpoint_every: 0.5
   save_final: true
+  save_lora_only: true
+  save_total_limit: 3
+  save_best: true
 
 # Runtime
 runtime:

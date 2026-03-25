@@ -28,6 +28,7 @@ dependencies = [
     "psutil>=5.9.0",
     "nvidia-ml-py>=12.535.0",
     "vessl>=0.1.199",
+    "evalplus>=0.3.0",
 ]
 
 [project.optional-dependencies]
@@ -45,7 +46,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]
-packages = ["src/weighted_mtp", "vendor"]
+packages = ["src/weighted_mtp"]
 
 [tool.ruff]
 line-length = 100

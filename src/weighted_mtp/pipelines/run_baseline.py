@@ -10,7 +10,7 @@ Weight modes:
   - "shuffled": Shuffled (Critic 가중치 위치 셔플, 대조군)
 
 독립 실행:
-    python -m weighted_mtp.pipelines.run_baseline --config configs/baseline/baseline.yaml
+    python -m weighted_mtp.pipelines.run_baseline --config configs/production/baseline.yaml
 """
 
 import argparse
@@ -407,15 +407,16 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
         value_model.eval_mode()  # 전체 frozen + eval
 
         # FSDP wrapping (LlamaDecoderLayer 기반)
+        # frozen model은 NO_SHARD: 각 GPU가 전체 복사본 보유, all-gather 통신 제거
         value_model = wrap_model_fsdp(
             value_model,
             device,
-            sharding_strategy=config.distributed.fsdp.sharding_strategy,
+            sharding_strategy="NO_SHARD",
             mixed_precision=config.distributed.fsdp.mixed_precision,
             cpu_offload=config.distributed.fsdp.cpu_offload,
             activation_checkpointing=False,  # frozen 모델은 activation checkpointing 불필요
         )
-        logger.info("Value Model loaded and FSDP-wrapped (frozen)")
+        logger.info("Value Model loaded and FSDP-wrapped (frozen, NO_SHARD)")
 
         # TDStatsEMA 초기화
         td_ema_momentum = config.training.get("td_ema_momentum", 0.1)
@@ -825,7 +826,8 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
             f"Weighted Loss: {avg_val_weighted_loss:.4f}"
         )
 
-        if avg_val_loss < best_val_loss:
+        is_new_best = avg_val_loss < best_val_loss
+        if is_new_best:
             best_val_loss = avg_val_loss
             logger.info(f"New best validation loss: {best_val_loss:.4f}")
 
@@ -865,6 +867,21 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
 
         if is_main_process():
             logger.info(f"Checkpoint saved: {checkpoint_path.name} (val_loss: {avg_val_loss:.4f})")
+
+            # Best checkpoint 저장
+            if is_new_best and config.checkpoint.get("save_best", False):
+                import shutil
+                best_path = checkpoint_dir / "checkpoint_best.pt"
+                if save_lora_only:
+                    shutil.copy2(checkpoint_path, best_path)
+                    logger.info(f"Best checkpoint updated: {best_path.name}")
+                else:
+                    # full HF: symlink to avoid 16GB duplication
+                    epoch_dir = checkpoint_dir / f"epoch_{current_epoch:.2f}"
+                    if best_path.is_symlink() or best_path.exists():
+                        best_path.unlink()
+                    best_path.symlink_to(epoch_dir.resolve())
+                    logger.info(f"Best checkpoint symlinked: {best_path.name} -> {epoch_dir.name}")
 
             if config.checkpoint.save_total_limit:
                 cleanup_old_checkpoints(
@@ -922,8 +939,25 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
                 val_metrics=final_val_metrics,
             )
 
+        # Final에서도 best 갱신 체크
+        reduced_final_val = all_reduce_scalars({"val_loss": final_val_metrics["val_loss"]})
+        avg_final_val_loss = reduced_final_val["val_loss"]
+
         if is_main_process():
             logger.info(f"Final checkpoint saved: {final_path.name}")
+
+            if avg_final_val_loss < best_val_loss and config.checkpoint.get("save_best", False):
+                import shutil
+                best_path = checkpoint_dir / "checkpoint_best.pt"
+                if save_lora_only:
+                    shutil.copy2(final_path, best_path)
+                    logger.info(f"Best checkpoint updated from final: {best_path.name}")
+                else:
+                    final_dir = checkpoint_dir / "final"
+                    if best_path.is_symlink() or best_path.exists():
+                        best_path.unlink()
+                    best_path.symlink_to(final_dir.resolve())
+                    logger.info(f"Best checkpoint symlinked from final: {best_path.name}")
 
     # 15. Cleanup
     shutdown_s3_executor()
@@ -933,16 +967,23 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
         if use_s3_upload:
             sync_mlruns_to_s3()
 
-    # 최신 checkpoint 경로 반환
+    # Best or latest checkpoint 경로 반환
+    best_path = checkpoint_dir / "checkpoint_best.pt"
     epoch_checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"))
     latest_checkpoint_path = str(epoch_checkpoints[-1]) if epoch_checkpoints else None
 
+    if best_path.exists() or best_path.is_symlink():
+        result_checkpoint_path = str(best_path)
+    else:
+        result_checkpoint_path = latest_checkpoint_path
+
     logger.info(
-        f"NTP Training ({weight_mode}) 완료! Latest checkpoint: {latest_checkpoint_path}"
+        f"NTP Training ({weight_mode}) 완료! "
+        f"Best checkpoint: {result_checkpoint_path}"
     )
 
     final_metrics = final_val_metrics if config.checkpoint.save_final else val_metrics
-    return final_metrics, latest_checkpoint_path
+    return final_metrics, result_checkpoint_path
 
 
 if __name__ == "__main__":

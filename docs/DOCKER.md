@@ -46,20 +46,18 @@ docker build -t weighted-mtp:v0.2.0 .
 # 프로젝트 루트에서
 ./storage/
 ├── models/
-│   ├── meta-llama-mtp/          # 25GB
-│   └── ref-sheared-llama-2.7b/  # 10GB
+│   └── ref-sheared-llama-2.7b/  # 10GB (Value/Critic Model)
 ├── datasets/
 │   └── codecontests/processed/
 └── checkpoints/                  # 학습 결과 저장
 ```
 
+Policy Model (`meta-llama/Meta-Llama-3-8B`)은 HuggingFace에서 자동 다운로드됩니다. `HF_TOKEN` 환경변수가 필요합니다.
+
 ### 모델 준비
 
 ```bash
-# 호스트에서 실행
-uv run python scripts/create_storage/setup_models.py \
-  --model meta-llama-mtp --steps all
-
+# 호스트에서 실행 (Value/Critic Model)
 uv run python scripts/create_storage/setup_models.py \
   --model ref-sheared-llama --steps all
 ```
@@ -81,8 +79,9 @@ uv run python scripts/create_storage/setup_datasets.py \
 # 현재 디렉토리의 storage를 /storage로 마운트
 docker run --gpus all -it \
   -v $(pwd)/storage:/storage \
+  -e HF_TOKEN=${HF_TOKEN} \
   weighted-mtp:latest \
-  python src/weighted_mtp/pipelines/run_baseline.py \
+  python -m weighted_mtp.pipelines.run_baseline \
     --config configs/production/baseline.yaml
 ```
 
@@ -94,7 +93,7 @@ docker run --gpus all -it \
   -e HF_TOKEN=${HF_TOKEN} \
   -e MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI} \
   weighted-mtp:latest \
-  python src/weighted_mtp/pipelines/run_baseline.py \
+  python -m weighted_mtp.pipelines.run_baseline \
     --config configs/production/baseline.yaml
 ```
 
@@ -115,11 +114,12 @@ docker run --gpus all -it \
 # 4-GPU 분산 학습
 docker run --gpus all -it \
   -v $(pwd)/storage:/storage \
+  -e HF_TOKEN=${HF_TOKEN} \
   --shm-size=16g \
   weighted-mtp:latest \
   torchrun --nproc_per_node=4 \
-    src/weighted_mtp/pipelines/run_verifiable.py \
-    --config configs/docker/verifiable.yaml
+    -m weighted_mtp.pipelines.run_baseline \
+    --config configs/production/taw.yaml
 ```
 
 **주의**: `--shm-size=16g`로 shared memory 확장 필요 (NCCL 통신용)
@@ -140,8 +140,8 @@ docker compose up baseline
 # Critic 학습
 docker compose up critic
 
-# Verifiable WMTP 학습
-docker compose up verifiable
+# TAW (critic weight mode) 학습
+docker compose up taw
 
 # 분산 학습 (4-GPU)
 docker compose up distributed
@@ -171,7 +171,7 @@ docker run --gpus all -it \
   weighted-mtp:latest \
   bash -c "
     aws s3 sync s3://your-bucket/models /storage/models --quiet &&
-    python src/weighted_mtp/pipelines/run_baseline.py --config configs/docker/baseline.yaml
+    python -m weighted_mtp.pipelines.run_baseline --config configs/docker/baseline.yaml
   "
 ```
 

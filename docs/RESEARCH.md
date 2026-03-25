@@ -8,7 +8,7 @@ Weighted Multi-Token Prediction (WMTP)의 이론적 배경 및 실험 설계.
 
 **"Not All Tokens Are What You Need"**
 
-표준 MTP는 모든 미래 토큰을 균등 가중으로 다루어, 쉬운/비핵심 토큰에도 동일한 학습 자원을 배분한다. 중요 토큰에 계산을 집중하는 WMTP는 동일 FLOPs에서 더 높은 성능과 안정적 수렴을 달성한다.
+표준 NTP는 모든 토큰을 균등 가중으로 다루어, 쉬운/비핵심 토큰에도 동일한 학습 자원을 배분한다. 중요 토큰에 계산을 집중하는 WNTP는 동일 FLOPs에서 더 높은 성능과 안정적 수렴을 달성한다.
 
 ---
 
@@ -169,21 +169,18 @@ L_policy = Σ_{t,k} w_t · CE(head_k, y_{t+k})
 ```
 weighted_mtp/
 ├── pipelines/
-│   ├── run_baseline.py      # Baseline MTP (균등 가중치)
+│   ├── run_baseline.py      # NTP 학습 (4 weight modes: uniform/critic/random/shuffled)
 │   ├── run_critic.py        # Value Model 독립 학습 (Pairwise Ranking)
-│   ├── run_verifiable.py    # Verifiable WMTP (GAE 가중화)
-│   ├── run_ref_tuning.py    # Reference Model 도메인 적응 (Backup)
-│   ├── run_rho1.py          # Rho-1 WMTP (Backup Plan)
 │   └── run_evaluation.py    # Pass@K 평가
 ├── value_weighting/
 │   ├── td_weighting.py      # GAE/TD error 기반 가중화
 │   ├── td_stats_ema.py      # EMA 기반 통계 정규화
-│   └── rho1_weighting.py    # Rho-1 selection (Backup)
+│   └── control_weights.py   # 대조군 가중치 (random, shuffled)
 ├── data/
 │   ├── datasets.py          # 메타데이터 기반 샘플링 (Pairwise, Length-balanced)
 │   └── collators.py         # Alpaca 템플릿 적용 및 Loss Masking
 └── utils/
-    ├── loss_utils.py        # MTP CE Loss 계산
+    ├── loss_utils.py        # NTP CE Loss 계산
     └── pairwise_utils.py    # Pairwise Ranking Loss, λ-return
 ```
 
@@ -202,7 +199,7 @@ w_{t,k} = 1.0 (모든 k)
 - **목적**: 비교 기준선
 - **특징**: 표준 SFT, `compute_mtp_ce_loss_unweighted()` 사용
 
-### 방식 2: Verifiable Critic WMTP (주요 방식)
+### 방식 2: TAW - Token Advantage Weighting (주요 방식, weight_mode: critic)
 
 데이터셋의 검증 가능한 레이블(is_correct)을 reward signal로 사용.
 **독립 Value Model + GAE Advantage 기반 가중화** 구조.
@@ -240,7 +237,7 @@ total_loss = pairwise_coef * pairwise_loss
 
 **Lambda Return (대안)**: `loss_type="lambda_return"` 설정 시 TD(λ) 기반 타겟으로 학습 가능하나, 실험 결과 Pairwise Ranking이 더 효과적이었음.
 
-#### Phase 2: Weighted Policy Training (run_verifiable.py)
+#### Phase 2: Weighted Policy Training (run_baseline.py, weight_mode: critic)
 
 학습된 Value Model을 frozen 상태로 로드하여 GAE Advantage 기반 가중치 계산.
 
@@ -299,34 +296,27 @@ weighted_ce_loss = compute_mtp_ce_loss(
 - ILQL: Inference 시 `logits += β(Q - V)`로 perturbation
 - WMTP: Training 시 `loss = Σ exp(A/β) · CE`로 가중화 → Inference 비용 없음
 
-### 방식 3: Rho-1 WMTP (Backup Plan)
+### 방식 3: 대조군 (weight_mode: random / shuffled)
 
-Verifiable Critic이 유의미한 결과를 보여 실제 실험 검증은 수행하지 않았으나, 대안 접근법으로 파이프라인을 유지한다.
+TAW의 가중치 효과를 검증하기 위한 대조군 파이프라인.
 
-**핵심 아이디어**: Reference Model과 Policy Model의 loss 차이 기반 토큰 선택
+- **Random-Matched** (`weight_mode: random`): TAW와 동일한 통계 분포(LogNormal)의 랜덤 가중치 적용
+- **Shuffled** (`weight_mode: shuffled`): TAW의 실제 가중치를 시퀀스 내에서 위치만 셔플하여 적용
 
-```
-excess_loss = CE_policy - CE_reference
-weights = TopK(excess_loss, k_percent)  # binary selection
-```
-
-**파이프라인**: `run_ref_tuning.py` → `run_rho1.py`
+**목적**: 가중치의 "분포"가 아닌 "위치(토큰별 배정)"가 성능 향상의 원인임을 입증
 
 ---
 
 ## 비교 테이블
 
-| 특성 | Baseline | Verifiable Critic | Rho-1 (Backup) |
-|------|----------|-------------------|----------------|
-| **가중치 산출** | 상수 (1.0) | GAE Advantage → exp weighting | Excess loss Top-k |
-| **Value 학습** | 없음 | 독립 모델 (Pairwise Ranking) | 없음 |
-| **가중치 차원** | 없음 | [batch, seq] 2D | [batch, seq, n_future] 3D |
-| **외부 모델** | 불필요 | Value Model (2.7B) | Reference Model (2.7B) |
-| **데이터 요구** | 정답만 | 정답+오답 (Pairwise) | 정답만 |
-| **학습 파이프라인** | 1단계 | 2단계 (Critic → Policy) | 2단계 (Ref → Policy) |
-| **구현 복잡도** | 낮음 | 높음 | 중간 |
-| **이론적 기반** | 표준 SFT | GAE + Pairwise Ranking + AWR | 정보 이론 |
-| **Negative signal** | 미사용 | 활용 (Pairwise 비교) | 미사용 |
+| 특성 | Baseline (uniform) | TAW (critic) | Random-Matched | Shuffled |
+|------|-------------------|-------------|----------------|----------|
+| **가중치 산출** | 상수 (1.0) | GAE Advantage → exp weighting | LogNormal 랜덤 | Critic 가중치 셔플 |
+| **Value 학습** | 없음 | 독립 모델 (Pairwise Ranking) | 없음 | Critic 필요 |
+| **외부 모델** | 불필요 | Value Model (2.7B) | 불필요 | Value Model (2.7B) |
+| **데이터 요구** | 정답만 | 정답+오답 (Pairwise) | 정답만 | 정답+오답 |
+| **학습 파이프라인** | 1단계 | 2단계 (Critic → Policy) | 1단계 | 2단계 |
+| **이론적 기반** | 표준 SFT | GAE + Pairwise Ranking + AWR | 대조군 | 대조군 |
 
 ---
 
@@ -515,20 +505,20 @@ def _sample_length_balanced_pairs(problem_index_map, n_samples, ...):
 
 | 모델 | 용도 | 크기 |
 |------|------|------|
-| Meta-LLaMA MTP | Policy Model | 7B (4-head MTP) |
-| Sheared-LLaMA | Value Model | 2.7B |
+| meta-llama/Meta-Llama-3-8B | Policy Model (LlamaForCausalLM) | 8B |
+| Sheared-LLaMA | Value Model (LlamaModel) | 2.7B |
 
 ### 학습 설정 (Production)
 
-| 항목 | Baseline | Critic | Verifiable |
-|------|----------|--------|------------|
+| 항목 | Baseline (uniform) | Critic | TAW (critic) |
+|------|-------------------|--------|-------------|
 | **Epochs** | 1.0 | 3.0 | 1.0 |
 | **Batch Size** | 12/GPU | 8/GPU | 12/GPU |
 | **Learning Rate** | 1e-4 | 5e-5 | 1e-4 |
 | **LoRA Rank** | 64 | 64 | 64 |
 | **Gradient Accum** | 2 | 2 | 2 |
 
-### Verifiable 핵심 Hyperparameters
+### TAW 핵심 Hyperparameters
 
 ```yaml
 training:
@@ -578,34 +568,38 @@ training:
 
 ## 파이프라인 실행 순서
 
-### Baseline
+### Baseline (uniform)
 ```bash
 python -m weighted_mtp.pipelines.run_baseline --config configs/production/baseline.yaml
 ```
 
-### Verifiable (2단계)
+### TAW (critic weight mode, 2단계)
 ```bash
 # Phase 1: Critic 학습 (Pairwise Ranking)
 python -m weighted_mtp.pipelines.run_critic --config configs/production/critic_mlp.yaml
 
 # Phase 2: Policy 학습 (Critic checkpoint 필요)
-python -m weighted_mtp.pipelines.run_verifiable --config configs/production/verifiable.yaml
+python -m weighted_mtp.pipelines.run_baseline --config configs/production/taw.yaml
 ```
 
-### Rho-1 (Backup Plan)
-Verifiable 접근이 실패할 경우를 대비한 대안 파이프라인.
+### 대조군
 ```bash
-# Phase 1: Reference 도메인 적응
-python -m weighted_mtp.pipelines.run_ref_tuning --config configs/production/ref_tuning.yaml
+# Random-Matched
+python -m weighted_mtp.pipelines.run_baseline --config configs/production/random_matched.yaml
 
-# Phase 2: Policy 학습 (Reference checkpoint 필요)
-python -m weighted_mtp.pipelines.run_rho1 --config configs/production/rho1.yaml
+# Shuffled (Critic checkpoint 필요)
+python -m weighted_mtp.pipelines.run_baseline --config configs/production/shuffled.yaml
+```
+
+### 분산 학습 (4-GPU)
+```bash
+torchrun --nproc_per_node=4 -m weighted_mtp.pipelines.run_baseline --config configs/production/taw.yaml
 ```
 
 ### 평가
 ```bash
-python -m weighted_mtp.pipelines.run_evaluation \
-  --checkpoint storage/checkpoints/verifiable/checkpoint_best.pt \
+python -m weighted_mtp evaluate \
+  --checkpoint storage/checkpoints/taw/checkpoint_best.pt \
   --dataset humaneval \
   --temperature 0.2
 ```

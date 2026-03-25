@@ -25,9 +25,9 @@ class TestValidateConfigBasic:
         validate_config(config)
 
     @patch("pathlib.Path.exists", return_value=True)
-    def test_valid_verifiable_config(self, mock_exists, project_root: Path):
-        """유효한 verifiable config 검증 통과"""
-        config_path = project_root / "configs" / "production" / "verifiable.yaml"
+    def test_valid_taw_config(self, mock_exists, project_root: Path):
+        """유효한 TAW config 검증 통과"""
+        config_path = project_root / "configs" / "production" / "taw.yaml"
         config = OmegaConf.load(config_path)
 
         # 검증 통과 (예외 없음)
@@ -192,8 +192,8 @@ class TestValidateConfigLogicalConsistency:
 class TestValidateStageSpecific:
     """Stage별 특수 검증 테스트"""
 
-    def test_verifiable_missing_beta(self):
-        """Verifiable stage에서 beta 필드 누락"""
+    def test_invalid_stage_verifiable(self):
+        """삭제된 verifiable stage 사용 시 실패"""
         config = OmegaConf.create(
             {
                 "experiment": {"name": "test", "stage": "verifiable"},
@@ -207,77 +207,19 @@ class TestValidateStageSpecific:
                     "n_epochs": 1,
                     "batch_size": 4,
                     "learning_rate": 1e-4,
-                    # beta 누락
                 },
             }
         )
 
-        with pytest.raises(ConfigValidationError, match="training.beta 필드 필수"):
+        with pytest.raises(ConfigValidationError, match="잘못된 stage"):
             validate_config(config)
 
-    def test_verifiable_invalid_weight_clip(self):
-        """Verifiable stage에서 weight_clip_min >= max"""
-        config = OmegaConf.create(
-            {
-                "experiment": {"name": "test", "stage": "verifiable"},
-                "models": {"policy": {"path": "storage/models/micro-mtp"}},
-                "dataset": {
-                    "name": "codecontests",
-                    "train": "storage/datasets/codecontests/processed/train.jsonl",
-                    "validation": "storage/datasets/codecontests/processed/valid.jsonl",
-                },
-                "training": {
-                    "n_epochs": 1,
-                    "batch_size": 4,
-                    "learning_rate": 1e-4,
-                    "beta": 0.9,
-                    "weight_clip_min": 5.0,
-                    "weight_clip_max": 1.0,  # min > max
-                },
-            }
-        )
-
-        with pytest.raises(
-            ConfigValidationError, match="weight_clip_min.*weight_clip_max"
-        ):
-            validate_config(config)
-
-    def test_verifiable_curriculum_without_schedule(self):
-        """Curriculum learning 활성화했는데 schedule 없음"""
-        config = OmegaConf.create(
-            {
-                "experiment": {"name": "test", "stage": "verifiable"},
-                "models": {"policy": {"path": "storage/models/micro-mtp"}},
-                "dataset": {
-                    "name": "codecontests",
-                    "train": "storage/datasets/codecontests/processed/train.jsonl",
-                    "validation": "storage/datasets/codecontests/processed/valid.jsonl",
-                },
-                "training": {
-                    "n_epochs": 1,
-                    "batch_size": 4,
-                    "learning_rate": 1e-4,
-                    "beta": 0.9,
-                },
-                "data_sampling": {
-                    "curriculum_learning": True,
-                    # curriculum_schedule 누락
-                },
-            }
-        )
-
-        with pytest.raises(
-            ConfigValidationError, match="curriculum_schedule 필수"
-        ):
-            validate_config(config)
-
-    def test_rho1_missing_reference_model(self):
-        """Rho1 stage에서 reference model 누락"""
+    def test_invalid_stage_rho1(self):
+        """삭제된 rho1 stage 사용 시 실패"""
         config = OmegaConf.create(
             {
                 "experiment": {"name": "test", "stage": "rho1"},
                 "models": {"policy": {"path": "storage/models/micro-mtp"}},
-                # reference 누락
                 "dataset": {
                     "name": "codecontests",
                     "train": "storage/datasets/codecontests/processed/train.jsonl",
@@ -291,9 +233,7 @@ class TestValidateStageSpecific:
             }
         )
 
-        with pytest.raises(
-            ConfigValidationError, match="models.reference.path 필드 필수"
-        ):
+        with pytest.raises(ConfigValidationError, match="잘못된 stage"):
             validate_config(config)
 
 
@@ -360,7 +300,7 @@ class TestValidateConfigPathChecks:
         """Checkpoint 경로는 검증 건너뜀"""
         config = OmegaConf.create(
             {
-                "experiment": {"name": "test", "stage": "verifiable"},
+                "experiment": {"name": "test", "stage": "baseline"},
                 "models": {"policy": {"path": "/nonexistent/checkpoint.pt"}},
                 "dataset": {
                     "name": "codecontests",
@@ -371,12 +311,9 @@ class TestValidateConfigPathChecks:
                     "n_epochs": 1,
                     "batch_size": 4,
                     "learning_rate": 1e-4,
-                    "beta": 0.2,
-                    "weight_clip_min": 0.1,
-                    "weight_clip_max": 3.0,
                 },
                 "data_sampling": {
-                    "use_pairwise": True,
+                    "use_pairwise": False,
                     "n_samples": 100,
                 },
             }
