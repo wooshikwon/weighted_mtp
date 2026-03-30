@@ -45,15 +45,15 @@ data_sampling:
   use_pairwise: true
   val_n_samples: 500        # Validation 샘플 수
 
-  # CodeContests+: 전체 pair capacity에 맞춰 조정
-  # 전체 실험: setup_codecontests_plus.py 메타데이터의 pair capacity 참고
-  # Go/No-Go: 125000 이하로 축소
-  n_samples: 125000
-  max_pairs_per_problem: 50  # problem당 최대 쌍 수 (다양성 확보, 과적합 방지)
+  # CodeContests+: length-balanced pair capacity ~258K (cap=80, diff=[1,25])
+  # 전체 실험: 250K (가용 258K의 97%)
+  # Go/No-Go: --override data_sampling.n_samples=10000 으로 축소
+  n_samples: 250000
+  max_pairs_per_problem: 80  # problem당 최대 쌍 수 (50→80: 다양성 유지하면서 데이터 활용 극대화)
 
   # Length-Balanced 샘플링 (길이 편향 제거)
+  # 정답(mean 175.7 tok) vs 오답(mean 263.2 tok)의 87.5토큰 길이 편향을 제거
   # 같은 problem 내 같은 length bin에서 correct/incorrect 매칭
-  # 세분화된 bin으로 평균 |Diff| 42.7 → 18.8 토큰 (56% 감소)
   use_length_balanced: true
   length_bins: [0, 50, 100, 125, 150, 175, 200, 250, 300, 350, 400, 500, 600, 800, 1000, 1500, 2000]
 
@@ -126,6 +126,8 @@ checkpoint:
   save_total_limit: 6
   save_lora_only: true
   s3_upload: false
+  hf_upload: true
+  hf_repo_id: wooshikwon/weighted-mtp-checkpoints
 
 # 런타임 설정
 runtime:

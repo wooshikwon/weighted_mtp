@@ -24,11 +24,11 @@ dataset:
 # Data sampling
 data_sampling:
   seed: 42
-  n_samples: 200000
+  n_samples: 350000
   val_n_samples: 5000
   use_pairwise: false
   difficulty_bins:
-    all: [0, 25]
+    all: [1, 25]            # Critic과 동일 범위 (diff=0은 난이도 정보 없음)
   difficulty_weights:
     all: 1.0
 
@@ -77,6 +77,8 @@ checkpoint:
   save_lora_only: true
   save_total_limit: 3
   save_best: true
+  hf_upload: true
+  hf_repo_id: wooshikwon/weighted-mtp-checkpoints
 
 # Runtime
 runtime:

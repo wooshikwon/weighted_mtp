@@ -457,6 +457,8 @@ def save_value_model_checkpoint(
     config: Any = None,
     s3_upload: bool = False,
     experiment_name: str | None = None,
+    hf_upload: bool = False,
+    hf_repo_id: str | None = None,
 ) -> None:
     """Value Model checkpoint 저장 (FSDP 지원, 메모리 효율적)
 
@@ -477,7 +479,9 @@ def save_value_model_checkpoint(
         checkpoint_path: 저장 경로
         config: 학습 설정 (OmegaConf DictConfig 또는 dict)
         s3_upload: S3 업로드 여부
-        experiment_name: 실험 이름 (S3 경로 구성에 사용)
+        experiment_name: 실험 이름 (S3/HF 경로 구성에 사용)
+        hf_upload: HF Hub 업로드 여부
+        hf_repo_id: HF repo ID (e.g., "wooshikwon/weighted-mtp-checkpoints")
 
     Saved checkpoint format (LoRA mode):
         {
@@ -629,6 +633,13 @@ def save_value_model_checkpoint(
         logger.info(f"S3 업로드 예약: {checkpoint_path.name}")
     elif s3_upload and not experiment_name:
         logger.warning(f"S3 업로드 건너뜀 (experiment_name 없음): {checkpoint_path.name}")
+
+    # HF Hub 업로드 (메인 스레드에서 temp copy 후, 비동기 업로드)
+    if hf_upload and experiment_name and hf_repo_id:
+        from weighted_mtp.utils.hf_utils import submit_hf_upload
+        submit_hf_upload(checkpoint_path, experiment_name, hf_repo_id)
+    elif hf_upload and not hf_repo_id:
+        logger.warning(f"HF 업로드 건너뜀 (hf_repo_id 없음): {checkpoint_path.name}")
 
 
 def _extract_value_model_trainable_params_fsdp(

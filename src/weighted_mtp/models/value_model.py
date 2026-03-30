@@ -1,9 +1,9 @@
 """독립 Value Model
 
 HuggingFace LlamaModel 기반의 완전 독립된 Value Model.
-Policy Model(LlamaForCausalLM)과 완전히 분리되어 별도 backbone 사용.
+Policy Model(MTP)과 완전히 분리되어 별도 backbone 사용.
 
-Critic 파이프라인에서 학습, Baseline (critic weight mode)에서 eval only로 사용.
+Critic 파이프라인에서 학습, Verifiable에서 eval only로 사용.
 """
 
 from pathlib import Path
@@ -14,6 +14,32 @@ from torch import nn
 from transformers import LlamaModel, LlamaConfig
 
 from .value_head import create_value_head, ValueHeadType
+
+
+def _extract_value_head_config(config_dict: dict) -> tuple[str, float]:
+    """Checkpoint config에서 value head 설정 추출
+
+    두 가지 config 구조를 모두 지원:
+    - nested: training.value_head.type / training.value_head.dropout
+    - flat (legacy): training.value_head_type / training.dropout
+
+    Args:
+        config_dict: checkpoint에 저장된 전체 config dict
+
+    Returns:
+        (value_head_type, dropout) 튜플
+    """
+    training_config = config_dict.get("training", {})
+    value_head_config = training_config.get("value_head", {})
+
+    if isinstance(value_head_config, dict) and value_head_config:
+        value_head_type = value_head_config.get("type", "mlp")
+        dropout = value_head_config.get("dropout", 0.0)
+    else:
+        value_head_type = training_config.get("value_head_type", "mlp")
+        dropout = training_config.get("dropout", 0.0)
+
+    return value_head_type, dropout
 
 
 class ValueModel(nn.Module):
@@ -209,10 +235,7 @@ class ValueModel(nn.Module):
 
         # Config에서 value head 설정 추출
         config_dict = checkpoint.get("config", {})
-        training_config = config_dict.get("training", {})
-        value_head_config = training_config.get("value_head", {})
-        value_head_type = value_head_config.get("type", training_config.get("value_head_type", "mlp"))
-        dropout = value_head_config.get("dropout", training_config.get("dropout", 0.0))
+        value_head_type, dropout = _extract_value_head_config(config_dict)
 
         models_config = config_dict.get("models", {})
         value_model_config = models_config.get("value_model", {})
@@ -276,10 +299,7 @@ class ValueModel(nn.Module):
             )
 
         # 학습 설정 추출
-        training_config = config_dict.get("training", {})
-        value_head_config = training_config.get("value_head", {})
-        value_head_type = value_head_config.get("type", training_config.get("value_head_type", "mlp"))
-        dropout = value_head_config.get("dropout", training_config.get("dropout", 0.0))
+        value_head_type, dropout = _extract_value_head_config(config_dict)
         dtype = value_model_config.get("dtype", "bfloat16")
 
         # 모델 생성

@@ -52,6 +52,13 @@ from weighted_mtp.utils.s3_utils import (
     sync_mlruns_to_s3,
     upload_to_s3_async,
 )
+from weighted_mtp.utils.hf_utils import (
+    ensure_hf_repo,
+    reset_hf_executor,
+    shutdown_hf_executor,
+    submit_hf_cleanup,
+    submit_hf_upload,
+)
 from weighted_mtp.utils.scheduler_utils import (
     create_param_groups,
     create_scheduler,
@@ -112,6 +119,12 @@ __all__ = [
     "sync_checkpoints_to_s3",
     "sync_mlruns_to_s3",
     "upload_to_s3_async",
+    # HF utils
+    "ensure_hf_repo",
+    "reset_hf_executor",
+    "shutdown_hf_executor",
+    "submit_hf_cleanup",
+    "submit_hf_upload",
     # Logging utils
     "compute_classification_metrics_from_counts",
     "compute_critic_classification_counts",

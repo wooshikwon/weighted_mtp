@@ -35,11 +35,15 @@ from weighted_mtp.utils import (
     cleanup_s3_checkpoints,
     compute_gradient_clip_stats,
     create_scheduler,
+    ensure_hf_repo,
     get_model_size,
     get_system_info,
     save_hf_checkpoint,
     save_hf_lora_checkpoint,
+    shutdown_hf_executor,
     shutdown_s3_executor,
+    submit_hf_cleanup,
+    submit_hf_upload,
     sync_mlruns_to_s3,
 )
 from weighted_mtp.utils.loss_utils import compute_weighted_ntp_loss
@@ -346,6 +350,10 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
     # 5. MLflow 초기화 (Rank 0만)
     use_mlflow = bool(config.mlflow.experiment)
     use_s3_upload = config.checkpoint.get("s3_upload", True) and use_mlflow
+    use_hf_upload = config.checkpoint.get("hf_upload", False)
+    hf_repo_id = config.checkpoint.get("hf_repo_id", None)
+    if use_hf_upload and is_main_process():
+        ensure_hf_repo(hf_repo_id)
     mlflow_run_id = None
     if is_main_process() and use_mlflow:
         mlflow.set_tracking_uri(config.mlflow.tracking_uri)
@@ -883,6 +891,10 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
                     best_path.symlink_to(epoch_dir.resolve())
                     logger.info(f"Best checkpoint symlinked: {best_path.name} -> {epoch_dir.name}")
 
+            # HF Hub 업로드 (메인 스레드에서 temp copy 후, 비동기 업로드)
+            if use_hf_upload and checkpoint_path.exists():
+                submit_hf_upload(checkpoint_path, config.experiment.name, hf_repo_id)
+
             if config.checkpoint.save_total_limit:
                 cleanup_old_checkpoints(
                     checkpoint_dir=checkpoint_dir,
@@ -893,6 +905,13 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
                     cleanup_s3_checkpoints(
                         experiment_name=config.experiment.name,
                         save_total_limit=config.checkpoint.save_total_limit,
+                    )
+
+                if use_hf_upload:
+                    submit_hf_cleanup(
+                        experiment_name=config.experiment.name,
+                        save_total_limit=config.checkpoint.save_total_limit,
+                        repo_id=hf_repo_id,
                     )
 
         next_checkpoint_epoch += save_checkpoint_every
@@ -959,8 +978,12 @@ def run_baseline_training(config: DictConfig) -> tuple[dict[str, float], str]:
                     best_path.symlink_to(final_dir.resolve())
                     logger.info(f"Best checkpoint symlinked from final: {best_path.name}")
 
+            if use_hf_upload and final_path.exists():
+                submit_hf_upload(final_path, config.experiment.name, hf_repo_id)
+
     # 15. Cleanup
     shutdown_s3_executor()
+    shutdown_hf_executor()
     if is_main_process() and use_mlflow:
         mlflow.end_run()
 

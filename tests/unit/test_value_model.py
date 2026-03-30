@@ -8,7 +8,7 @@ import torch
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from weighted_mtp.models.value_model import ValueModel
+from weighted_mtp.models.value_model import ValueModel, _extract_value_head_config
 from weighted_mtp.models.value_head import (
     LinearValueHead,
     MLPValueHead,
@@ -168,22 +168,71 @@ class TestValueModel:
         assert value_model.num_layers == 4
 
 
+class TestExtractValueHeadConfig:
+    """_extract_value_head_config 테스트"""
+
+    def test_nested_config(self):
+        """nested 구조 (training.value_head.type) — 현재 production config 형식"""
+        config_dict = {
+            "training": {
+                "value_head": {
+                    "type": "mlp",
+                    "dropout": 0.2,
+                }
+            }
+        }
+        vtype, dropout = _extract_value_head_config(config_dict)
+        assert vtype == "mlp"
+        assert dropout == 0.2
+
+    def test_flat_config(self):
+        """flat 구조 (training.value_head_type) — legacy 형식"""
+        config_dict = {
+            "training": {
+                "value_head_type": "linear",
+                "dropout": 0.15,
+            }
+        }
+        vtype, dropout = _extract_value_head_config(config_dict)
+        assert vtype == "linear"
+        assert dropout == 0.15
+
+    def test_empty_config(self):
+        """config 없을 때 기본값"""
+        vtype, dropout = _extract_value_head_config({})
+        assert vtype == "mlp"
+        assert dropout == 0.0
+
+    def test_nested_partial_config(self):
+        """nested 구조에서 일부 키만 있는 경우"""
+        config_dict = {
+            "training": {
+                "value_head": {
+                    "type": "sigmoid",
+                }
+            }
+        }
+        vtype, dropout = _extract_value_head_config(config_dict)
+        assert vtype == "sigmoid"
+        assert dropout == 0.0
+
+
 class TestValueModelCheckpoint:
     """ValueModel checkpoint 로드 테스트"""
-    
+
     def test_from_checkpoint_missing_config(self, tmp_path):
         """config 누락 시 에러"""
         checkpoint_path = tmp_path / "checkpoint.pt"
         torch.save({"epoch": 1}, checkpoint_path)
-        
+
         with pytest.raises(ValueError, match="모델 경로가 없습니다"):
             ValueModel.from_checkpoint(str(checkpoint_path))
-    
-    def test_from_checkpoint_with_state_dict(self, tmp_path):
-        """state_dict가 있는 checkpoint 로드"""
+
+    def test_from_checkpoint_with_flat_config(self, tmp_path):
+        """flat config 구조 (legacy) checkpoint 로드"""
         checkpoint_path = tmp_path / "checkpoint.pt"
-        
-        # Mock checkpoint
+
+        # Mock checkpoint (legacy flat key 구조)
         checkpoint = {
             "epoch": 1,
             "config": {
@@ -202,16 +251,16 @@ class TestValueModelCheckpoint:
             "value_head_state_dict": {},
         }
         torch.save(checkpoint, checkpoint_path)
-        
+
         # from_pretrained를 mock
         with patch.object(ValueModel, 'from_pretrained') as mock_pretrained:
             mock_model = MagicMock()
             mock_model.backbone = MagicMock()
             mock_model.value_head = MagicMock()
             mock_pretrained.return_value = mock_model
-            
+
             model = ValueModel.from_checkpoint(str(checkpoint_path))
-            
+
             # from_pretrained 호출 검증
             mock_pretrained.assert_called_once_with(
                 model_path="test/path",
@@ -220,10 +269,52 @@ class TestValueModelCheckpoint:
                 device="cuda",
                 dtype="bfloat16",
             )
-            
+
             # state_dict 로드 검증
             mock_model.backbone.load_state_dict.assert_called_once()
             mock_model.value_head.load_state_dict.assert_called_once()
+
+    def test_from_checkpoint_with_nested_config(self, tmp_path):
+        """nested config 구조 (production) checkpoint 로드"""
+        checkpoint_path = tmp_path / "checkpoint.pt"
+
+        # Mock checkpoint (현재 production config 구조)
+        checkpoint = {
+            "epoch": 1,
+            "config": {
+                "models": {
+                    "value_model": {
+                        "path": "test/path",
+                        "dtype": "bfloat16",
+                    }
+                },
+                "training": {
+                    "value_head": {
+                        "type": "mlp",
+                        "dropout": 0.2,
+                    }
+                }
+            },
+            "backbone_state_dict": {},
+            "value_head_state_dict": {},
+        }
+        torch.save(checkpoint, checkpoint_path)
+
+        with patch.object(ValueModel, 'from_pretrained') as mock_pretrained:
+            mock_model = MagicMock()
+            mock_model.backbone = MagicMock()
+            mock_model.value_head = MagicMock()
+            mock_pretrained.return_value = mock_model
+
+            model = ValueModel.from_checkpoint(str(checkpoint_path))
+
+            mock_pretrained.assert_called_once_with(
+                model_path="test/path",
+                value_head_type="mlp",
+                dropout=0.2,
+                device="cuda",
+                dtype="bfloat16",
+            )
 
 
 class TestValueModelIntegration:

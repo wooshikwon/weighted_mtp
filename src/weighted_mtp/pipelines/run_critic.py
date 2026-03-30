@@ -35,13 +35,16 @@ from weighted_mtp.utils import (
     compute_token_variance,
     create_output_end_mask,
     create_scheduler,
+    ensure_hf_repo,
     get_model_dtype,
     get_scheduled_lambda,
     get_model_size,
     get_system_info,
     pairwise_ranking_loss,
     save_value_model_checkpoint,
+    shutdown_hf_executor,
     shutdown_s3_executor,
+    submit_hf_cleanup,
     sync_mlruns_to_s3,
 )
 from weighted_mtp.runtime import (
@@ -360,6 +363,10 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
     # 5. MLflow 초기화 (Rank 0만, experiment 이름이 있는 경우만)
     use_mlflow = bool(config.mlflow.experiment)
     use_s3_upload = config.checkpoint.get("s3_upload", True) and use_mlflow
+    use_hf_upload = config.checkpoint.get("hf_upload", False)
+    hf_repo_id = config.checkpoint.get("hf_repo_id", None)
+    if use_hf_upload and is_main_process():
+        ensure_hf_repo(hf_repo_id)
     mlflow_run_id = None
     if is_main_process() and use_mlflow:
         mlflow.set_tracking_uri(config.mlflow.tracking_uri)
@@ -1092,6 +1099,8 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             config=config,
             s3_upload=use_s3_upload,
             experiment_name=config.experiment.name,
+            hf_upload=use_hf_upload,
+            hf_repo_id=hf_repo_id,
         )
 
         # 로깅 및 cleanup은 rank 0만 수행
@@ -1109,6 +1118,13 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
                     cleanup_s3_checkpoints(
                         experiment_name=config.experiment.name,
                         save_total_limit=config.checkpoint.save_total_limit,
+                    )
+
+                if use_hf_upload:
+                    submit_hf_cleanup(
+                        experiment_name=config.experiment.name,
+                        save_total_limit=config.checkpoint.save_total_limit,
+                        repo_id=hf_repo_id,
                     )
 
         next_checkpoint_epoch += save_checkpoint_every
@@ -1167,6 +1183,8 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
             config=config,
             s3_upload=use_s3_upload,
             experiment_name=config.experiment.name,
+            hf_upload=use_hf_upload,
+            hf_repo_id=hf_repo_id,
         )
 
         if is_main_process():
@@ -1174,6 +1192,7 @@ def run_critic_training(config: DictConfig) -> tuple[dict[str, float], str]:
 
     # 9. 종료
     shutdown_s3_executor()
+    shutdown_hf_executor()
     if is_main_process() and use_mlflow:
         mlflow.end_run()
 
