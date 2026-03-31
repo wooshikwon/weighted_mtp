@@ -24,7 +24,7 @@ class TestDistributedLoading:
 
         # 데이터 로드
         dataset = load_dataset(
-            dataset_name="mbpp",
+            dataset_name="codecontests",
             split="train",
             sampling_config={
                 "n_samples": total_samples,
@@ -57,7 +57,7 @@ class TestDistributedLoading:
         # 모든 rank의 데이터 수집
         for rank in range(world_size):
             dataset = load_dataset(
-                dataset_name="mbpp",
+                dataset_name="codecontests",
                 split="train",
                 sampling_config={
                     "n_samples": total_samples,
@@ -89,7 +89,7 @@ class TestDistributedLoading:
         # 모든 rank의 데이터 수집
         for rank in range(world_size):
             dataset = load_dataset(
-                dataset_name="mbpp",
+                dataset_name="codecontests",
                 split="train",
                 sampling_config={
                     "n_samples": total_samples,
@@ -120,7 +120,7 @@ class TestDistributedLoading:
 
         # 첫 번째 로드
         dataset1 = load_dataset(
-            dataset_name="mbpp",
+            dataset_name="codecontests",
             split="train",
             sampling_config={
                 "n_samples": total_samples,
@@ -136,7 +136,7 @@ class TestDistributedLoading:
 
         # 두 번째 로드 (같은 seed)
         dataset2 = load_dataset(
-            dataset_name="mbpp",
+            dataset_name="codecontests",
             split="train",
             sampling_config={
                 "n_samples": total_samples,
@@ -163,7 +163,7 @@ class TestDistributedLoading:
 
         for rank in range(world_size):
             dataset = load_dataset(
-                dataset_name="mbpp",
+                dataset_name="codecontests",
                 split="train",
                 sampling_config={
                     "n_samples": total_samples,

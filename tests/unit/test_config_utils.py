@@ -18,7 +18,7 @@ class TestValidateConfigBasic:
     @patch("pathlib.Path.exists", return_value=True)
     def test_valid_baseline_config(self, mock_exists, project_root: Path):
         """유효한 baseline config 검증 통과"""
-        config_path = project_root / "configs" / "local" / "baseline_local.yaml"
+        config_path = project_root / "configs" / "production" / "baseline.yaml"
         config = OmegaConf.load(config_path)
 
         # 검증 통과 (예외 없음)
@@ -244,7 +244,7 @@ class TestLoadAndValidateConfig:
     @patch("pathlib.Path.exists", return_value=True)
     def test_load_valid_config(self, mock_exists, project_root: Path):
         """유효한 config 로드 및 검증"""
-        config_path = project_root / "configs" / "local" / "baseline_local.yaml"
+        config_path = project_root / "configs" / "production" / "baseline.yaml"
         config = load_and_validate_config(str(config_path))
 
         assert config.experiment.stage == "baseline"

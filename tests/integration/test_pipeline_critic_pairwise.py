@@ -62,8 +62,16 @@ def pairwise_test_config():
             "n_epochs": 0.1,  # 빠른 테스트
             "batch_size": 1,
             "gradient_accumulation_steps": 1,
-            "backbone_frozen": True,  # value head만 학습
-            "use_lora": False,
+            "backbone_frozen": True,
+            "use_lora": True,  # LoRA로 backbone grad chain 유지 (production 동일)
+            "lora": {
+                "rank": 4,
+                "alpha": 8.0,
+                "dropout": 0.0,
+                "target_modules": ["q_proj", "v_proj"],
+                "learning_rate": 1e-4,
+                "weight_decay": 0.0,
+            },
             "max_grad_norm": 1.0,
             "log_interval": 1,
             "value_head": {

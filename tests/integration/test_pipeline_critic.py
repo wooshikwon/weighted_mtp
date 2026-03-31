@@ -24,9 +24,15 @@ def test_critic_pipeline_micro_mtp():
     if not torch.backends.mps.is_available():
         pytest.skip("MPS not available on this machine")
 
-    # Test config 경로
-    config_path = "configs/local/critic_local.yaml"
+    # Test config 경로 (production config 기반)
+    config_path = "configs/production/critic_mlp.yaml"
     assert Path(config_path).exists(), f"Config not found: {config_path}"
+
+    # Production config는 llama3-8b-code-merged (LoRA Merge 결과)를 참조 — 로컬에 없으면 skip
+    config_tmp = OmegaConf.load(config_path)
+    model_path = Path(config_tmp.models.value_model.path)
+    if not model_path.exists():
+        pytest.skip(f"Merged model not found (created by LoRA Merge step): {model_path}")
 
     # Override 파라미터 (초경량 테스트 설정)
     override_params = {
@@ -95,7 +101,7 @@ def test_critic_pipeline_micro_mtp():
 @pytest.mark.integration
 def test_critic_config_validation():
     """Critic config 파일 유효성 검증"""
-    config_path = Path("configs/local/critic_local.yaml")
+    config_path = Path("configs/production/critic_mlp.yaml")
     assert config_path.exists(), f"Config not found: {config_path}"
 
     config = OmegaConf.load(str(config_path))
@@ -107,19 +113,12 @@ def test_critic_config_validation():
     assert hasattr(config, "data_sampling"), "Config should have data_sampling"
     assert hasattr(config, "training"), "Config should have training"
     assert hasattr(config, "checkpoint"), "Config should have checkpoint"
-    assert hasattr(config, "runtime"), "Config should have runtime"
 
     # Critic 특화 검증 (독립 Value Model 구조)
     assert config.experiment.stage == "critic", "Should be critic stage"
     assert config.data_sampling.use_pairwise is True, "Critic uses pairwise mode"
-    assert config.runtime.device == "mps", "Should use MPS for local test"
 
     # 독립 Value Model 설정 검증
     assert hasattr(config.models, "value_model"), "Should have value_model config"
-    model_path = Path(config.models.value_model.path)
-    assert model_path.exists(), f"Value model path should exist: {model_path}"
-
-    tokenizer_path = Path(config.models.value_model.tokenizer_path)
-    assert tokenizer_path.exists(), f"Tokenizer path should exist: {tokenizer_path}"
 
     print(f"\n✓ Critic config validation passed")

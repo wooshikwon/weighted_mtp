@@ -527,7 +527,7 @@ def compute_lambda_value_loss(
     n_valid = valid_seq_mask.sum()
 
     if n_valid == 0:
-        return torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+        return (values * 0).sum()  # grad chain 유지하면서 0 반환
 
     seq_loss = (loss * combined_mask).sum(dim=1) / (seq_lengths + 1e-8)
     # 유효 시퀀스만 평균 (0-length 시퀀스 제외)

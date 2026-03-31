@@ -1,11 +1,21 @@
 """pytest 공통 fixture"""
 
 import json
+import os
 import pytest
 import sys
 from pathlib import Path
 
 from weighted_mtp.utils import s3_utils
+
+
+def pytest_collection_modifyitems(config, items):
+    """분산 환경이 아니면 ddp 마커가 있는 테스트를 자동 skip"""
+    if "RANK" not in os.environ:
+        skip_ddp = pytest.mark.skip(reason="torchrun 환경이 아닙니다 (RANK 미설정)")
+        for item in items:
+            if "ddp" in item.keywords:
+                item.add_marker(skip_ddp)
 
 
 @pytest.fixture(scope="session", autouse=True)
