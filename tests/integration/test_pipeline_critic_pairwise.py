@@ -50,12 +50,10 @@ def pairwise_test_config():
             "use_pairwise": True,
             "n_samples": 100,  # 테스트용 소량
             "difficulty_bins": {
-                "diff_7": [7, 7],
-                "else": [8, 25],
+                "all": [1, 25],
             },
             "difficulty_weights": {
-                "diff_7": 0.35,
-                "else": 0.65,
+                "all": 1.0,
             },
         },
         "training": {
@@ -209,12 +207,10 @@ def test_pairwise_batch_structure():
         "use_pairwise": True,
         "n_samples": 500,  # 동일 problem_id 쌍 생성을 위해 충분한 샘플 필요
         "difficulty_bins": {
-            "diff_7": [7, 7],
-            "else": [8, 25],
+            "all": [1, 25],
         },
         "difficulty_weights": {
-            "diff_7": 0.35,
-            "else": 0.65,
+            "all": 1.0,
         },
     }
 

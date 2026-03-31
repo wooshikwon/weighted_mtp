@@ -40,7 +40,12 @@ logger = logging.getLogger(__name__)
 OUTPUT_DIR = Path("storage/datasets/codecontests/processed")
 
 # Python 언어 필터
-PYTHON_LANGUAGES = {"Python", "Python 3", "Python3", "PyPy", "PyPy 3", "PyPy3"}
+PYTHON_LANGUAGES = {
+    # CodeContests+ (ByteDance) format
+    "py2", "py3",
+    # Original CodeContests (DeepMind) format
+    "Python", "Python 3", "Python3", "PyPy", "PyPy 3", "PyPy3",
+}
 
 
 def download_dataset(max_problems: int | None = None):
@@ -369,30 +374,17 @@ def generate_metadata(jsonl_path: Path, output_path: Path, tokenizer=None):
 
 
 def load_tokenizer():
-    """LLaMA-3 토크나이저 로드 (가능하면)"""
+    """LLaMA-3 토크나이저 로드 (로컬 캐시 → HuggingFace Hub → char fallback)"""
     try:
         from transformers import AutoTokenizer
-        tokenizer_path = "storage/models/meta-llama/Meta-Llama-3-8B"
-        if Path(tokenizer_path).exists():
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-            logger.info(f"Loaded LLaMA-3 tokenizer (vocab={tokenizer.vocab_size})")
-            return tokenizer
-    except Exception:
-        pass
 
-    try:
-        import sentencepiece as spm
-        sp_path = Path("storage/models/meta-llama-mtp/tokenizer/tokenizer.model")
-        if sp_path.exists():
-            sp = spm.SentencePieceProcessor()
-            sp.load(str(sp_path))
-            logger.info(f"Loaded SentencePiece tokenizer (vocab={sp.vocab_size()})")
-            return sp
-    except Exception:
-        pass
-
-    logger.warning("No tokenizer found — using char-length estimation (len/4)")
-    return None
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
+        logger.info(f"Loaded LLaMA-3 tokenizer (vocab={tokenizer.vocab_size})")
+        return tokenizer
+    except Exception as e:
+        logger.warning(f"LLaMA-3 tokenizer load failed: {e}")
+        logger.warning("Using char-length estimation (len/4)")
+        return None
 
 
 def main():
