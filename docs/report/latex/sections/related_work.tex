@@ -1,0 +1,81 @@
+% Related Work
+\section{Related Work}
+
+\subsection{Advantage-Weighted Regression (AWR) and Related Methods}
+
+Advantage-Weighted Regression (AWR) \citep{peng2019advantage} introduced exponentially-weighted supervised learning for offline reinforcement learning in robotics:
+\begin{equation}
+    \mathcal{L}_{\text{AWR}} = \mathbb{E}\left[ \exp\left(\frac{A(s,a)}{\beta}\right) \cdot \log \pi_\theta(a|s) \right]
+\end{equation}
+
+AWR computes advantages using TD($\lambda$) returns from a separately trained value function. Advantage-weighted Policy Actor (APA) extends this with squared error stabilization for online learning.
+
+\textbf{Critical distinction}: WMTP does \textit{not} reproduce AWR in its entirety. We adopt only the \textbf{$\exp(A/\beta)$ weighting form}, while making significant departures in advantage computation (GAE instead of TD($\lambda$) returns) and value learning (pairwise ranking instead of MSE regression). Table~\ref{tab:awr_comparison} summarizes these differences.
+
+\begin{table}[h]
+\centering
+\caption{Comparison of AWR and WMTP components. WMTP adopts only the exponential weighting form from AWR while using different methods for advantage computation and value learning.}
+\label{tab:awr_comparison}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Component} & \textbf{AWR} \citep{peng2019advantage} & \textbf{WMTP (Ours)} \\
+\midrule
+Domain & Robotics control & LLM code generation \\
+Advantage computation & TD($\lambda$) return-based & \textbf{GAE (TD-error accumulation)} \\
+Value learning & Regression (MSE) & \textbf{Pairwise Ranking} \\
+Weight form & $\exp(A/\beta)$ & $\exp(A/\beta)$ (same form only) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Implicit Q-Learning and Offline RL for LLMs}
+
+Several works apply offline RL principles to LLM fine-tuning:
+
+\begin{description}[style=unboxed,leftmargin=0cm]
+    \item[Q-SFT:] Interprets token probabilities as Q-values and uses Bellman targets for weighting. Requires careful tuning to avoid distributional shift.
+
+    \item[IQL/ILQL \citep{snell2022offline}:] Implicit Language Q-Learning uses expectile regression to learn conservative value estimates. However, it requires \textbf{inference-time logit perturbation}, adding computational overhead during generation.
+
+    \item[OREO:] Uses policy gradient and odds ratio formulations, which can be unstable due to importance sampling variance.
+\end{description}
+
+WMTP occupies a distinct position in this landscape:
+\begin{itemize}[nosep]
+    \item \textbf{Weighted SFT}: Stable supervised learning (no policy gradient variance)
+    \item \textbf{Training-time weighting}: Zero inference overhead (critic not used at test time)
+    \item \textbf{Explicit value}: Interpretable token-level scores for debugging and analysis
+\end{itemize}
+
+\subsection{Multi-Token Prediction}
+
+Multi-Token Prediction (MTP) \citep{gloeckle2024better} extends standard next-token prediction by using multiple independent heads to predict $K$ future tokens simultaneously:
+\begin{equation}
+    \mathcal{L}_{\text{MTP}} = \frac{1}{K} \sum_{k=1}^{K} \sum_t \text{CE}(z_{t,k}, y_{t+k})
+\end{equation}
+
+MTP improves sample efficiency and representation quality through multi-step prediction. However, the loss averages uniformly across all tokens and heads, without distinguishing token importance.
+
+\textbf{WMTP contribution}: We maintain the MTP multi-head architecture while \textbf{redistributing learning signal based on token-level value estimates}. This allows the model to focus on tokens that matter most for solution correctness.
+
+\subsection{Summary: Method Positioning}
+
+Table~\ref{tab:method_comparison} positions WMTP relative to existing approaches:
+
+\begin{table}[h]
+\centering
+\caption{Comparison of related methods. WMTP combines weighted SFT stability with training-time-only critic usage and MTP support.}
+\label{tab:method_comparison}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Method} & \textbf{Loss} & \textbf{Weighting} & \textbf{Value Learning} & \textbf{Extra Model} & \textbf{MTP Support} & \textbf{Inference Overhead} \\
+\midrule
+Standard MTP & CE & Uniform & -- & -- & Yes & None \\
+AWR & Weighted CE & $\exp(A/\beta)$ & Regression & Critic & No & None \\
+ILQL & Modified CE & Q-based & Implicit & -- & No & \textbf{Yes} \\
+\textbf{WMTP (Ours)} & \textbf{Weighted CE} & $\exp(A/\beta)$ & \textbf{Pairwise} & \textbf{Critic} & \textbf{Yes} & \textbf{None} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}

@@ -1,0 +1,77 @@
+% Introduction
+\section{Introduction}
+
+\subsection{Background: Code Generation and the Learning Signal Problem}
+
+Code generation presents unique challenges for language model training. Unlike natural language, code exhibits several distinctive characteristics:
+
+\begin{itemize}[nosep]
+    \item \textbf{Long sequences}: Competitive programming solutions often exceed 1,000 tokens
+    \item \textbf{Sparse, episodic rewards}: A solution is either correct or incorrect---no partial credit
+    \item \textbf{Critical token sensitivity}: Function names, conditional expressions, and return statements have disproportionate impact on correctness
+\end{itemize}
+
+Standard supervised fine-tuning (SFT) with cross-entropy loss treats all tokens equally, allocating identical learning signal to boilerplate code and critical logic. Multi-Token Prediction (MTP) \citep{gloeckle2024better} extends this by predicting multiple future tokens simultaneously, improving training efficiency and representation quality. However, MTP inherits the same limitation: \textbf{uniform loss weighting fails to reflect token importance differences}.
+
+This observation motivates our core hypothesis: \textit{``Not All Tokens Are What You Need''}---allocating more learning resources to important tokens should improve performance and convergence efficiency at equivalent FLOPs.
+
+\subsection{Research Questions}
+
+We formulate three research questions to investigate token-weighted learning for code generation:
+
+\begin{description}[style=unboxed,leftmargin=0cm]
+    \item[RQ1:] Under what conditions does GAE-weighted cross-entropy improve code generation performance?
+    \begin{itemize}[nosep]
+        \item \textbf{RQ1a:} What is the effect on out-of-domain benchmarks (short function-level tasks like HumanEval/MBPP)?
+        \item \textbf{RQ1b:} What is the effect on in-domain benchmarks (long competitive programming like CodeContests)?
+    \end{itemize}
+
+    \item[RQ2:] How can we stably learn token-level value estimates?
+    \begin{itemize}[nosep]
+        \item Pairwise ranking vs. MSE regression
+        \item Length-balanced stratified sampling
+    \end{itemize}
+
+    \item[RQ3:] How does critic quality affect downstream policy performance? (Exploratory, incomplete)
+\end{description}
+
+\subsection{Proposed Approach: Two-Phase WMTP}
+
+We propose \textbf{Weighted Multi-Token Prediction (WMTP)}, a two-phase pipeline illustrated in Figure~\ref{fig:pipeline}:
+
+\begin{description}[style=unboxed,leftmargin=0cm]
+    \item[Phase 1 -- Critic Training:] Train an independent value model on correct/incorrect solution pairs using pairwise ranking loss. The critic learns token-level value estimates $V_t$ that distinguish solutions likely to be correct from those likely to be incorrect.
+
+    \item[Phase 2 -- Weighted Policy Training:] Freeze the critic and use it to compute token advantages via GAE. Apply whitening normalization with EMA running statistics, convert to exponential weights, and modulate the MTP cross-entropy loss.
+\end{description}
+
+% Placeholder for pipeline figure
+\begin{figure}[t]
+    \centering
+    \fbox{\parbox{0.9\textwidth}{
+        \centering
+        \textbf{[Figure 1: WMTP Pipeline]}\\[1em]
+        Phase 1: CodeContests (correct/incorrect pairs) $\rightarrow$ Pairwise Ranking $\rightarrow$ Critic $V_t$\\[0.5em]
+        Phase 2: Critic frozen $\rightarrow$ GAE $A_t$ $\rightarrow$ Whitening + EMA $\rightarrow$ $w_t = \exp(\hat{A}_t/\beta)$ $\rightarrow$ Weighted MTP Loss
+    }}
+    \caption{Overview of the WMTP two-phase pipeline. Phase 1 trains an independent critic using pairwise ranking on solution pairs. Phase 2 uses the frozen critic to compute token-level advantages for weighting the MTP loss. The critic is \textbf{not used at inference time}.}
+    \label{fig:pipeline}
+\end{figure}
+
+\subsection{Contributions}
+
+Our main contributions are:
+
+\begin{enumerate}[nosep]
+    \item \textbf{GAE-weighted CE exploration for LLM code generation}: We transfer GAE-based advantage estimation, primarily used in robotics control, to token weighting for code generation, observing positive signals on out-of-domain benchmarks.
+
+    \item \textbf{Pairwise ranking for value learning}: We replace pointwise MSE regression with Bradley-Terry pairwise ranking, providing stable learning signals appropriate for the code domain where relative correctness is easier to judge than absolute quality.
+
+    \item \textbf{Sparse reward stabilization recipe}: We combine whitening, EMA normalization, exponential weighting, and clipping to control learning instability from sparse episodic rewards.
+
+    \item \textbf{Out-of-domain transfer observation}: Using only 1.4\% of available training data (50K/3.6M samples), we observe improvements on HumanEval, MBPP, and GSM8K (causal relationship not confirmed).
+
+    \item \textbf{Honest limitation disclosure}: We explicitly acknowledge unverified MTP necessity (vs. NTP), 63\% critic accuracy ceiling, in-domain performance decline, and absence of random weight baselines.
+\end{enumerate}
+
+\textbf{Important note:} MTP is an \textit{implementation choice} in this work. The necessity of MTP over standard NTP for token weighting effectiveness requires separate verification, which we leave to future work.

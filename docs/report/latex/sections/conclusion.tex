@@ -1,0 +1,69 @@
+% Conclusion
+\section{Conclusion}
+
+\subsection{Summary}
+
+We presented \textbf{Weighted Multi-Token Prediction (WMTP)}, a two-phase approach for token-weighted learning in code generation. Our method combines:
+
+\begin{itemize}[nosep]
+    \item \textbf{Independent critic} trained via pairwise ranking on correct/incorrect solution pairs
+    \item \textbf{GAE-based advantage estimation} computed from token-level value changes
+    \item \textbf{AWR-style exponential weighting} with whitening normalization and clipping
+    \item \textbf{Weighted MTP loss} that modulates learning signal by token importance
+\end{itemize}
+
+The critic is used only during training, resulting in \textbf{zero inference overhead}.
+
+\subsection{Key Results}
+
+Using only \textbf{1.4\%} of available training data (50K/3.6M samples), WMTP achieves:
+
+\begin{itemize}[nosep]
+    \item \textbf{Out-of-domain improvements}:
+    \begin{itemize}[nosep]
+        \item HumanEval: +2.86\% (average across Pass@k)
+        \item MBPP: +3.00\%
+        \item GSM8K: +1.07\%
+    \end{itemize}
+    \item \textbf{In-domain decline}:
+    \begin{itemize}[nosep]
+        \item CodeContests: -1.05\%
+    \end{itemize}
+\end{itemize}
+
+\subsection{Key Limitations}
+
+We honestly acknowledge significant limitations:
+
+\begin{enumerate}[nosep]
+    \item \textbf{MTP necessity unverified}: We have not compared against NTP with identical weighting
+    \item \textbf{Random baseline absent}: Cannot separate information effect from mechanism effect
+    \item \textbf{Critic accuracy ceiling}: 63\% accuracy may limit effectiveness on long sequences
+    \item \textbf{In-domain decline}: The method underperforms baseline on the training domain
+\end{enumerate}
+
+\subsection{Future Work}
+
+Critical experiments for future investigation:
+
+\begin{enumerate}
+    \item \textbf{NTP vs. MTP comparison}: Determine whether MTP architecture is necessary for token weighting benefits
+
+    \item \textbf{Random weight baseline}: Establish whether improvements come from meaningful importance signals or general weighting effects
+
+    \item \textbf{Critic accuracy sweep}: Investigate the relationship between critic quality and downstream performance by using checkpoints at different accuracy levels
+
+    \item \textbf{Long sequence analysis}: Investigate credit assignment breakdown on sequences $>$1000 tokens
+
+    \item \textbf{Domain generalization}: Test on non-code tasks (summarization, dialogue) to assess broader applicability
+\end{enumerate}
+
+\subsection{Broader Impact}
+
+This work explores applying advantage-weighted learning principles from robotics (AWR, GAE) to large language model training. While our results are mixed, the positive out-of-domain transfer with limited data suggests that \textbf{token-level importance weighting may be a promising direction for data-efficient LLM training}.
+
+The honest reporting of negative results (in-domain decline, unverified hypotheses, missing baselines) is intentional. We believe that transparent acknowledgment of limitations advances the field more effectively than selective reporting of positive outcomes.
+
+\subsection{Conclusion Statement}
+
+WMTP demonstrates that GAE-based token weighting can provide positive signals for out-of-domain code generation tasks, achieving improvements with minimal training data. However, significant questions remain about the necessity of specific architectural choices (MTP), the role of critic quality, and the mechanism underlying the observed improvements. We hope this work provides a foundation for future investigation into token-weighted learning for LLMs.

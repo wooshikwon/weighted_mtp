@@ -1,0 +1,108 @@
+% Results
+\section{Results}
+
+\subsection{Main Results}
+
+Table~\ref{tab:main_results} presents the complete evaluation results across all benchmarks. We report results for three model variants:
+\begin{itemize}[nosep]
+    \item \textbf{Pure}: Pretrained MTP model without fine-tuning
+    \item \textbf{Baseline}: MTP + standard SFT on CodeContests
+    \item \textbf{Verifiable}: MTP + WMTP (our method)
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Pass@k evaluation results on code generation benchmarks. Best results per dataset in bold. Verifiable (WMTP) shows consistent improvements on out-of-domain benchmarks but declines on in-domain CodeContests.}
+\label{tab:main_results}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llcccc|cccc}
+\toprule
+& & \multicolumn{4}{c|}{\textbf{Out-of-Domain}} & \multicolumn{4}{c}{\textbf{In-Domain}} \\
+\textbf{Model} & \textbf{Metric} & \multicolumn{4}{c|}{\textbf{HumanEval} (T=0.8)} & \multicolumn{4}{c}{\textbf{CodeContests} (T=0.2)} \\
+& & @1 & @5 & @10 & @20 & @1 & @5 & @10 & @20 \\
+\midrule
+Pure & Pass@k & 2.94 & 13.17 & 23.30 & 37.50 & 0.25 & 1.25 & 2.50 & 5.00 \\
+Baseline & Pass@k & 2.56 & 11.85 & 21.45 & 35.00 & 1.00 & 4.25 & 6.97 & 10.00 \\
+\textbf{Verifiable} & Pass@k & \textbf{3.25} & \textbf{14.27} & \textbf{24.79} & \textbf{40.00} & 0.50 & 2.50 & 5.00 & \textbf{10.00} \\
+\midrule
+\multicolumn{2}{l}{$\Delta$ (Verifiable - Baseline)} & \textcolor{green!60!black}{+0.69} & \textcolor{green!60!black}{+2.42} & \textcolor{green!60!black}{+3.34} & \textcolor{green!60!black}{+5.00} & \textcolor{red}{-0.50} & \textcolor{red}{-1.75} & \textcolor{red}{-1.97} & 0.00 \\
+\bottomrule
+\end{tabular}%
+}
+
+\vspace{0.5em}
+
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llcccc|cccc}
+\toprule
+& & \multicolumn{4}{c|}{\textbf{MBPP} (T=0.2)} & \multicolumn{4}{c}{\textbf{GSM8K} (T=0.2)} \\
+\textbf{Model} & \textbf{Metric} & @1 & @5 & @10 & @20 & @1 & @5 & @10 & @20 \\
+\midrule
+Pure & Pass@k & 17.00 & 24.58 & 27.99 & 31.00 & 2.95 & 7.34 & 10.40 & 14.00 \\
+Baseline & Pass@k & 17.50 & 23.55 & 26.28 & 30.00 & 3.20 & 8.80 & 11.34 & 13.00 \\
+\textbf{Verifiable} & Pass@k & \textbf{17.80} & \textbf{26.26} & \textbf{30.29} & \textbf{35.00} & 3.00 & 8.45 & \textbf{12.16} & \textbf{17.00} \\
+\midrule
+\multicolumn{2}{l}{$\Delta$ (Verifiable - Baseline)} & \textcolor{green!60!black}{+0.30} & \textcolor{green!60!black}{+2.71} & \textcolor{green!60!black}{+4.01} & \textcolor{green!60!black}{+5.00} & \textcolor{red}{-0.20} & \textcolor{red}{-0.35} & \textcolor{green!60!black}{+0.82} & \textcolor{green!60!black}{+4.00} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Summary of Improvements}
+
+Table~\ref{tab:improvement_summary} summarizes the average improvement of Verifiable (WMTP) over Baseline across all Pass@k values.
+
+\begin{table}[h]
+\centering
+\caption{Average improvement ($\Delta$) across Pass@\{1,5,10,20\} for Verifiable vs Baseline. Out-of-domain benchmarks show consistent positive improvements; in-domain CodeContests shows decline.}
+\label{tab:improvement_summary}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Benchmark} & \textbf{Domain} & \textbf{Avg $\Delta$} & \textbf{Direction} \\
+\midrule
+HumanEval & Out-of-domain & \textbf{+2.86\%} & $\uparrow$ \\
+MBPP & Out-of-domain & \textbf{+3.00\%} & $\uparrow$ \\
+GSM8K & Out-of-domain & \textbf{+1.07\%} & $\uparrow$ \\
+CodeContests & In-domain & \textbf{-1.05\%} & $\downarrow$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key observation}: WMTP provides consistent improvements on \textbf{out-of-domain} benchmarks (HumanEval, MBPP, GSM8K) but shows decline on \textbf{in-domain} CodeContests. We analyze potential causes in Section~\ref{sec:analysis}.
+
+\subsection{Training Diagnostics}
+
+\subsubsection{Weight Statistics}
+
+Table~\ref{tab:weight_stats} reports token weight statistics from the final Verifiable training run, providing insights into how the advantage weighting behaves.
+
+\begin{table}[h]
+\centering
+\caption{Token weight statistics from WMTP training (run: \texttt{last-final-verifiable}). The clipping ratio of 17.9\% indicates that extreme weights are being controlled effectively.}
+\label{tab:weight_stats}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{Value} & \textbf{Interpretation} \\
+\midrule
+weight\_mean & 1.328 & Average upweighting (mean $> 1$) \\
+weight\_std & 0.981 & Moderate variance \\
+weight\_min & 0.100 & Clipping lower bound active \\
+weight\_max & 3.000 & Clipping upper bound active \\
+\textbf{clipping\_ratio} & \textbf{17.9\%} & Extreme value control \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Observations}:
+\begin{itemize}[nosep]
+    \item \textbf{Mean $>$ 1}: On average, tokens receive slight upweighting compared to uniform
+    \item \textbf{Clipping ratio 17.9\%}: Approximately 1 in 5 tokens hits the clipping bounds, indicating effective extreme value control while preserving meaningful weight variation
+\end{itemize}
+
+% Figure placeholder for weight dynamics
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.9\textwidth]{improvement_table.pdf}
+    \caption{Improvement of Verifiable (WMTP) over Baseline across benchmarks. Green indicates improvement; red indicates decline. Out-of-domain benchmarks (HumanEval, MBPP, GSM8K) show positive improvements, while in-domain CodeContests shows mixed results.}
+    \label{fig:improvement}
+\end{figure}

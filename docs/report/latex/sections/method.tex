@@ -1,0 +1,212 @@
+% Method
+\section{Method: Weighted Multi-Token Prediction (WMTP)}
+
+\subsection{Problem Setup and Notation}
+
+Let $x$ denote the input (problem description) and $y_{1:T}$ the output sequence (solution code). We train a policy $\pi_\theta$ with MTP heads $k \in \{1, \ldots, K\}$, where each head produces logits $z_{t,k}$ for predicting token $y_{t+k}$.
+
+Following the Alpaca template, we apply \textbf{loss masking}: instruction and input portions have labels set to $-100$ (ignored in loss computation), training only on the output (solution) tokens.
+
+\subsection{Baseline: Multi-Token Prediction Objective}
+
+The standard MTP objective averages cross-entropy loss across all heads and tokens:
+\begin{equation}
+    \mathcal{L}_{\text{MTP}} = \frac{1}{K} \sum_{k=1}^{K} \sum_t \text{CE}(z_{t,k}, y_{t+k})
+    \label{eq:mtp_baseline}
+\end{equation}
+
+This treats all tokens equally, regardless of their importance for solution correctness.
+
+\subsection{Phase 1: Independent Critic via Pairwise Ranking}
+
+\subsubsection{Data Construction}
+
+We construct training pairs from the CodeContests dataset:
+\begin{itemize}[nosep]
+    \item For each problem, pair correct solutions with incorrect solutions
+    \item Apply \textbf{length-balanced stratified sampling} using 17 bins to prevent length bias
+    \item Limit to \texttt{max\_pairs\_per\_problem=60} to ensure diversity
+    \item Total: 200K pairs (400K samples)
+\end{itemize}
+
+\subsubsection{Critic Architecture}
+
+The critic model consists of:
+\begin{itemize}[nosep]
+    \item \textbf{Backbone}: Sheared-LLaMA 2.7B (HuggingFace LlamaModel)
+    \item \textbf{Value head}: MLP with hidden dimension $\times 4 \rightarrow 1$
+    \item \textbf{Output}: Token-level value $V_t \in \mathbb{R}$ for each position
+    \item \textbf{Fine-tuning}: LoRA with rank=32, $\alpha$=64, dropout=0.1
+\end{itemize}
+
+\subsubsection{Pairwise Ranking Loss (Bradley-Terry)}
+
+Rather than predicting absolute values via MSE regression, we use pairwise ranking to learn relative preferences. For a correct solution ($+$) and incorrect solution ($-$), we compute sequence-level values by averaging over output tokens:
+\begin{equation}
+    \bar{V}^{+} = \frac{1}{|\mathcal{O}^{+}|} \sum_{t \in \mathcal{O}^{+}} V_t^{+}, \quad
+    \bar{V}^{-} = \frac{1}{|\mathcal{O}^{-}|} \sum_{t \in \mathcal{O}^{-}} V_t^{-}
+\end{equation}
+
+where $\mathcal{O}$ denotes the set of output token positions (excluding instruction/input).
+
+The Bradley-Terry pairwise ranking loss encourages the correct solution's value to exceed the incorrect solution's:
+\begin{equation}
+    \mathcal{L}_{\text{pair}} = -\log \sigma(\bar{V}^{+} - \bar{V}^{-})
+    \label{eq:pairwise_loss}
+\end{equation}
+
+This formulation is more appropriate for code where \textit{relative} correctness is easier to judge than absolute quality scores.
+
+% Pairwise ranking diagram placeholder
+\begin{figure}[h]
+    \centering
+    \fbox{\parbox{0.85\textwidth}{
+        \centering
+        \textbf{[Figure 2: Pairwise Ranking Training]}\\[1em]
+        Correct solution $\xrightarrow{\text{Critic}}$ $V_t^{+}$ $\xrightarrow{\text{avg}}$ $\bar{V}^{+}$\\[0.3em]
+        Incorrect solution $\xrightarrow{\text{Critic}}$ $V_t^{-}$ $\xrightarrow{\text{avg}}$ $\bar{V}^{-}$\\[0.5em]
+        $\mathcal{L}_{\text{pair}} = -\log \sigma(\bar{V}^{+} - \bar{V}^{-})$
+    }}
+    \caption{Pairwise ranking training for the critic. The model learns that correct solutions should have higher average token values than incorrect solutions for the same problem.}
+    \label{fig:pairwise}
+\end{figure}
+
+\subsection{Phase 2: Token Advantage Estimation with GAE}
+
+\subsubsection{Objective}
+
+Given the trained critic, we estimate token-level importance (credit assignment) from value changes across the sequence. Tokens that increase the value estimate contribute positively to correctness; tokens that decrease it contribute negatively.
+
+\subsubsection{Generalized Advantage Estimation}
+
+The standard GAE formulation \citep{schulman2015high} defines:
+\begin{align}
+    \delta_t &= r_t + \gamma V(s_{t+1}) - V(s_t) \label{eq:td_error} \\
+    A_t &= \sum_{l \geq 0} (\gamma \lambda)^l \delta_{t+l} \label{eq:gae}
+\end{align}
+
+\subsubsection{Simplification for Code Generation}
+
+Code generation is an \textbf{episodic task} with sparse rewards. We make the following simplifications:
+
+\begin{itemize}[nosep]
+    \item \textbf{No intermediate rewards}: $r_t = 0$ for all $t < T$
+    \item \textbf{No terminal reward signal}: The value function itself encodes correctness likelihood (trained via pairwise ranking), so we do not add explicit $r_T$
+    \item \textbf{No discounting}: $\gamma = 1.0$ (episodic task, no preference for earlier rewards)
+\end{itemize}
+
+This yields the simplified TD-error:
+\begin{equation}
+    \delta_t = \gamma V(s_{t+1}) - V(s_t) = V_{t+1} - V_t
+    \label{eq:simplified_td}
+\end{equation}
+
+which represents the \textbf{pure value change} caused by token $t$.
+
+\textbf{Hyperparameter}: We use $\lambda = 0.95$ (GAE standard recommendation), providing a bias-variance tradeoff between TD(0) ($\lambda=0$) and Monte Carlo ($\lambda=1$).
+
+\subsubsection{Interpretation}
+
+\begin{itemize}[nosep]
+    \item $V$ \textbf{increases} $\Rightarrow$ Token contributes to higher correctness probability
+    \item $V$ \textbf{decreases} $\Rightarrow$ Token contributes to lower correctness probability
+\end{itemize}
+
+\subsection{AWR-Style Weighting with Stabilization}
+
+\subsubsection{Whitening Normalization}
+
+Raw advantages can have unbounded scale, causing training instability. We apply whitening:
+\begin{equation}
+    \hat{A}_t = \frac{A_t - \mu}{\sigma + \epsilon}
+    \label{eq:whitening}
+\end{equation}
+
+where $\mu$ and $\sigma$ are computed using \textbf{EMA running statistics} across batches:
+\begin{align}
+    \mu_{\text{new}} &= (1 - \alpha) \cdot \mu_{\text{old}} + \alpha \cdot \mu_{\text{batch}} \\
+    \sigma_{\text{new}} &= (1 - \alpha) \cdot \sigma_{\text{old}} + \alpha \cdot \sigma_{\text{batch}}
+\end{align}
+
+with momentum $\alpha = 0.1$ and warmup period of 10 steps.
+
+\subsubsection{Exponential Weighting with Clipping}
+
+Following AWR, we convert normalized advantages to exponential weights:
+\begin{equation}
+    w_t = \exp\left(\frac{\hat{A}_t}{\beta}\right)
+    \label{eq:exp_weight}
+\end{equation}
+
+and apply clipping to prevent extreme values:
+\begin{equation}
+    w_t \leftarrow \text{clip}(w_t, w_{\min}, w_{\max})
+    \label{eq:clipping}
+\end{equation}
+
+\textbf{Hyperparameters}: $\beta = 1.0$, $[w_{\min}, w_{\max}] = [0.1, 3.0]$
+
+\subsubsection{Distributed Training Synchronization}
+
+For multi-GPU training with FSDP, we synchronize EMA statistics across ranks using \texttt{all\_reduce} to ensure consistent normalization.
+
+\subsection{Final WMTP Objective}
+
+The weighted MTP loss modulates each token's contribution by its importance weight:
+\begin{equation}
+    \boxed{
+    \mathcal{L}_{\text{WMTP}} = \frac{1}{K} \sum_{k=1}^{K} \sum_t w_t \cdot \text{CE}(z_{t,k}, y_{t+k})
+    }
+    \label{eq:wmtp}
+\end{equation}
+
+Tokens with high advantage (contributing to correctness) receive higher weights; tokens with low or negative advantage receive lower weights.
+
+\subsection{Implementation Details}
+
+\subsubsection{Data Pipeline}
+
+\begin{itemize}[nosep]
+    \item \textbf{Template}: Alpaca format with instruction/input/output sections
+    \item \textbf{Loss masking}: \texttt{labels=-100} for instruction and input tokens
+    \item \textbf{Maximum length}: 2048 tokens
+\end{itemize}
+
+\subsubsection{Training Infrastructure}
+
+\begin{itemize}[nosep]
+    \item \textbf{Hardware}: NVIDIA H100 80GB $\times$ 4
+    \item \textbf{Distributed training}: FSDP with \texttt{FULL\_SHARD} (ZeRO-3)
+    \item \textbf{Precision}: BF16 mixed precision
+    \item \textbf{Memory optimization}: Activation checkpointing
+    \item \textbf{Policy LoRA}: rank=64, $\alpha$=128, dropout=0.05
+\end{itemize}
+
+\subsubsection{Inference Cost}
+
+\begin{itemize}[nosep]
+    \item \textbf{Training}: Phase 2 requires critic forward pass (approximately 1.3$\times$ training cost)
+    \item \textbf{Inference}: \textbf{Zero additional cost}---the critic is not used at test time
+\end{itemize}
+
+\subsection{Algorithm Summary}
+
+\begin{algorithm}[h]
+\caption{Weighted Multi-Token Prediction (WMTP)}
+\label{alg:wmtp}
+\begin{algorithmic}[1]
+\Require Critic $V_\phi$ (trained in Phase 1), Policy $\pi_\theta$, hyperparameters $\gamma, \lambda, \beta, w_{\min}, w_{\max}$
+\For{each training batch}
+    \State Tokenize input and apply loss mask
+    \State Compute token values $V_t = V_\phi(x, y_{1:t})$ \Comment{Frozen critic}
+    \State Compute TD-errors $\delta_t = \gamma V_{t+1} - V_t$
+    \State Compute GAE advantages $A_t = \sum_{l \geq 0} (\gamma\lambda)^l \delta_{t+l}$
+    \State Update EMA: $\mu, \sigma \leftarrow \text{EMA}(\mu, \sigma, A)$
+    \State Normalize: $\hat{A}_t = (A_t - \mu) / (\sigma + \epsilon)$
+    \State Compute weights: $w_t = \text{clip}(\exp(\hat{A}_t / \beta), w_{\min}, w_{\max})$
+    \State Compute MTP logits $z_{t,k}$ for all heads $k$
+    \State Compute weighted loss: $\mathcal{L} = \frac{1}{K} \sum_k \sum_t w_t \cdot \text{CE}(z_{t,k}, y_{t+k})$
+    \State Update $\theta$ via gradient descent on $\mathcal{L}$
+\EndFor
+\end{algorithmic}
+\end{algorithm}

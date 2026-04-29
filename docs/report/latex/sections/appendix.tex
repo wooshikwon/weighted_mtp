@@ -1,0 +1,215 @@
+% Appendix
+\appendix
+
+\section{Configuration Files}
+\label{app:configs}
+
+Table~\ref{tab:config_mapping} maps experiment names to configuration files in the codebase.
+
+\begin{table}[h]
+\centering
+\caption{Configuration file mapping for reproducibility.}
+\label{tab:config_mapping}
+\begin{tabular}{lll}
+\toprule
+\textbf{Experiment} & \textbf{Config File} & \textbf{Key Parameters} \\
+\midrule
+Baseline & \texttt{configs/production/baseline.yaml} & batch=12, lr=1e-4, epochs=1.0 \\
+Critic & \texttt{configs/production/critic\_mlp\_pairwise.yaml} & pairwise loss, lr=5e-5/1e-4 \\
+Verifiable & \texttt{configs/production/verifiable.yaml} & $\lambda$=0.95, $\beta$=1.0, clip=[0.1,3.0] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Mathematical Formulations}
+\label{app:math}
+
+\subsection{Pairwise Ranking Loss}
+
+For a correct solution ($+$) and incorrect solution ($-$) from the same problem:
+\begin{equation}
+    \mathcal{L}_{\text{pair}} = -\log \sigma(\bar{V}^{+} - \bar{V}^{-})
+\end{equation}
+where $\bar{V} = \frac{1}{|\mathcal{O}|} \sum_{t \in \mathcal{O}} V_t$ averages over output tokens.
+
+\subsection{Generalized Advantage Estimation}
+
+TD-error (simplified for code generation with no intermediate rewards):
+\begin{equation}
+    \delta_t = \gamma V(s_{t+1}) - V(s_t)
+\end{equation}
+
+GAE accumulation:
+\begin{equation}
+    A_t = \sum_{l \geq 0} (\gamma\lambda)^l \delta_{t+l}
+\end{equation}
+
+With $\gamma = 1.0$ (no discounting) and $\lambda = 0.95$.
+
+\subsection{Whitening Normalization}
+
+\begin{equation}
+    \hat{A}_t = \frac{A_t - \mu}{\sigma + \epsilon}
+\end{equation}
+
+where $\mu$ and $\sigma$ are EMA running statistics with momentum 0.1.
+
+\subsection{Exponential Weighting with Clipping}
+
+\begin{equation}
+    w_t = \text{clip}\left(\exp\left(\frac{\hat{A}_t}{\beta}\right), w_{\min}, w_{\max}\right)
+\end{equation}
+
+With $\beta = 1.0$, $w_{\min} = 0.1$, $w_{\max} = 3.0$.
+
+\subsection{WMTP Objective}
+
+\begin{equation}
+    \mathcal{L}_{\text{WMTP}} = \frac{1}{K} \sum_{k=1}^{K} \sum_t w_t \cdot \text{CE}(z_{t,k}, y_{t+k})
+\end{equation}
+
+\subsection{Pass@k Estimator}
+
+Unbiased estimator from \citet{chen2021evaluating}:
+\begin{equation}
+    \text{Pass@}k = \mathbb{E}_{\text{problems}} \left[ 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}} \right]
+\end{equation}
+
+where $n$ = samples per problem, $c$ = correct samples.
+
+\section{Implementation Details}
+\label{app:impl}
+
+\subsection{Data Pipeline}
+
+\begin{itemize}[nosep]
+    \item \textbf{Template}: Alpaca format
+    \begin{verbatim}
+Below is an instruction that describes a task...
+### Instruction:
+{problem_description}
+### Response:
+{solution_code}
+    \end{verbatim}
+
+    \item \textbf{Loss masking}: Instruction and input tokens have \texttt{labels=-100} (ignored in loss)
+    \item \textbf{Output tokens only}: Only solution code tokens contribute to loss
+\end{itemize}
+
+\subsection{Distributed Training}
+
+\begin{itemize}[nosep]
+    \item \textbf{FSDP}: \texttt{FULL\_SHARD} (ZeRO-3 equivalent)
+    \item \textbf{Activation checkpointing}: Enabled for memory efficiency
+    \item \textbf{Mixed precision}: BF16
+    \item \textbf{EMA synchronization}: \texttt{all\_reduce} across ranks for consistent normalization
+\end{itemize}
+
+\subsection{Hardware}
+
+\begin{itemize}[nosep]
+    \item \textbf{GPUs}: NVIDIA H100 80GB $\times$ 4
+    \item \textbf{Interconnect}: NVLink
+    \item \textbf{Training time}: Approximately 4 hours per experiment
+\end{itemize}
+
+\section{Experiment Journey}
+\label{app:journey}
+
+Table~\ref{tab:experiment_journey} documents the problem-solving process during method development.
+
+\begin{table}[h]
+\centering
+\caption{Problems encountered and solutions applied during development.}
+\label{tab:experiment_journey}
+\begin{tabular}{p{3cm}p{4cm}p{4cm}p{3cm}}
+\toprule
+\textbf{Problem} & \textbf{Root Cause} & \textbf{Solution} & \textbf{Effect} \\
+\midrule
+Random sampling overfitting & Repeated exposure to same problems & \texttt{max\_pairs\_per\_problem=60} & Improved diversity \\
+\midrule
+Token length imbalance & Short code overrepresented & Length-balanced stratified sampling (17 bins) & Balanced length distribution \\
+\midrule
+MSE loss failure & Pointwise value learning unstable & Pairwise ranking loss & Val Acc: 55\% $\rightarrow$ 63\% \\
+\midrule
+TD-error instability & Large scale fluctuations & GAE + EMA + whitening & Controlled weight std \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Detailed Evaluation Results}
+\label{app:detailed_results}
+
+\subsection{Complete Pass@k Results}
+
+\begin{table}[h]
+\centering
+\caption{Complete Pass@k results for all models and benchmarks.}
+\label{tab:complete_results}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llcccccccc}
+\toprule
+& & \multicolumn{4}{c}{\textbf{HumanEval} (n=80, T=0.8)} & \multicolumn{4}{c}{\textbf{MBPP} (n=100, T=0.2)} \\
+\textbf{Model} & & @1 & @5 & @10 & @20 & @1 & @5 & @10 & @20 \\
+\midrule
+Pure & & 2.94 & 13.17 & 23.30 & 37.50 & 17.00 & 24.58 & 27.99 & 31.00 \\
+Baseline & & 2.56 & 11.85 & 21.45 & 35.00 & 17.50 & 23.55 & 26.28 & 30.00 \\
+Verifiable & & \textbf{3.25} & \textbf{14.27} & \textbf{24.79} & \textbf{40.00} & \textbf{17.80} & \textbf{26.26} & \textbf{30.29} & \textbf{35.00} \\
+\midrule
+& & \multicolumn{4}{c}{\textbf{GSM8K} (n=100, T=0.2)} & \multicolumn{4}{c}{\textbf{CodeContests} (n=20, T=0.2)} \\
+\midrule
+Pure & & 2.95 & 7.34 & 10.40 & 14.00 & 0.25 & 1.25 & 2.50 & 5.00 \\
+Baseline & & 3.20 & 8.80 & 11.34 & 13.00 & \textbf{1.00} & \textbf{4.25} & \textbf{6.97} & 10.00 \\
+Verifiable & & 3.00 & 8.45 & \textbf{12.16} & \textbf{17.00} & 0.50 & 2.50 & 5.00 & 10.00 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Improvement Breakdown}
+
+\begin{table}[h]
+\centering
+\caption{Detailed improvement ($\Delta$) of Verifiable over Baseline.}
+\label{tab:improvement_detail}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Benchmark} & $\Delta$@1 & $\Delta$@5 & $\Delta$@10 & $\Delta$@20 & \textbf{Avg $\Delta$} & \textbf{Direction} \\
+\midrule
+HumanEval & +0.69 & +2.42 & +3.34 & +5.00 & \textbf{+2.86} & $\uparrow$ \\
+MBPP & +0.30 & +2.71 & +4.01 & +5.00 & \textbf{+3.00} & $\uparrow$ \\
+GSM8K & -0.20 & -0.35 & +0.82 & +4.00 & \textbf{+1.07} & $\uparrow$ \\
+CodeContests & -0.50 & -1.75 & -1.97 & 0.00 & \textbf{-1.05} & $\downarrow$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{LoRA Parameter Calculation}
+\label{app:lora}
+
+\subsection{Policy Model (Meta-LLaMA MTP 7B)}
+
+\begin{itemize}[nosep]
+    \item Hidden dimension: $d = 4096$
+    \item LoRA rank: $r = 64$
+    \item Target modules: wq, wk, wv, wo, w1, w2, w3 (7 modules per layer)
+    \item Number of layers: $L = 32$
+    \item Parameters per module: $2 \times d \times r = 2 \times 4096 \times 64 = 524,288$
+    \item Total LoRA parameters: $7 \times 32 \times 524,288 = 117,440,512 \approx 117.4$M
+    \item With MTP heads (4 heads): Additional parameters bring total to $\sim$190.8M
+    \item Percentage of base: $190.8$M / $7$B = 2.73\%
+\end{itemize}
+
+\subsection{Critic Model (Sheared-LLaMA 2.7B)}
+
+\begin{itemize}[nosep]
+    \item Hidden dimension: $d = 2560$
+    \item LoRA rank: $r = 32$
+    \item Target modules: q\_proj, k\_proj, v\_proj, o\_proj, gate\_proj, up\_proj, down\_proj (7 modules)
+    \item Number of layers: $L = 32$
+    \item Parameters per module: $2 \times d \times r = 2 \times 2560 \times 32 = 163,840$
+    \item Total LoRA parameters: $7 \times 32 \times 163,840 = 36,700,160 \approx 36.7$M
+    \item With value head MLP: Additional $\sim$82.8M parameters
+    \item Total trainable: $\sim$119.5M
+    \item Percentage of base: $119.5$M / $2.7$B = 4.43\%
+\end{itemize}

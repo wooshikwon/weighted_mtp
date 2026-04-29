@@ -1,0 +1,128 @@
+% Ablations
+\section{Ablation Studies}
+
+We report ablation studies separated into \textbf{completed experiments} (with empirical results) and \textbf{planned future work} (not yet conducted).
+
+\subsection{Completed Ablations}
+
+\subsubsection{Value Loss Type: MSE vs. Pairwise Ranking}
+
+We compared two approaches for training the critic:
+
+\begin{itemize}[nosep]
+    \item \textbf{MSE (Pointwise regression)}: Train critic to predict absolute value scores, supervised by binary correct/incorrect labels
+    \item \textbf{Pairwise Ranking (Bradley-Terry)}: Train critic to rank correct solutions higher than incorrect solutions for the same problem
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Ablation: Value loss type. Pairwise ranking significantly outperforms MSE regression.}
+\label{tab:ablation_loss}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Loss Type} & \textbf{Critic Val Accuracy} & \textbf{Observation} \\
+\midrule
+MSE (pointwise) & 55\% & Unstable, poor calibration \\
+\textbf{Pairwise Ranking} & \textbf{63\%} & \textbf{Stable, better discrimination} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Analysis}: Pairwise ranking improves accuracy by 8 percentage points. We attribute this to:
+\begin{itemize}[nosep]
+    \item \textbf{Relative vs. absolute}: Judging relative correctness is easier than predicting absolute quality scores
+    \item \textbf{Calibration}: Pairwise ranking does not require well-calibrated absolute predictions
+    \item \textbf{Noise robustness}: The margin-based loss is more robust to label noise
+\end{itemize}
+
+\subsubsection{Advantage Computation: TD-Error vs. GAE}
+
+We compared two methods for computing token-level advantages:
+
+\begin{itemize}[nosep]
+    \item \textbf{TD-Error (direct)}: Use raw TD-error $\delta_t = V_{t+1} - V_t$ as advantage
+    \item \textbf{GAE}: Accumulate TD-errors with $\lambda$-weighting: $A_t = \sum_l (\gamma\lambda)^l \delta_{t+l}$
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Ablation: Advantage computation method. GAE provides more stable weight distributions.}
+\label{tab:ablation_advantage}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{Weight Stability} & \textbf{Observation} \\
+\midrule
+TD-Error only & Unstable (high variance) & Large scale fluctuations \\
+\textbf{GAE ($\lambda$=0.95)} & \textbf{Stable} & \textbf{Controlled variance, smooth weights} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Analysis}: GAE smooths the advantage signal by incorporating information from future tokens, providing a better bias-variance tradeoff than raw TD-errors. The $\lambda=0.95$ setting balances between TD(0) (high bias, low variance) and Monte Carlo (low bias, high variance).
+
+\subsection{Ablation Results Summary}
+
+\begin{table}[h]
+\centering
+\caption{Summary of completed ablation results.}
+\label{tab:ablation_summary}
+\begin{tabular}{llll}
+\toprule
+\textbf{Setting} & \textbf{Critic Val Acc} & \textbf{Weight Stability} & \textbf{Notes} \\
+\midrule
+MSE loss & 55\% & Unstable & Pointwise regression limitation \\
+\textbf{Pairwise loss} & \textbf{63\%} & \textbf{Stable} & \textbf{Relative comparison suits code} \\
+\midrule
+TD-error only & -- & Unstable (high var) & Scale fluctuations severe \\
+\textbf{GAE ($\lambda$=0.95)} & -- & \textbf{Stable} & \textbf{Bias-variance tradeoff} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Planned Ablations (Future Work)}
+
+The following ablations are important for complete understanding but were not conducted in this work:
+
+\begin{table}[h]
+\centering
+\caption{Planned ablations for future work. Priority indicates importance for validating core claims.}
+\label{tab:future_ablations}
+\begin{tabular}{lp{7cm}c}
+\toprule
+\textbf{Ablation} & \textbf{Purpose} & \textbf{Priority} \\
+\midrule
+\textbf{Random weight baseline} & Separate information effect from weighting mechanism effect & \textbf{High} \\
+\textbf{NTP vs. MTP} & Verify whether MTP is necessary or if NTP shows similar effects & \textbf{High} \\
+$\lambda$ sweep (0.9, 0.95, 0.99) & Measure sensitivity to GAE $\lambda$ parameter & Medium \\
+$\beta$ sweep (0.5, 1.0, 2.0) & Measure sensitivity to temperature parameter & Medium \\
+Critic accuracy sweep & Correlate critic quality with downstream performance & Medium \\
+EMA on/off & Verify necessity of running statistics normalization & Low \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Critical Missing Experiment: Random Weight Baseline}
+
+The most important missing ablation is the \textbf{random weight baseline}. Without this, we cannot distinguish:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Information effect}: Improvements come from meaningful token importance signals in the weights
+    \item \textbf{Mechanism effect}: Any non-uniform weighting (even random) helps by acting as regularization or noise injection
+\end{enumerate}
+
+A proper random baseline would:
+\begin{itemize}[nosep]
+    \item Sample weights from the same distribution as value-based weights (matching mean, variance)
+    \item Use shuffled advantages (scramble token-weight assignments within each sequence)
+    \item Compare performance against both uniform and value-based weighting
+\end{itemize}
+
+\subsubsection{Critical Missing Experiment: NTP vs. MTP Comparison}
+
+Our method is built on MTP, but we have not verified whether MTP is \textbf{necessary} for the observed improvements. It is possible that:
+\begin{itemize}[nosep]
+    \item GAE-weighted cross-entropy works equally well (or better) with standard NTP
+    \item The multi-head prediction structure interacts with weighting in unexpected ways
+\end{itemize}
+
+A proper comparison would train identical weighting schemes on both NTP and MTP architectures.

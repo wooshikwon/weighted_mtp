@@ -1,0 +1,86 @@
+% Limitations
+\section{Limitations}
+
+We explicitly acknowledge the following limitations of this work:
+
+\subsection{MTP Necessity Unverified}
+
+\textbf{Limitation}: We have not verified whether Multi-Token Prediction (MTP) is necessary for the observed improvements, or whether standard Next-Token Prediction (NTP) would show similar effects with GAE-weighted cross-entropy.
+
+\textbf{Implication}: Claims about WMTP should be interpreted as claims about \textit{token-weighted learning applied to an MTP architecture}, not as evidence that MTP is required for token weighting to be effective.
+
+\textbf{Required experiment}: Train identical weighting schemes on both NTP and MTP architectures, comparing performance.
+
+\subsection{Critic Performance Ceiling}
+
+\textbf{Limitation}: The critic achieves only 63.1\% validation accuracy on pairwise ranking. This is significantly below oracle performance and raises questions about the quality of token-level signals.
+
+\textbf{Implications}:
+\begin{itemize}[nosep]
+    \item For long sequences, accumulated errors may produce misleading advantage estimates
+    \item The in-domain performance decline may be partially attributable to critic quality
+    \item Higher critic accuracy might yield better downstream performance (unverified)
+\end{itemize}
+
+\textbf{Potential causes of limited accuracy}:
+\begin{itemize}[nosep]
+    \item Critic backbone capacity (2.7B may be insufficient)
+    \item Training data quantity/diversity
+    \item Inherent difficulty of the pairwise ranking task for competitive programming
+\end{itemize}
+
+\subsection{Random Baseline Absence}
+
+\textbf{Limitation}: We did not include a random weight baseline, making it impossible to separate the ``information effect'' (meaningful token importance) from the ``mechanism effect'' (any non-uniform weighting).
+
+\textbf{Implication}: The observed improvements could potentially be explained by:
+\begin{itemize}[nosep]
+    \item Random regularization from variable token weights
+    \item Implicit curriculum from weighting distribution
+    \item Other effects unrelated to ``correct'' importance signals
+\end{itemize}
+
+\textbf{Required experiment}: Train with random weights sampled from the same distribution as value-based weights.
+
+\subsection{Computational Cost}
+
+\textbf{Limitation}: Phase 2 training requires an additional critic forward pass for each training batch, increasing training cost by approximately 1.3$\times$.
+
+\textbf{Mitigating factor}: Inference cost is \textbf{zero}---the critic is only used during training. For deployment scenarios where training is amortized over many inference calls, this overhead may be acceptable.
+
+\textbf{Cost breakdown}:
+\begin{itemize}[nosep]
+    \item Phase 1 (Critic training): Similar to standard SFT
+    \item Phase 2 (Policy training): $\sim$1.3$\times$ standard SFT (critic forward + policy forward/backward)
+    \item Inference: Identical to standard MTP (no overhead)
+\end{itemize}
+
+\subsection{Generalization Scope}
+
+\textbf{Limitation}: All experiments are conducted on code generation tasks. Effectiveness on other generation tasks (summarization, dialogue, translation) is unknown.
+
+\textbf{Potential concerns for other domains}:
+\begin{itemize}[nosep]
+    \item Code has clear correctness criteria; other tasks have subjective quality
+    \item Pairwise ranking may be less applicable when relative quality is ambiguous
+    \item Token importance patterns may differ significantly across domains
+\end{itemize}
+
+\subsection{Summary of Limitations}
+
+\begin{table}[h]
+\centering
+\caption{Summary of limitations and their implications.}
+\label{tab:limitations_summary}
+\begin{tabular}{lp{5cm}p{5cm}}
+\toprule
+\textbf{Limitation} & \textbf{Impact} & \textbf{Mitigation/Future Work} \\
+\midrule
+MTP necessity unverified & Cannot claim MTP is required & NTP vs. MTP comparison \\
+Critic 63\% accuracy & May limit long-sequence performance & Improve critic architecture/data \\
+No random baseline & Cannot separate information vs. mechanism effect & Random weight A/B test \\
+1.3$\times$ training cost & Higher compute requirement & Zero inference overhead \\
+Code domain only & Unknown generalization & Test on other tasks \\
+\bottomrule
+\end{tabular}
+\end{table}

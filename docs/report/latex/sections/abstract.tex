@@ -1,0 +1,14 @@
+% Abstract
+\begin{abstract}
+
+Standard Multi-Token Prediction (MTP) trains all future tokens with uniform cross-entropy loss, failing to distinguish between critical tokens (e.g., function names, conditional statements, return values) and less important ones. We propose \textbf{Weighted MTP (WMTP)}, a two-phase approach that assigns token-level importance weights derived from an independent critic model.
+
+In Phase 1, we train a critic using \textbf{pairwise ranking loss} (Bradley-Terry) on correct/incorrect solution pairs, learning token-level value estimates $V_t$ without requiring explicit reward signals. In Phase 2, we compute \textbf{Generalized Advantage Estimation (GAE)} from value changes across tokens, apply whitening normalization with EMA running statistics, and convert advantages to exponential weights following the AWR-style formulation: $w_t = \exp(\hat{A}_t / \beta)$. These weights modulate the MTP cross-entropy loss, focusing learning on tokens that contribute most to solution correctness.
+
+WMTP operates as an \textbf{offline weighted SFT} method, providing training-time token reweighting with \textbf{zero inference overhead}---the critic is only used during training. On code generation benchmarks, using only \textbf{1.4\%} of available training data (50K/3.6M samples), WMTP achieves consistent improvements on out-of-domain tasks: \textbf{HumanEval +2.86\%}, \textbf{MBPP +3.00\%}, and \textbf{GSM8K +1.07\%} (average $\Delta$ across Pass@k). However, we observe a \textbf{-1.05\%} decline on in-domain CodeContests, which we attribute to critic quality limitations (63.1\% validation accuracy) and GAE credit assignment challenges on long sequences.
+
+We provide honest analysis of limitations including unverified MTP necessity (vs. NTP), absence of random weight baselines, and the 63\% critic accuracy ceiling. Our work explores the application of GAE-weighted cross-entropy to LLM code generation, demonstrating positive signals on out-of-domain transfer while highlighting important failure modes for future research.
+
+\end{abstract}
+
+\textbf{Keywords:} Weighted SFT, Multi-Token Prediction, Advantage Weighting, Pairwise Ranking, Verifiable Reward, Offline RL for LLMs, Code Generation

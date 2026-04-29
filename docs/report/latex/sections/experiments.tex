@@ -1,0 +1,150 @@
+% Experimental Setup
+\section{Experimental Setup}
+
+\subsection{Datasets}
+
+\subsubsection{Training Data: CodeContests}
+
+We use the CodeContests dataset \citep{li2022competition} for training both the critic and policy models.
+
+\begin{table}[h]
+\centering
+\caption{CodeContests dataset usage. We use only 1.4\% of the available training data.}
+\label{tab:codecontests_data}
+\begin{tabular}{lc}
+\toprule
+\textbf{Item} & \textbf{Value} \\
+\midrule
+Total available data & $\sim$3.6M samples \\
+\textbf{Actual usage} & \textbf{50K samples (1.4\%)} \\
+Critic training & 200K pairs (correct/incorrect) \\
+Policy training & 200K samples (correct only) \\
+Maximum sequence length & 2048 tokens \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Evaluation Benchmarks}
+
+We evaluate on four benchmarks spanning different characteristics:
+
+\begin{table}[h]
+\centering
+\caption{Evaluation benchmark characteristics. Out-of-domain benchmarks feature shorter, function-level code compared to in-domain competitive programming.}
+\label{tab:eval_benchmarks}
+\begin{tabular}{llll}
+\toprule
+\textbf{Dataset} & \textbf{Purpose} & \textbf{Metric} & \textbf{Characteristics} \\
+\midrule
+HumanEval & Out-of-domain & Pass@k & Short functions, $n=164$ \\
+MBPP & Out-of-domain & Pass@k & Short functions, $n=500$ \\
+GSM8K & Out-of-domain & Accuracy & Math reasoning, $n=1319$ \\
+CodeContests & In-domain & Pass@k & Long solutions, $n=165$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Models}
+
+\subsubsection{Policy Model: Meta-LLaMA MTP 7B}
+
+\begin{table}[h]
+\centering
+\caption{Policy model configuration.}
+\label{tab:policy_model}
+\begin{tabular}{lc}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Base architecture & Meta-LLaMA MTP \\
+Base parameters & 7B \\
+MTP heads & $K=4$ \\
+\textbf{LoRA parameters} & \textbf{190.8M (2.73\%)} \\
+LoRA rank & 64 \\
+LoRA $\alpha$ & 128 \\
+LoRA dropout & 0.05 \\
+Target modules & wq, wk, wv, wo, w1, w2, w3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Critic Model: Sheared-LLaMA 2.7B}
+
+\begin{table}[h]
+\centering
+\caption{Critic model configuration. The critic achieves 63.1\% validation accuracy on pairwise ranking.}
+\label{tab:critic_model}
+\begin{tabular}{lc}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Base architecture & Sheared-LLaMA \\
+Base parameters & 2.7B \\
+\textbf{LoRA parameters} & \textbf{119.5M (4.43\%)} \\
+LoRA rank & 32 \\
+LoRA $\alpha$ & 64 \\
+LoRA dropout & 0.1 \\
+Value head & MLP (hidden $\times 4 \rightarrow 1$) \\
+\textbf{Final validation accuracy} & \textbf{63.1\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Training Configuration}
+
+Table~\ref{tab:training_config} summarizes hyperparameters across all three training stages.
+
+\begin{table}[h]
+\centering
+\caption{Training hyperparameters for Baseline (standard MTP SFT), Critic (pairwise ranking), and Verifiable (WMTP).}
+\label{tab:training_config}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Parameter} & \textbf{Baseline} & \textbf{Critic} & \textbf{Verifiable (WMTP)} \\
+\midrule
+Batch size (per GPU) & 12 & 8 & 12 \\
+Gradient accumulation & 2 & 2 & 2 \\
+Effective batch size & $12 \times 2 \times 4 = 96$ & $8 \times 2 \times 4 = 64$ & $12 \times 2 \times 4 = 96$ \\
+Learning rate & $1 \times 10^{-4}$ & $5 \times 10^{-5}$ (LoRA) / $1 \times 10^{-4}$ (head) & $1 \times 10^{-4}$ \\
+Epochs & 1.0 & 1.0 & 1.0 \\
+LR scheduler & Cosine & Cosine & Cosine \\
+Warmup ratio & 0.03 & 0.03 & 0.03 \\
+\midrule
+\multicolumn{4}{c}{\textit{WMTP-specific parameters}} \\
+\midrule
+$\lambda$ (GAE) & -- & -- & 0.95 \\
+$\beta$ (temperature) & -- & -- & 1.0 \\
+Weight clip range & -- & -- & $[0.1, 3.0]$ \\
+EMA momentum & -- & -- & 0.1 \\
+EMA warmup steps & -- & -- & 10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Evaluation Protocol}
+
+\subsubsection{Pass@k Computation}
+
+We use the unbiased Pass@k estimator from \citet{chen2021evaluating}:
+\begin{equation}
+    \text{Pass@}k = \mathbb{E}_{\text{problems}} \left[ 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}} \right]
+\end{equation}
+where $n$ is the number of samples generated per problem and $c$ is the number of correct samples.
+
+\subsubsection{Generation Settings}
+
+\begin{itemize}[nosep]
+    \item \textbf{Sampling}: $n=20$ samples per problem
+    \item \textbf{Temperature}: Selected via search (0.2 for MBPP/GSM8K/CodeContests, 0.8 for HumanEval)
+    \item \textbf{Pass@k values}: $k \in \{1, 5, 10, 20\}$
+    \item \textbf{Execution}: Sandboxed environment with test case validation
+\end{itemize}
+
+\subsubsection{Evaluation Methods by Benchmark}
+
+\begin{itemize}[nosep]
+    \item \textbf{HumanEval}: Function execution against hidden test cases
+    \item \textbf{MBPP}: Assert statement execution
+    \item \textbf{GSM8K}: Exact match of final numerical answer
+    \item \textbf{CodeContests}: stdin/stdout matching against 10 test cases
+\end{itemize}
